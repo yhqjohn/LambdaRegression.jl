@@ -9,8 +9,12 @@ using AbstractTrees
 Abstract type for De Bruijn level nodes.
 """
 abstract type AbstractDBLNode <: AbstractToken end
-pretty_string(node::AbstractDBLNode) = string(node)
-Base.display(io::IO, node::AbstractDBLNode) = print(io, pretty_string(node))
+pretty_string(node::AbstractDBLNode, d) = string(node)
+level_string(node::AbstractDBLNode) = string(node)
+Base.display(io::IO, node::AbstractDBLNode) = print(io, pretty_string(node, nothing), "\n")
+Base.display(node::AbstractDBLNode) = display(stdout, node)
+Base.show(io::IO, node::AbstractDBLNode) = print(io, level_string(node))
+depth(node::AbstractDBLNode) = UInt(0)
 
 repr_letters = "zyxwvutsrqpnmlkjihgfedcba" # skip o to avoid confusion with 0
 function to_letter(i::UInt)
@@ -27,8 +31,10 @@ end
 AbstractTrees.children(node::DBLVariable) = []
 AbstractTrees.nodevalue(node::DBLVariable) = node.index
 AbstractTrees.printnode(io::IO, node::DBLVariable) = print(io, "#$(node.index)")
-pretty_string(node::DBLVariable) = to_letter(node.index)
+pretty_string(node::DBLVariable, d) = to_letter(d-node.index)
+level_string(node::DBLVariable) = "#$(node.index)"
 Base.display(io::IO, node::DBLVariable) = print(io, "#$(node.index)")
+depth(node::DBLVariable) = UInt(0)
 
 
 struct DBLAbstraction <: AbstractDBLNode
@@ -38,6 +44,7 @@ end
 AbstractTrees.children(node::DBLAbstraction) = [node.body]
 AbstractTrees.nodevalue(node::DBLAbstraction) = node.index
 AbstractTrees.printnode(io::IO, node::DBLAbstraction) = print(io, "λ#$(node.index)")
+# note that the args are in reverse order
 function args_body(node::DBLAbstraction)
     args = UInt[]
     while node isa DBLAbstraction
@@ -46,10 +53,25 @@ function args_body(node::DBLAbstraction)
     end
     return args, node
 end
-function pretty_string(node::DBLAbstraction)
+function pretty_string(node::DBLAbstraction, d=nothing)
+    if isnothing(d)
+        d = depth(node)
+    end
     args, body = args_body(node)
-    "λ$(join([to_letter(arg) for arg in args], "")).$(pretty_string(body))"
+    body_str = pretty_string(body, d)
+    if body isa DBLApply
+        body_str = "($body_str)"
+    end
+    "λ$(join([to_letter(d-arg) for arg in args], ",")).$body_str"
 end
+function level_string(node::DBLAbstraction)
+    if node.body isa DBLApply
+        "λ#$(node.index).($(level_string(node.body)))"
+    else
+        "λ#$(node.index).$(level_string(node.body))"
+    end
+end
+depth(node::DBLAbstraction) = max(depth(node.body), node.index)
 
 
 struct DBLApply <: AbstractDBLNode
@@ -59,20 +81,33 @@ end
 AbstractTrees.children(node::DBLApply) = [node.func, node.arg]
 AbstractTrees.nodevalue(node::DBLApply) = nothing
 AbstractTrees.printnode(io::IO, node::DBLApply) = print(io, "APPLY")
-function pretty_string(node::DBLApply)
+function pretty_string(node::DBLApply, d=nothing)
+    if isnothing(d)
+        d = depth(node)
+    end
     if node.arg isa DBLApply
-        "$(pretty_string(node.func))($(pretty_string(node.arg)))"
+        "$(pretty_string(node.func, d))($(pretty_string(node.arg, d)))"
     else
-        "$(pretty_string(node.func)) $(pretty_string(node.arg))"
+        "$(pretty_string(node.func, d)) $(pretty_string(node.arg, d))"
     end
 end
+function level_string(node::DBLApply)
+    if node.arg isa DBLApply
+        "$(level_string(node.func))($(level_string(node.arg)))"
+    else
+        "$(level_string(node.func)) $(level_string(node.arg))"
+    end
+end
+depth(node::DBLApply) = max(depth(node.func), depth(node.arg))
 
 struct DBLProxy{T} <: AbstractDBLNode
     body::T
 end
 AbstractTrees.children(node::DBLProxy) = []
 AbstractTrees.nodevalue(node::DBLProxy) = node.body
-pretty_string(node::DBLProxy) = repr(node.body)
+pretty_string(node::DBLProxy, d) = repr(node.body)
+level_string(node::DBLProxy) = level_string(node.body)
+depth(node::DBLProxy) = 0
 
 
 function to_debrujin(node::AbstractToken, level=UInt(0), context=Dict{AbstractVariableToken, UInt}())
