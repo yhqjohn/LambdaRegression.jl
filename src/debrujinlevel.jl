@@ -1,6 +1,7 @@
 module DeBrujinLevelModule
 
 import ..ParseModule: AbstractToken, AbstractVariableToken, VariableToken, DeBruijnToken, LambdaToken, ApplyToken, MultiApplyToken, ProxyToken
+using LambdaRegression: to_letter
 using AbstractTrees
 
 """
@@ -8,7 +9,7 @@ using AbstractTrees
 
 Abstract type for De Bruijn level nodes.
 """
-abstract type AbstractDBLNode <: AbstractToken end
+abstract type AbstractDBLNode <: AbstractNode{Any} end
 pretty_string(node::AbstractDBLNode, d) = string(node)
 level_string(node::AbstractDBLNode) = string(node)
 Base.display(io::IO, node::AbstractDBLNode) = print(io, pretty_string(node, nothing), "\n")
@@ -16,14 +17,6 @@ Base.display(node::AbstractDBLNode) = display(stdout, node)
 Base.show(io::IO, node::AbstractDBLNode) = print(io, level_string(node))
 depth(node::AbstractDBLNode) = UInt(0)
 
-repr_letters = "zyxwvutsrqpnmlkjihgfedcba" # skip o to avoid confusion with 0
-function to_letter(i::UInt)
-    if i<=24
-        repr_letters[i+1]
-    else
-        "x_$(i-24)"
-    end
-end
 
 struct DBLVariable <: AbstractDBLNode
     index::UInt
@@ -110,7 +103,7 @@ level_string(node::DBLProxy) = level_string(node.body)
 depth(node::DBLProxy) = 0
 
 
-function to_debrujin(node::AbstractToken, level=UInt(0), context=Dict{AbstractVariableToken, UInt}())
+function to_debrujin_level(node::AbstractToken, level=UInt(0), context=Dict{AbstractVariableToken, UInt}())
     if node isa AbstractVariableToken
         idx = get(context, node, nothing)
         isnothing(idx) && throw(ArgumentError("unbound variable $node"))
@@ -122,21 +115,21 @@ function to_debrujin(node::AbstractToken, level=UInt(0), context=Dict{AbstractVa
             arg = node.args[1]
             new_context = copy(context)
             new_context[arg] = level
-            return DBLAbstraction(level, to_debrujin(node.body, level+1, new_context))
+            return DBLAbstraction(level, to_debrujin_level(node.body, level+1, new_context))
         else
             arg = node.args[1]
             new_context = copy(context)
             new_context[arg] = level
-            return DBLAbstraction(level, to_debrujin(LambdaToken(node.args[2:end], node.body), level+1, new_context))
+            return DBLAbstraction(level, to_debrujin_level(LambdaToken(node.args[2:end], node.body), level+1, new_context))
         end
     elseif node isa ApplyToken
-        return DBLApply(to_debrujin(node.func, level, context), to_debrujin(node.arg, level, context))
+        return DBLApply(to_debrujin_level(node.func, level, context), to_debrujin_level(node.arg, level, context))
     elseif node isa MultiApplyToken
-        return foldl(node.terms, init=to_debrujin(node.func, level, context)) do (a,b) 
-            DBLApply(a, to_debrujin(b, level, context))
+        return foldl(node.terms, init=to_debrujin_level(node.func, level, context)) do (a,b) 
+            DBLApply(a, to_debrujin_level(b, level, context))
         end
     elseif node isa ProxyToken
-        return DBLProxy(to_debrujin(node.body, level, context))
+        return DBLProxy(to_debrujin_level(node.body, level, context))
     else
         throw(ArgumentError("node must be a VariableToken, LambdaToken, ApplyToken, or ProxyToken"))
     end

@@ -27,13 +27,20 @@ make_arg_node(arg::Int) = DeBruijnToken(arg)
 make_arg_node(arg::AbstractVariableToken) = arg
 
 struct LambdaToken <: AbstractToken
-    args::Vector{AbstractVariableToken}
+    arg::AbstractVariableToken
     body::AbstractToken
-    LambdaToken(args::Vector, body) = new(make_arg_node.(args), body)
 end
-AbstractTrees.children(node::LambdaToken) = [node.args..., node.body]
-AbstractTrees.nodevalue(node::LambdaToken) = node.args
+AbstractTrees.children(node::LambdaToken) = [node.arg, node.body]
+AbstractTrees.nodevalue(node::LambdaToken) = nothing
 AbstractTrees.printnode(io::IO, node::LambdaToken) = print(io, "λ")
+
+struct MultiLambdaToken <: AbstractToken
+    args::Tuple{Vararg{AbstractVariableToken}}
+    body::AbstractToken
+end
+AbstractTrees.children(node::MultiLambdaToken) = [node.args..., node.body]
+AbstractTrees.nodevalue(node::MultiLambdaToken) = nothing
+AbstractTrees.printnode(io::IO, node::MultiLambdaToken) = print(io, "λ")
 
 struct ApplyToken <: AbstractToken
     func::AbstractToken
@@ -45,9 +52,9 @@ AbstractTrees.printnode(io::IO, node::ApplyToken) = print(io, "APPLY")
 
 struct MultiApplyToken <: AbstractToken
     func::AbstractToken
-    terms::Vector{AbstractToken}
+    args::Tuple{Vararg{AbstractToken}}
 end
-AbstractTrees.children(node::MultiApplyToken) = [node.func, node.terms...]
+AbstractTrees.children(node::MultiApplyToken) = [node.func, node.args...]
 AbstractTrees.nodevalue(node::MultiApplyToken) = nothing
 AbstractTrees.printnode(io::IO, node::MultiApplyToken) = print(io, "APPLY")
 
@@ -60,8 +67,6 @@ AbstractTrees.nodevalue(node::ProxyToken) = node.body
 
 Base.:*(a::AbstractToken, b::AbstractToken) = ApplyToken(a, b)
 -->(a::AbstractVariableToken, b::AbstractToken) = LambdaToken(a, b)
--->(args::Tuple{Vararg{AbstractVariableToken}}, b::AbstractToken) = LambdaToken(collect(args), b)
-
 
 """
     parse_lambda(expr)
@@ -104,28 +109,30 @@ function parse_lambda(expr, context=[])
             # deal with arguments
             if args isa Expr && args.head==:tuple # case 3.2: a multiple argument abstraction `(x, y, z)-> M`
                 args = args.args
+                check_arg.(args)
+                context = [context; args...]
+                args = parse_arg.(args)
+                args = Expr(:tuple, args...)
+                body = parse_lambda(body, context)
+                return :(MultiLambdaToken($args, $body))
             else # case 3.1: a single argument abstraction `x-> M`
-                args = [args]
+                check_arg(args)
+                context = [context; args]
+                arg = parse_arg(args)
+                body = parse_lambda(body, context)
+                return :(LambdaToken($(arg), $body))
             end
-            check_arg.(args)
-            context = [args; context]
-            args = parse_arg.(args)
-            body = parse_lambda(body, context)
-            return :(LambdaToken([$(args...)], $body))
+            
         elseif expr.head === :call
             if expr.args[1] === :* # case 4: an application expression `f*x`
-                terms = [parse_lambda(arg, context) for arg in expr.args[2:end]]
-                return Expr(:call, :*, terms...)
+                args = [parse_lambda(arg, context) for arg in expr.args[2:end]]
+                return Expr(:call, :*, args...)
             else # case 5: an application expression `f(x)`
                 func = parse_lambda(expr.args[1], context)
                 args = expr.args[2:end]
-                if length(args)==1 # case 5.1: a single argument application `f(x)`
-                    arg = parse_lambda(args[1], context)
-                    return :(ApplyToken($func, $arg))
-                else # case 5.2: a multiple argument application `f(x, y, z)`
-                    args = [parse_lambda(arg, context) for arg in args]
-                    return :(MultiApplyToken($func, $args))
-                end
+                args = [parse_lambda(arg, context) for arg in args]
+                args = Expr(:tuple, args...)
+                return :(MultiApplyToken($func, $args))
             end
         elseif expr.head === :& # case 1.2: a de Bruijn index `&1`
             check_arg(expr)
@@ -157,5 +164,37 @@ macro lambda(expr)
     return expr
 end
 
-    
+function unfold(node::AbstractToken)
+    if node isa ProxyToken || node isa VariableToken || node isa DeBruijnToken
+        return node
+    elseif node isa LambdaToken
+        return LambdaToken(node.arg, unfold(node.body))
+    elseif node isa ApplyToken
+        return ApplyToken(unfold(node.func), unfold(node.arg))
+    elseif node isa MultiLambdaToken
+        args = node.args
+        body = node.body
+        if length(args)<1
+            throw(ArgumentError("lambda must have at least one argument"))
+        elseif length(args)==1
+            return LambdaToken(args[1], unfold(body))
+        else
+            return LambdaToken(args[1], unfold(MultiLambdaToken(args[2:end], body)))
+        end
+    elseif node isa MultiApplyToken
+        func = node.func
+        args = node.args
+        if length(args)<1
+            throw(ArgumentError("multi-apply must have at least one term"))
+        elseif length(args)==1
+            return ApplyToken(unfold(func), unfold(args[1]))
+        else
+            return ApplyToken(unfold(MultiApplyToken(func, args[1:end-1])), unfold(args[end]))
+        end
+    else
+        throw(ArgumentError("The node must be a ProxyToken, VariableToken, DeBruijnToken, LambdaToken, ApplyToken, MultiLambdaToken, or MultiApplyToken"))
+    end
+end
+
+
 end
