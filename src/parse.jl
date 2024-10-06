@@ -1,0 +1,161 @@
+module ParseModule
+using MacroTools, AbstractTrees
+
+abstract type AbstractToken <: AbstractNode{Any} end
+abstract type AbstractVariableToken <: AbstractToken end
+
+# named variable style
+struct VariableToken <: AbstractVariableToken
+    name::Symbol
+end
+VariableToken(name::String) = VariableToken(Symbol(name))
+AbstractTrees.children(node::VariableToken) = []
+AbstractTrees.nodevalue(node::VariableToken) = node.name
+AbstractTrees.printnode(io::IO, node::VariableToken) = print(io, string(node.name))
+
+# de Bruijn index style
+struct DeBruijnToken <: AbstractVariableToken
+    index::Int
+end
+AbstractTrees.children(node::DeBruijnToken) = []
+AbstractTrees.nodevalue(node::DeBruijnToken) = node.index
+AbstractTrees.printnode(io::IO, node::DeBruijnToken) = print(io, "#$(node.index)")
+
+make_arg_node(arg::String) = VariableToken(arg)
+make_arg_node(arg::Symbol) = VariableToken(arg)
+make_arg_node(arg::Int) = DeBruijnToken(arg)
+make_arg_node(arg::AbstractVariableToken) = arg
+
+struct LambdaToken <: AbstractToken
+    args::Vector{AbstractVariableToken}
+    body::AbstractToken
+    LambdaToken(args::Vector, body) = new(make_arg_node.(args), body)
+end
+AbstractTrees.children(node::LambdaToken) = [node.args..., node.body]
+AbstractTrees.nodevalue(node::LambdaToken) = node.args
+AbstractTrees.printnode(io::IO, node::LambdaToken) = print(io, "λ")
+
+struct ApplyToken <: AbstractToken
+    func::AbstractToken
+    arg::AbstractToken
+end
+AbstractTrees.children(node::ApplyToken) = [node.func, node.arg]
+AbstractTrees.nodevalue(node::ApplyToken) = nothing
+AbstractTrees.printnode(io::IO, node::ApplyToken) = print(io, "APPLY")
+
+struct MultiApplyToken <: AbstractToken
+    func::AbstractToken
+    terms::Vector{AbstractToken}
+end
+AbstractTrees.children(node::MultiApplyToken) = [node.func, node.terms...]
+AbstractTrees.nodevalue(node::MultiApplyToken) = nothing
+AbstractTrees.printnode(io::IO, node::MultiApplyToken) = print(io, "APPLY")
+
+
+struct ProxyToken{T} <: AbstractToken
+    body::T
+end
+AbstractTrees.children(node::ProxyToken) = [node.body]
+AbstractTrees.nodevalue(node::ProxyToken) = node.body
+
+Base.:*(a::AbstractToken, b::AbstractToken) = ApplyToken(a, b)
+-->(a::AbstractVariableToken, b::AbstractToken) = LambdaToken(a, b)
+-->(args::Tuple{Vararg{AbstractVariableToken}}, b::AbstractToken) = LambdaToken(collect(args), b)
+
+
+"""
+    parse_lambda(expr)
+
+Parse a lambda expression Literal into an Abstract Syntax Tree (AST) of `AbstractToken`s.
+Two styles of lambda expressions are supported:
+- Named variable style: `f-> (x-> f(x * x)) * (x-> f(x * x))`
+- De Bruijn index style: `&2-> (&1-> &2(&1 * &1)) * (&1-> &2(&1 * &1))`
+
+Function calling can be written either in the form of `f*x` or `f(x)`.
+Expressions that cannot be found in the abstraction variables (or `context`, if called with a context) are treated as free variables,
+which should be defined in the context scope, and will be wrapped in `ProxyToken`.
+
+**Note**
+The free variables must be written in the form of a literal, such as a string, a number, or a symbol, rather than a expression.
+"""
+function parse_lambda(expr, context=[])
+    #=
+        - case 1: a bounded variable
+            - case 1.1: a named variable `x`
+            - case 1.2: a de Bruijn index `&1`
+        - case 2: an unbounded variable
+        - case 3: an abstraction expression `x-> M`
+            - case 3.1: a single argument abstraction `x-> M`
+            - case 3.2: a multiple argument abstraction `(x, y, z)-> M`
+        - case 4: an application expression `f*x`
+        - case 5: an application expression `f(x)`
+            - case 5.1: a single argument application `f(x)`
+            - case 5.2: a multiple argument application `f(x, y, z)`
+    =#
+    if expr isa Expr
+        # TODO
+        if expr.head === :-> # case 3: an abstraction expression `x-> M`
+            args = expr.args[1]
+            body = expr.args[2]
+            body = Base.remove_linenums!(body)
+            body isa Expr || throw(ArgumentError("The body of an abstraction must be an expression"))
+            (body.head==:block && length(body.args)==1) || throw(ArgumentError("The body of an abstraction must be a single expression"))
+            body = body.args[1]
+            # deal with arguments
+            if args isa Expr && args.head==:tuple # case 3.2: a multiple argument abstraction `(x, y, z)-> M`
+                args = args.args
+            else # case 3.1: a single argument abstraction `x-> M`
+                args = [args]
+            end
+            check_arg.(args)
+            context = [args; context]
+            args = parse_arg.(args)
+            body = parse_lambda(body, context)
+            return :(LambdaToken([$(args...)], $body))
+        elseif expr.head === :call
+            if expr.args[1] === :* # case 4: an application expression `f*x`
+                terms = [parse_lambda(arg, context) for arg in expr.args[2:end]]
+                return Expr(:call, :*, terms...)
+            else # case 5: an application expression `f(x)`
+                func = parse_lambda(expr.args[1], context)
+                args = expr.args[2:end]
+                if length(args)==1 # case 5.1: a single argument application `f(x)`
+                    arg = parse_lambda(args[1], context)
+                    return :(ApplyToken($func, $arg))
+                else # case 5.2: a multiple argument application `f(x, y, z)`
+                    args = [parse_lambda(arg, context) for arg in args]
+                    return :(MultiApplyToken($func, $args))
+                end
+            end
+        elseif expr.head === :& # case 1.2: a de Bruijn index `&1`
+            check_arg(expr)
+            return parse_arg(expr)
+        else
+            throw(ArgumentError("The expression head must be `:->`, `:call`, or `:&`"))
+        end
+    elseif expr isa Symbol && expr in context # case 1.1: a bounded variable `x`
+        check_arg(expr)
+        return parse_arg(expr)
+    else # case 2: an unbounded variable
+        return ProxyToken(expr)
+    end
+end
+
+function check_arg(arg)
+    arg isa Symbol && Base.isidentifier(arg) && return # case 1.1: a symbol
+    arg isa Expr && arg.head==:& && arg.args[1] isa Int && return # case 1.2: a de Bruijn index
+    throw(ArgumentError("The argument must be a symbol or a de Bruijn index in the form of `&1`"))
+end
+
+function parse_arg(arg)
+    arg isa Symbol && return :(VariableToken($(QuoteNode(arg)))) # case 1.1: a symbol
+    arg isa Expr && arg.head==:& && arg.args[1] isa Int && return :(DeBruijnToken($(arg.args[1]))) # case 1.2: a de Bruijn index
+end
+
+macro lambda(expr)
+    expr = parse_lambda(expr)
+    return expr
+end
+
+    
+end
