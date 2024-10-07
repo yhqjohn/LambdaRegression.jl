@@ -96,7 +96,7 @@ using .ParseModule: @lambda
 
 # using .DeBrujinLevelModule: DBLAbstraction, to_debrujin_level
 
-# include("debrujinindex.jl")
+include("debrujinindex.jl")
 
 
 end # module LambdaRegression
