@@ -1,12 +1,10 @@
-using LambdaRegression.DeBruijnModule: to_derbujin, set_alphabetic!
+using LambdaRegression.DeBruijnModule: to_debrujin
 using LambdaRegression.ParseModule: @lambda
 
 y_combinator = @lambda f->(x->f(x(x)))(x->f(x(x)))
 y_combinator2 = @lambda &1->(&0->&1(&0*&0)) * (&0->&1(&0*&0))
-y_db = to_derbujin(y_combinator)
-y_db2 = to_derbujin(y_combinator2)
-set_alphabetic!(false)
-display(y_db)
-set_alphabetic!(true)
-display(y_db)
+y_db = to_debrujin(y_combinator)
+y_db2 = to_debrujin(y_combinator2)
+display(y_db2)
+println("yes")
 @test y_db == y_db2

@@ -92,10 +92,10 @@ include("parse.jl")
 
 using .ParseModule: @lambda
 
-include("debrujinindex.jl")
-using .DeBruijnModule: to_derbujin
+include("debrujin.jl")
+using .DeBruijnModule: to_debrujin
 
-include("reduce.jl")
+# include("reduce.jl")
 
 
 end # module LambdaRegression
