@@ -1,7 +1,7 @@
 module DeBruijnModule
 
 import ..ParseModule: AbstractToken, AbstractVariableToken, VariableToken, DeBruijnToken, LambdaToken, LambdaToken, ApplyToken, ProxyToken, unfold
-using LambdaRegression: to_letter
+using LambdaRegression: to_letter, U1
 using AbstractTrees
 
 ALPHABETIC = true
@@ -88,7 +88,7 @@ function to_derbujin(node::AbstractToken)
     index_dict = Dict{AbstractVariableToken, UInt}()
     for node in AbstractTrees.PreOrderDFS(node)
         if node isa LambdaToken
-            index_dict[node.arg] = depth(node)-UInt(1)
+            index_dict[node.arg] = depth(node)
         end
     end
     return _to_debruijn_index(node, index_dict)
@@ -114,14 +114,13 @@ function depth(node::AbstractToken)
     elseif node isa ApplyToken
         return max(depth(node.func), depth(node.arg))
     elseif node isa LambdaToken
-        return depth(node.body) + UInt(1)
+        return depth(node.body) + U1
     else
         throw(ArgumentError("`node` must be a `VariableToken`, `DeBruijnToken`, `ProxyToken`, `ApplyToken`, or `LambdaToken`, got $(typeof(node))"))
     end
 end
 
 set_alphabetic!(tf::Bool) = global ALPHABETIC = tf
-
 
 
 end
