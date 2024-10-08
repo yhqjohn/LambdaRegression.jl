@@ -1,7 +1,8 @@
 module DeBruijnModule
 
 using AbstractTrees
-import ..ParseModule: AbstractToken, AbstractVariableToken, VariableToken, DeBruijnToken, LambdaToken, LambdaToken, ApplyToken, ProxyToken, unfold
+import ..ParseModule: AbstractToken, AbstractVariableToken, VariableToken, DeBruijnToken, LambdaToken, DeBruijnLambdaToken, ApplyToken, ProxyToken, unfold
+import LambdaRegression: U1
 
 
 """
@@ -47,12 +48,16 @@ AllDB{T} = Union{VarDB, AbsDB, AppDB, ProxyDB{T}}
 to_debrujin(node::AbstractToken) = _to_debrujin(unfold(node))
 
 function _to_debrujin(node::AbstractToken, stack=AbstractVariableToken[])
-    if node isa AbstractVariableToken
+    if node isa VariableToken
         index = findfirst(==(node), stack)
         isnothing(index) && throw(ArgumentError("variable not found in scope: $node"))
-        return VarDB(index)
+        return VarDB(index-1)
+    elseif node isa DeBruijnToken
+        return VarDB(node.index)
     elseif node isa LambdaToken
         return AbsDB(_to_debrujin(node.body, [node.arg, stack...]))
+    elseif node isa DeBruijnLambdaToken
+        return AbsDB(_to_debrujin(node.body, stack))
     elseif node isa ApplyToken
         return AppDB(_to_debrujin(node.func, stack), _to_debrujin(node.arg, stack))
     else
@@ -76,5 +81,48 @@ end
 pretty_string(node::ProxyDB) = string(node.value)
 Base.display(io::IO, node::AbstractDBNode) = println(io, pretty_string(node))
 Base.display(node::AbstractDBNode) = println(pretty_string(node))
+
+
+# substitution
+
+function substitute(term::AbstractDBNode, newterm::AbstractDBNode, scope::UInt=0)
+    if term isa VarDB
+        if term.index < scope # bound variable
+            return term
+        elseif term.index == scope # substitution instance
+            newterm = shift(newterm, scope) # shift up
+            return newterm
+        else # free variable
+            return VarDB(term.index-U1) # shift down 
+        end
+    elseif term isa AbsDB
+        return AbsDB(substitute(term.body, newterm, scope+U1))
+    elseif term isa AppDB
+        return AppDB(substitute(term.func, newterm, scope), substitute(term.arg, newterm, scope))
+    elseif term isa ProxyDB
+        return term
+    else
+        throw(ArgumentError("term must be a `VarDB`, `AbsDB`, `AppDB`, or `ProxyDB`, got $(typeof(term))"))
+    end
+end
+
+function shift(term::AbstractDBNode, offset::UInt, scope::UInt=0)
+    if term isa VarDB
+        if term.index < scope # bound variabl, e.g. 0 in λ.0 is bound where scope=1, while 0 is free in 0 where scope=0.
+            return term
+        else # free variable, 
+            return VarDB(term.index+offset)
+        end
+    elseif term isa AbsDB
+        return AbsDB(shift(term.body, offset, scope+U1))
+    elseif term isa AppDB
+        return AppDB(shift(term.func, offset, scope), shift(term.arg, offset, scope))
+    elseif term isa ProxyDB
+        return term
+    else
+        throw(ArgumentError("term must be a `VarDB`, `AbsDB`, `AppDB`, or `ProxyDB`, got $(typeof(term))"))
+    end
+end
+
 
 end # module DeBruijnModule

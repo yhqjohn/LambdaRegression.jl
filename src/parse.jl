@@ -42,6 +42,21 @@ AbstractTrees.children(node::MultiLambdaToken) = [node.args..., node.body]
 AbstractTrees.nodevalue(node::MultiLambdaToken) = nothing
 AbstractTrees.printnode(io::IO, node::MultiLambdaToken) = print(io, "λ")
 
+struct DeBruijnLambdaToken <: AbstractToken
+    body::AbstractToken
+end
+AbstractTrees.children(node::DeBruijnLambdaToken) = [node.body]
+AbstractTrees.nodevalue(node::DeBruijnLambdaToken) = nothing
+AbstractTrees.printnode(io::IO, node::DeBruijnLambdaToken) = print(io, "λ")
+
+struct MultiDeBruijnLambdaToken <: AbstractToken
+    argnum::Int
+    body::AbstractToken
+end
+AbstractTrees.children(node::MultiDeBruijnLambdaToken) = [node.body]
+AbstractTrees.nodevalue(node::MultiDeBruijnLambdaToken) = nothing
+AbstractTrees.printnode(io::IO, node::MultiDeBruijnLambdaToken) = print(io, "λ"^node.argnum*".")
+
 struct ApplyToken <: AbstractToken
     func::AbstractToken
     arg::AbstractToken
@@ -92,6 +107,8 @@ function parse_lambda(expr, context=[])
         - case 3: an abstraction expression `x-> M`
             - case 3.1: a single argument abstraction `x-> M`
             - case 3.2: a multiple argument abstraction `(x, y, z)-> M`
+            - case 3.3: a De Bruijn index abstraction `(*)-> M`
+            - case 3.4: a multiple argument De Bruijn index abstraction `(*, *)-> M`
         - case 4: an application expression `f*x`
         - case 5: an application expression `f(x)`
             - case 5.1: a single argument application `f(x)`
@@ -107,14 +124,22 @@ function parse_lambda(expr, context=[])
             (body.head==:block && length(body.args)==1) || throw(ArgumentError("The body of an abstraction must be a single expression"))
             body = body.args[1]
             # deal with arguments
-            if args isa Expr && args.head==:tuple # case 3.2: a multiple argument abstraction `(x, y, z)-> M`
-                args = args.args
-                check_arg.(args)
-                context = [context; args...]
-                args = parse_arg.(args)
-                args = Expr(:tuple, args...)
+            if args === :(*) # case 3.3: a de Bruijn index abstraction `(*)-> M`
                 body = parse_lambda(body, context)
-                return :(MultiLambdaToken($args, $body))
+                return :(DeBruijnLambdaToken($body))
+            elseif args isa Expr && args.head==:tuple
+                if all(==(:(*)), args.args) # case 3.4: a multiple argument De Bruijn index abstraction `(*, *)-> M`
+                    body = parse_lambda(body, context)
+                    return :(MultiDeBruijnLambdaToken($(length(args.args)), $body))
+                else # case 3.2: a multiple argument abstraction `(x, y, z)-> M`
+                    args = args.args
+                    check_arg.(args)
+                    context = [context; args...]
+                    args = parse_arg.(args)
+                    args = Expr(:tuple, args...)
+                    body = parse_lambda(body, context)
+                    return :(MultiLambdaToken($args, $body))
+                end
             else # case 3.1: a single argument abstraction `x-> M`
                 check_arg(args)
                 context = [context; args]
@@ -169,6 +194,16 @@ function unfold(node::AbstractToken)
         return node
     elseif node isa LambdaToken
         return LambdaToken(node.arg, unfold(node.body))
+    elseif node isa DeBruijnLambdaToken
+        return DeBruijnLambdaToken(unfold(node.body))
+    elseif node isa MultiDeBruijnLambdaToken
+        if node.argnum<1
+            throw(ArgumentError("De Bruijn lambda must have at least one argument"))
+        elseif node.argnum==1
+            return DeBruijnLambdaToken(unfold(node.body))
+        else
+            return DeBruijnLambdaToken(unfold(MultiDeBruijnLambdaToken(node.argnum-1, node.body)))
+        end
     elseif node isa ApplyToken
         return ApplyToken(unfold(node.func), unfold(node.arg))
     elseif node isa MultiLambdaToken

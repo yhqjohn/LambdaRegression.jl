@@ -34,8 +34,9 @@ y_combinator = @lambda f->(x->f(x(x)))(x->f(x(x)))
 y_combinator2 = @lambda f->((x->f*(x*x)) * (x->f*(x*x)))
 @test unfold(y_combinator) == y_combinator2
 
-two3 = @lambda (&1, &2)->&1(&2, &2)
-two4 = @lambda &1->&2->&1*&2*&2
-@test unfold(two3) == two4
+two3 = @lambda (*)->(*)->&0*&1*&1
+two4 = @lambda (*, *)->&0*&1*&1
+display(two3)
+@test unfold(two4) == two3
 
 
