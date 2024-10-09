@@ -1,27 +1,46 @@
 module ReduceModule
 
-using ..DeBruijnModule: AbstractDBNode, VarNode, AbsNode, AppNode, ProxyNode
+using ..DeBruijnModule: AbstractDBNode, VarNode, AbsNode, AppNode, ProxyNode, substitute
+using MLStyle: @data
 
-apply_on(func::AbsNode, arg::AbstractDBNode) = substitute(func.body, func.index, arg)
-
-find_deepest_scope(node::AbsNode) = find_deepest_scope(node.body, VarNode(node.index), node.index-UInt(1), node.index)
-
-function find_deepest_scope(node::AbstractDBNode, target::VarNode, depth::UInt, max_depth::UInt)
-    if node === target
-        return depth
-    elseif node isa AbsNode
-        return find_deepest_scope(node.body, target, depth-UInt(1), max_depth)
-    elseif node isa AppNode
-        depth1 = find_deepest_scope(node.func, target, depth, max_depth)
-        depth2 = find_deepest_scope(node.arg, target, depth, max_depth)
-        return min(depth1, depth2)
-    elseif node isa ProxyNode
-        return max_depth
-    else
-        throw(ArgumentError("node must be a `VarNode`, `AbsNode`, `AppNode`, or `ProxyNode`, got $(typeof(node))"))
-    end
+@data ReductionResult{E} begin
+    Normalized()
+    Ok(::AbstractDBNode)
+    Err(E)
 end
 
+function beta_reduce(node::AbstractDBNode)
+    @match node begin
+        n::VarNode || n::ProxyNode => Normalized()
+        AbsNode(index, body) => begin
+            result = beta_reduce(body)
+            @match result begin
+                Normalized() => Normalized()
+                Ok(body) => Ok(AbsNode(index, body))
+                Err(e) => Err(e)
+            end
+        end
+        AppNode(func, arg) => @match func begin
+            ::AbsNode => substitute(func.body, arg)
+            ::VarNode => Normalized()
+            ::AppNode => begin
+                result = beta_reduce(func)
+                @match result begin
+                    Err(e) => Err(e)
+                    Ok(func) => Ok(AppNode(func, arg))
+                    Normalized() => begin
+                        result = beta_reduce(arg)
+                        @match result begin
+                            Err(e) => Err(e)
+                            Ok(arg) => Ok(AppNode(func, arg))
+                            Normalized() => Normalized()
+                        end
+                    end
+                end
+            end
+        end           
+    end
+end
 
 
 end # module ReduceModule
