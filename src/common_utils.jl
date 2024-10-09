@@ -8,3 +8,4 @@ function to_letter(i::UInt)
 end
 
 U1 = UInt(1)
+U0 = UInt(0)

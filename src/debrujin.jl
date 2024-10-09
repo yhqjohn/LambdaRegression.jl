@@ -2,7 +2,7 @@ module DeBruijnModule
 
 using AbstractTrees
 import ..ParseModule: AbstractToken, AbstractVariableToken, VariableToken, DeBruijnToken, LambdaToken, DeBruijnLambdaToken, ApplyToken, ProxyToken, unfold
-import LambdaRegression: U1
+import LambdaRegression: U1, U0
 
 
 """
@@ -60,6 +60,8 @@ function _to_debrujin(node::AbstractToken, stack=AbstractVariableToken[])
         return AbsDB(_to_debrujin(node.body, stack))
     elseif node isa ApplyToken
         return AppDB(_to_debrujin(node.func, stack), _to_debrujin(node.arg, stack))
+    elseif node isa ProxyToken
+        return ProxyDB(node.body)
     else
         throw(ArgumentError("node must be a `VariableToken`, `LambdaToken`, or `ApplyToken`, got $(typeof(node))"))
     end
@@ -84,43 +86,70 @@ Base.display(node::AbstractDBNode) = println(pretty_string(node))
 
 
 # substitution
+struct _Abs end
+struct _Right
+    value:: AbstractDBNode
+end
+struct _NewLeft
+    value:: AbstractDBNode
+end
+_Context = Union{_Abs, _Right, _NewLeft}
 
-function substitute(term::AbstractDBNode, newterm::AbstractDBNode, scope::UInt=0)
-    if term isa VarDB
-        if term.index < scope # bound variable
-            return term
-        elseif term.index == scope # substitution instance
-            newterm = shift(newterm, scope) # shift up
-            return newterm
-        else # free variable
-            return VarDB(term.index-U1) # shift down 
+function traverse(f, node::AbstractDBNode)
+    stack = _Context[]
+    depth = UInt(0)
+    result = nothing
+    node = node
+    while !isnothing(node) || !isempty(stack)
+        if !isnothing(node)
+            if node isa AbsDB
+                push!(stack, _Abs())
+                node = node.body
+                depth += 1
+            elseif node isa AppDB
+                push!(stack, _Right(node.arg))
+                node = node.func
+            else # leaf node
+                result = f(node, depth)
+                node = nothing
+            end
+        else
+            context = pop!(stack)
+            if context isa _Abs
+                result = AbsDB(result)
+                depth -= 1
+            elseif context isa _Right
+                push!(stack, _NewLeft(result))
+                node = context.value
+            elseif context isa _NewLeft
+                result = AppDB(context.value, result)
+            end
         end
-    elseif term isa AbsDB
-        return AbsDB(substitute(term.body, newterm, scope+U1))
-    elseif term isa AppDB
-        return AppDB(substitute(term.func, newterm, scope), substitute(term.arg, newterm, scope))
-    elseif term isa ProxyDB
-        return term
-    else
-        throw(ArgumentError("term must be a `VarDB`, `AbsDB`, `AppDB`, or `ProxyDB`, got $(typeof(term))"))
+    end
+    return result
+end
+
+function substitute(func::AbsDB, arg::AbstractDBNode)
+    traverse(func.body) do node, depth # ripped the first lambda, therefore the depth n bounds to variable n, not variable n-1
+        if node isa VarDB
+            if node.index == depth
+                shift_free(arg, depth)
+            elseif node.index > depth # shift down free variables
+                VarDB(node.index - 1)
+            else
+                node
+            end
+        else
+            node
+        end
     end
 end
 
-function shift(term::AbstractDBNode, offset::UInt, scope::UInt=0)
-    if term isa VarDB
-        if term.index < scope # bound variabl, e.g. 0 in λ.0 is bound where scope=1, while 0 is free in 0 where scope=0.
-            return term
-        else # free variable, 
-            return VarDB(term.index+offset)
-        end
-    elseif term isa AbsDB
-        return AbsDB(shift(term.body, offset, scope+U1))
-    elseif term isa AppDB
-        return AppDB(shift(term.func, offset, scope), shift(term.arg, offset, scope))
-    elseif term isa ProxyDB
-        return term
+shift_free(node::AbstractDBNode, n::UInt) = traverse(node) do node, depth
+    if node isa VarDB && node.index >= depth
+        VarDB(node.index + n)
     else
-        throw(ArgumentError("term must be a `VarDB`, `AbsDB`, `AppDB`, or `ProxyDB`, got $(typeof(term))"))
+        node
     end
 end
 
