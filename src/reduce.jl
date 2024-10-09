@@ -1,15 +1,15 @@
 module ReduceModule
 
-using ..DeBruijnModule: AbstractDBNode, VarNode, AbsNode, AppNode, ProxyNode, substitute
+using ..DeBruijnModule: DBNode, VarNode, AbsNode, AppNode, ProxyNode, substitute
 using MLStyle: @data
 
 @data ReductionResult{E} begin
     Normalized()
-    Ok(::AbstractDBNode)
+    Ok(::DBNode)
     Err(E)
 end
 
-function beta_reduce(node::AbstractDBNode)
+function beta_reduce(node::DBNode)
     @match node begin
         n::VarNode || n::ProxyNode => Normalized()
         AbsNode(index, body) => begin
