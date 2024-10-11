@@ -18,7 +18,7 @@ function beta_reduce(node::DBNode)
             Ok(AbsDB(@check result))
         end
         AppDB(func, arg) => @match func begin
-            ::AbsDB => substitute(func.body, arg)
+            ::AbsDB => substitute(func, arg)
             ::VarDB => normalized
             ::AppDB => begin
                 reduced_func = @check beta_reduce(func) Normalized # other Err cases are directly returned

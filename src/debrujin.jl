@@ -8,7 +8,7 @@ using MLStyle
     VarDB(index::UInt)
     AbsDB(body::DBNode)
     AppDB(func::DBNode, arg::DBNode)
-    ProxyDB(body)
+    ProxyDB{T}::(value::T)=>DBNode
 end
 
 # parse
