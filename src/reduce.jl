@@ -1,41 +1,30 @@
 module ReduceModule
 
-using ..DeBruijnModule: DBNode, VarNode, AbsNode, AppNode, ProxyNode, substitute
-using MLStyle: @data
+using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, substitute
+using LambdaRegression: Result, Ok, Err, @check
+using MLStyle
 
-@data ReductionResult{E} begin
-    Normalized()
-    Ok(::DBNode)
-    Err(E)
-end
+struct Normalized end
+ReduceErr = Union{Normalized}
+ReduceResult = Result{DBNode, ReduceErr}
+const normalized = Err(Normalized())
+
 
 function beta_reduce(node::DBNode)
     @match node begin
-        n::VarNode || n::ProxyNode => Normalized()
-        AbsNode(index, body) => begin
+        n::VarDB || n::ProxyDB => normalized
+        AbsDB(body) => begin
             result = beta_reduce(body)
-            @match result begin
-                Normalized() => Normalized()
-                Ok(body) => Ok(AbsNode(index, body))
-                Err(e) => Err(e)
-            end
+            Ok(AbsDB(@check result))
         end
-        AppNode(func, arg) => @match func begin
-            ::AbsNode => substitute(func.body, arg)
-            ::VarNode => Normalized()
-            ::AppNode => begin
-                result = beta_reduce(func)
-                @match result begin
-                    Err(e) => Err(e)
-                    Ok(func) => Ok(AppNode(func, arg))
-                    Normalized() => begin
-                        result = beta_reduce(arg)
-                        @match result begin
-                            Err(e) => Err(e)
-                            Ok(arg) => Ok(AppNode(func, arg))
-                            Normalized() => Normalized()
-                        end
-                    end
+        AppDB(func, arg) => @match func begin
+            ::AbsDB => substitute(func.body, arg)
+            ::VarDB => normalized
+            ::AppDB => begin
+                reduced_func = @check beta_reduce(func) Normalized # other Err cases are directly returned
+                @match reduced_func begin # only Normalized Err is possible
+                    Ok(func) => Ok(AppDB(func, arg))
+                    Err(::Normalized) => Ok(AppDB(func, @check beta_reduce(arg)))
                 end
             end
         end           
