@@ -1,7 +1,7 @@
 module ReduceModule
 
 using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, substitute
-using LambdaRegression: Result, Ok, Err, @check
+using LambdaRegression: Err, @check
 using MLStyle
 
 struct Normalized end
@@ -13,10 +13,7 @@ const normalized = Err(Normalized())
 function beta_reduce(node::DBNode)
     @match node begin
         n::VarDB || n::ProxyDB => normalized
-        AbsDB(body) => begin
-            result = beta_reduce(body)
-            Ok(AbsDB(@check result))
-        end
+        AbsDB(body) => AbsDB(@check beta_reduce(body))
         AppDB(func, arg) => @match func begin
             ::AbsDB => substitute(func, arg)
             ::VarDB => normalized
@@ -27,6 +24,7 @@ function beta_reduce(node::DBNode)
                     Err(::Normalized) => Ok(AppDB(func, @check beta_reduce(arg)))
                 end
             end
+            ::ProxyDB => @check substitute(func, arg)
         end           
     end
 end

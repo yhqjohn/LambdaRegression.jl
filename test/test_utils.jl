@@ -1,23 +1,14 @@
-using LambdaRegression: Result, Ok, Err, @check
+using LambdaRegression: Err, @check
 
-IntErr = Result{Real, String}
-
-ok1 = Ok(1)
 err1 = Err("error")
 
-function passresult(x)::IntErr
-    @check x
-end
-
-@test passresult(ok1) === Ok{Real, String}(1)
-@test passresult(err1) === Err{Real, String}("error")
 
 #test upcasting
-function increase(x)::IntErr
+function increase(x)
     (@check x) + 1
 end
-@test increase(ok1) === Ok{Real, String}(2)
-@test increase(err1) === Err{Real, String}("error")
+@test increase(1) === 2
+@test increase(err1) === Err("error")
 
 #test pass through
 function passthrough(x)
@@ -28,7 +19,7 @@ function passthrough(x)
         return 2
     end
 end
-@test passthrough(ok1) === 1
+@test passthrough(1) === 1
 @test passthrough(err1) === 2
 @test passthrough(Err(1)) === Err(1)
 

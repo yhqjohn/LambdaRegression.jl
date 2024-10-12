@@ -9,7 +9,7 @@ using .ParseModule: @lambda
 include("debrujin.jl")
 using .DeBruijnModule: to_debrujin
 
-include("reduce.jl")
+# include("reduce.jl")
 
 
 end # module LambdaRegression
