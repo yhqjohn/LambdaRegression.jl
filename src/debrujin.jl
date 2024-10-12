@@ -1,7 +1,6 @@
 module DeBruijnModule
 
 import ..ParseModule: AbstractToken, AbstractVariableToken, VariableToken, DeBruijnToken, LambdaToken, DeBruijnLambdaToken, ApplyToken, ProxyToken, unfold
-import LambdaRegression: U1, U0
 using MLStyle
 
 @data DBNode begin

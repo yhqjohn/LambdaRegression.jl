@@ -5,8 +5,6 @@ using LambdaRegression: Err, @check
 using MLStyle
 
 struct Normalized end
-ReduceErr = Union{Normalized}
-ReduceResult = Result{DBNode, ReduceErr}
 const normalized = Err(Normalized())
 
 
@@ -20,8 +18,8 @@ function beta_reduce(node::DBNode)
             ::AppDB => begin
                 reduced_func = @check beta_reduce(func) Normalized # other Err cases are directly returned
                 @match reduced_func begin # only Normalized Err is possible
-                    Ok(func) => Ok(AppDB(func, arg))
-                    Err(::Normalized) => Ok(AppDB(func, @check beta_reduce(arg)))
+                    Err(:Normalized) => AppDB(func, @check beta_reduce(arg))
+                    _ => AppDB(reduced_func, arg)
                 end
             end
             ::ProxyDB => @check substitute(func, arg)
