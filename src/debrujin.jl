@@ -74,7 +74,7 @@ function traverse(f, node::DBNode)
             end
         else
             result = @match pop!(stack) begin
-                Abs => AbsDB(result)
+                Abs => (depth -= 1; AbsDB(result))
                 Right(value) => begin
                     push!(stack, NewLeft(result))
                     node = value

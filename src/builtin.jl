@@ -29,7 +29,7 @@ const ILEQ = FunctionTerm(x->(y->x <= y), :Int64 >> :Int64 >> :Bool, "<=")
 
 const IFTHENELSE = FunctionTerm(x->(y->(z->x ? y : z)), :Bool >> :Any >> :Any >> :Unknown, "if-then-else")
 
-const YCOMBINATOR = to_debrujin(@lambda f->(x->f(x(x)))(x->f(x(x))))
+const YCOMBINATOR = to_debrujin(@lambda f->((x->f(x(x)))*(x->f(x(x)))))
 
 FIBB = to_debrujin(@lambda f->(n->(IFTHENELSE * (ILEQ * n * 1) * 1 * (IMUL * n * (f * (ISUB * n * 1))))))
 
