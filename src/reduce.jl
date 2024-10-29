@@ -8,21 +8,21 @@ struct Normalized end
 const normalized = Err(Normalized())
 
 
-function beta_reduce(node::DBNode)
+function beta_reduce(node::DBNode, eval=false)
     @match node begin
         n::VarDB || n::ProxyDB => normalized
-        AbsDB(body) => AbsDB(@check beta_reduce(body))
+        AbsDB(body) => AbsDB(@check beta_reduce(body, eval))
         AppDB(func, arg) => @match func begin
-            ::AbsDB => substitute(func, arg)
+            ::AbsDB => substitute(func, arg, eval)
             ::VarDB => normalized
             ::AppDB => begin
                 reduced_func = @check beta_reduce(func) Normalized # other Err cases are directly returned
                 @match reduced_func begin # only Normalized Err is possible
-                    Err(:Normalized) => AppDB(func, @check beta_reduce(arg))
+                    Err(:Normalized) => AppDB(func, @check beta_reduce(arg, eval))
                     _ => AppDB(reduced_func, arg)
                 end
             end
-            ::ProxyDB => @check substitute(func, arg)
+            ::ProxyDB => @check substitute(func, arg, eval)
         end           
     end
 end

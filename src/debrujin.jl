@@ -84,7 +84,7 @@ function traverse(f, node::DBNode)
     return result
 end
 
-substitute(func::AbsDB, arg::DBNode) = traverse(func.body) do node, depth 
+substitute(func::AbsDB, arg::DBNode, _eval=false) = traverse(func.body) do node, depth 
     @match node begin # ripped the first lambda, therefore the depth n bounds to variable n, not variable n-1
         VarDB(index) && if index == depth end => shift_free(arg, depth)
         VarDB(index) && if index > depth end => VarDB(index - 1)

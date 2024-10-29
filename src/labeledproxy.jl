@@ -3,6 +3,7 @@ module LabeledProxyModule
 using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
 using ..DeBruijnModule
 using LambdaRegression: Err
+using ..ReduceModule: normalized
 
 typelabel(::ProxyDB{T}) where T = typelabel(T)
 typelabel(::Int) = :Int
@@ -38,12 +39,18 @@ FunctionTerm(func, label, alias::String) = (term = FunctionTerm(func, label); se
 struct TypeMismatch end
 const type_mismatch_err = Err(TypeMismatch())
 
-function DeBruijnModule.substitute(a::ProxyDB{S}, b::ProxyDB{T}) where {S, T}
+function DeBruijnModule.substitute(a::ProxyDB{S}, b::ProxyDB{T}, eval=false) where {S, T}
     if isapplicable(S, T)
-        return ProxyDB(a.value(b.value))
+        if eval
+            return ProxyDB(a.value(b.value))
+        else
+            return normalized
+        end
     else
         return type_mismatch_err
     end
 end
+
+
 
 end
