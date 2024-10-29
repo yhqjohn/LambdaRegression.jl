@@ -50,6 +50,9 @@ pretty_string(node::ProxyDB) = string(node.value)
 Base.display(io::IO, node::DBNode) = println(io, pretty_string(node))
 Base.display(node::DBNode) = println(pretty_string(node))
 
+# apply
+(n::DBNode)(m) = AppDB(n, ProxyDB(m))
+(n::DBNode)(m::DBNode) = AppDB(n, m)
 
 @data Context begin
     Abs

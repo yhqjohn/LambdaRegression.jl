@@ -28,4 +28,17 @@ function beta_reduce(node::DBNode, eval=false)
 end
 
 
+struct NormalizationLimitExceeded end
+const normalization_limit_exceeded = Err(NormalizationLimitExceeded())
+function normalize(node::DBNode, eval=false; max_iter=100)
+    for _ in 1:max_iter
+        node = @check beta_reduce(node, eval) Normalized
+        if node isa Normalized
+            return node
+        end
+    end
+    normalization_limit_exceeded
+end
+
+
 end # module ReduceModule

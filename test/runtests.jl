@@ -12,6 +12,6 @@ end
     include("test_utils.jl")
 end
 
-# @safetestset "Test reduce" begin
-#     include("test_reduce.jl")
-# end
+@safetestset "Test reduce" begin
+    include("test_reduce.jl")
+end

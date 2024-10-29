@@ -23,7 +23,7 @@ Base.show(io::IO, pair::LabelPair) = print(io, pair.a, " -> ", pair.b isa LabelP
 
 isapplicable(a, b) = false
 isapplicable(a::ProxyDB, b::ProxyDB) = isapplicable(typelabel(a), typelabel(b))
-isapplicable(a::LabelPair, b::Union{Symbol, LabelPair}) = a.a == b
+isapplicable(a::LabelPair, b::Union{Symbol, LabelPair}) = a.a == b || a.a == :Any || b == :Unknown
 
 
 struct FunctionTerm
