@@ -16,9 +16,14 @@ yid = beta_reduce(yid)
 display(yid)
 
 fibb = YCOMBINATOR(FIBB)
-fibb5 = fibb(5)
-display(fibb5)
-fibb5 = beta_reduce(fibb5)
-display(fibb5)
-fibb5 = beta_reduce(fibb5)
-display(fibb5)
+let fibb5 = fibb(5)
+    while true
+        fibb5 = beta_reduce(fibb5, true)
+        display(fibb5)
+        if isa(fibb5, ProxyDB)
+            break
+        end
+    end
+    fibb5
+end
+@test fibb5 == ProxyDB(5)

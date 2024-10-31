@@ -87,7 +87,10 @@ function traverse(f, node::DBNode)
     return result
 end
 
-substitute(func::AbsDB, arg::DBNode, _eval=false) = traverse(func.body) do node, depth 
+struct Normalized end
+const normalized = Err(Normalized())
+
+substitute(func::AbsDB, arg::DBNode, context=nothing) = traverse(func.body) do node, depth 
     @match node begin # ripped the first lambda, therefore the depth n bounds to variable n, not variable n-1
         VarDB(index) && if index == depth end => shift_free(arg, depth)
         VarDB(index) && if index > depth end => VarDB(index - 1)
@@ -102,5 +105,20 @@ shift_free(node::DBNode, n::UInt) = traverse(node) do node, depth
     end
 end
 
+# substitution rules for proxy
+substitute(::ProxyDB, _, _) = normalized
+
+
+# show proxy
+proxy_alias_dict = Dict{ProxyDB, String}()
+set_alias!(p::ProxyDB, alias::String) = proxy_alias_dict[p] = alias
+
+function Base.show(io::IO, ::MIME"text/plain", p::ProxyDB)
+    if haskey(proxy_alias_dict, p)
+        print(io, proxy_alias_dict[p])
+    else
+        print(io, "ProxyDB(", p.value, ")")
+    end
+end
 
 end # module DeBruijnModule

@@ -1,56 +1,83 @@
 module LabeledProxyModule
 
-using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, proxy_alias_dict, normalized
 using ..DeBruijnModule
 using LambdaRegression: Err
-using ..ReduceModule: normalized
+using ..ReduceModule:beta_reduce
+using MLStyle
 
-typelabel(::ProxyDB{T}) where T = typelabel(T)
-typelabel(::Int) = :Int
-typelabel(::Float64) = :Float64
-typelabel(::Bool) = :Bool
-typelabel(_) = :Unknown
+abstract type AbstractTypeLabel end
 
-struct LabelPair
-    a::Union{Symbol, LabelPair}
-    b::Union{Symbol, LabelPair}
+@data SimpleTypeLabel begin
+    LabelType(label::Symbol)
+    FunctionType(arg::SimpleType, ret::SimpleType)
+    FunctionalType(arg::SimpleType, func::Any)
+    UnknownType()
 end
-
-Base.:>>(a::Symbol, b::Symbol) = LabelPair(a, b)
-Base.:>>(a::Symbol, b::LabelPair) = LabelPair(a, b)
-Base.:>>(a::LabelPair, b::Symbol) = LabelPair(a, b)
-Base.show(io::IO, pair::LabelPair) = print(io, pair.a, " -> ", pair.b isa LabelPair ? "($(pair.b))" : pair.b)
-
-isapplicable(a, b) = false
-isapplicable(a::ProxyDB, b::ProxyDB) = isapplicable(typelabel(a), typelabel(b))
-isapplicable(a::LabelPair, b::Union{Symbol, LabelPair}) = a.a == b || a.a == :Any || b == :Unknown
-
-
-struct FunctionTerm
-    func
-    label::LabelPair
-end
-termalias = Dict{Union{FunctionTerm}, String}()
-setalias!(term::FunctionTerm, alias::String) = termalias[term] = alias
-Base.show(io::IO, ::MIME"text/plain", term::FunctionTerm) = print(io, get(termalias, term, string(term)))
-FunctionTerm(func, label, alias::String) = (term = FunctionTerm(func, label); setalias!(term, alias); term)
-(f::FunctionTerm)(x) = f.func(x)
+Base.:>>(a::SimpleTypeLabel, b::SimpleTypeLabel) = FunctionType(a, b)
+Base.:>>(a::Symbol, b::Symbol) = FunctionType(LabelType(a), LabelType(b))
+Base.:>>(a::SimpleTypeLabel, b::Symbol) = FunctionalType(a, LabelType(b))
+Base.:>>(a::Symbol, b::SimpleTypeLabel) = FunctionalType(LabelType(a), b)
+argtype(f::FunctionalType) = f.arg
+argtype(f::FunctionType) = f.arg
+argtype(::LabelType) = nothing
+argtype(::UnknownType) = UnknownType()
+isapplicable(a::SimpleTypeLabel, b::SimpleTypeLabel) = argtype(a) == typelabel(b) || argtype(a) === UnknownType()
 
 struct TypeMismatch end
-const type_mismatch_err = Err(TypeMismatch())
+typemismatch = Err(TypeMismatch())
 
-function DeBruijnModule.substitute(a::ProxyDB{S}, b::ProxyDB{T}, eval=false) where {S, T}
-    if isapplicable(S, T)
-        if eval
-            return ProxyDB(a.value(b.value))
-        else
-            return normalized
-        end
+rettype(f::FunctionType, arg::SimpleTypeLabel) = f.ret
+rettype(f::FunctionalType, arg::SimpleTypeLabel) = f.func(arg)
+
+function typeinfer(a::SimpleTypeLabel, b::SimpleTypeLabel)
+    if isapplicable(a, b)
+        rettype(b, a)
     else
-        return type_mismatch_err
+        typemismatch
     end
 end
 
+struct LabeledTerm{V, T<:AbstractTypeLabel}
+    value::V
+    label::T
+end
 
+LabeledProxy{V, T} = ProxyDB{LabeledTerm{V, T}}
+function Base.show(io::IO, ::MIME"text/plain", p::LabeledProxy)
+    if haskey(proxy_alias_dict, p)
+        print(io, proxy_alias_dict[p])
+    else
+        print(io, p.value.value, "::", p.value.label)
+    end
+end
+argtype(p::LabeledProxy) = argtype(p.value.label)
+typelabel(p::LabeledProxy) = p.value.label
+value(p::LabeledProxy) = p.value.value
+typeinfer(a::LabeledProxy, b::LabeledProxy) = typeinfer(typelabel(a), typelabel(b))
+
+
+to_labeled_proxy(p::ProxyDB) = ProxyDB(LabeledTerm(p.value, typelabel(p.value)))
+labelize(n::DBNode) = traverse(n) do node, depth
+    @match node begin
+        ProxyDB(value) => to_labeled_proxy(ProxyDB(value))
+        _ => node
+    end
+end
+
+typelabel(_) = UnknownType()
+typelabel(::Int64) = LabelType(:Int64)
+typelabel(::Float64) = LabelType(:Float64)
+typelabel(::Bool) = LabelType(:Bool)
+
+# substitution rules for labeled proxy
+function DeBruijnModule.substitute(a::LabeledProxy, b::LabeledProxy, context)
+    return_type = @check typeinfer(typelabel(a), typelabel(b))
+    if context === nothing
+        normalized
+    else
+        LabeledTerm(value(a)(value(b)), return_type)
+    end
+end
 
 end
