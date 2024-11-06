@@ -13,11 +13,19 @@ end
     value::E
 end
 
+# struct UncheckedException <: Exception
+#     value:: Err
+# end
+
+# global _panic_when_check_fails = false
+
+# set_check_panic!(b::Bool) = global _panic_when_check_fails = b
+
 macro check(expr, passthroughs...)
     if length(passthroughs) == 0
         passthrough_expr = :()
     else
-        passthroughs = [:(Err(::$x)) for x in passthroughs]
+        passthroughs = [:(Err(::$(esc(x)))) for x in passthroughs]
         passthrough_expr = reduce(passthroughs) do x, y
             :($x || $y)
         end
@@ -29,10 +37,34 @@ macro check(expr, passthroughs...)
             @case $(passthrough_expr)
                 output = result
             @case Err(_)
+                # if _panic_when_check_fails
+                #     throw(UncheckedException(result))
+                # end
                 return result
             @case _
                 output = result
         end
         output
+    end
+end
+
+alias_dict = Dict{Any, String}()
+
+function _show_backup(io::IO, x::T) where {T}
+    super = supertype(T)
+    invoke(Base.show, Tuple{IO, super}, io, x)
+end
+
+set_alias!(x, alias) = alias_dict[x] = alias
+
+macro alias(T)
+    quote
+        function Base.show(io::IO, x::$(esc(T)))
+            if haskey(alias_dict, x)
+                print(io, alias_dict[x])
+            else
+                _show_backup(io, x)
+            end
+        end
     end
 end

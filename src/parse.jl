@@ -169,7 +169,7 @@ function parse_lambda(expr, context=[])
         check_arg(expr)
         return parse_arg(expr)
     else # case 2: an unbounded variable
-        return ProxyToken(expr)
+        return :(ProxyToken($(esc(expr))))
     end
 end
 
