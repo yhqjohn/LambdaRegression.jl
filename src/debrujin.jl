@@ -1,7 +1,7 @@
 module DeBruijnModule
 
 import ..ParseModule: AbstractToken, AbstractVariableToken, VariableToken, DeBruijnToken, LambdaToken, DeBruijnLambdaToken, ApplyToken, ProxyToken, unfold
-import LambdaRegression: Err, @alias
+import LambdaRegression: Err, @alias, alias_dict
 using MLStyle
 
 @data DBNode begin
@@ -10,6 +10,10 @@ using MLStyle
     AppDB(func::DBNode, arg::DBNode)
     ProxyDB{T}::(value::T)=>DBNode
 end
+ProxyDB(value::DBNode) = value
+
+value(node::ProxyDB) = node.value
+Base.:(==)(p::ProxyDB, q::ProxyDB) = value(p) == value(q)
 
 # parse
 to_debrujin(node::AbstractToken) = _to_debrujin(unfold(node))
@@ -37,17 +41,24 @@ end
 # pretty_print
 pretty_string(node::VarDB) = "#$(node.index)"
 function pretty_string(node::AbsDB)
+    if haskey(alias_dict, node)
+        return alias_dict[node]
+    end
+
     body_str = pretty_string(node.body)
     node.body isa AppDB && (body_str = "($body_str)")
     return "λ.$body_str"
 end
 function pretty_string(node::AppDB)
+    if haskey(alias_dict, node)
+        return alias_dict[node]
+    end
     func_str = pretty_string(node.func)
     arg_str = pretty_string(node.arg)
     node.arg isa AppDB && (arg_str = "($arg_str)")
     return "$func_str $arg_str"
 end
-pretty_string(node::ProxyDB) = repr(node.value)
+pretty_string(node::ProxyDB) = string(value(node))
 Base.display(io::IO, node::DBNode) = println(io, pretty_string(node))
 Base.display(node::DBNode) = println(pretty_string(node))
 
@@ -111,8 +122,8 @@ substitute(::ProxyDB, _, _) = normalized
 
 
 # show specific patterns
-@alias DBNode
-# show proxy
+@alias AbsDB
+@alias AppDB
 @alias ProxyDB
 
 end # module DeBruijnModule

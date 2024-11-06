@@ -50,7 +50,7 @@ end
 
 alias_dict = Dict{Any, String}()
 
-function _show_backup(io::IO, x::T) where {T}
+function _show_backup(io::IO, x, T)
     super = supertype(T)
     invoke(Base.show, Tuple{IO, super}, io, x)
 end
@@ -63,7 +63,7 @@ macro alias(T)
             if haskey(alias_dict, x)
                 print(io, alias_dict[x])
             else
-                _show_backup(io, x)
+                _show_backup(io, x, $(esc(T)))
             end
         end
     end

@@ -34,17 +34,33 @@ end
 
 function beta_reduce(node::DBNode)
     @match node begin
-        n::VarDB || n::ProxyDB => normalized
-        AppDB(func::ProxyDB, arg::ProxyDB) => ProxyDB(@check func.value(arg.value))
         AppDB(func, arg) => @match func begin
             ::AbsDB => substitute(func, arg)
-            _ => @match beta_reduce(func) begin
-                ::Err{Normalized} => AppDB(func, @check beta_reduce(arg))
+            ::ProxyDB => @match substitute(func, arg) begin
+                n::DBNode => n
+                ::Err{Normalized} => @match beta_reduce(arg) begin
+                    e::Err{Normalized} => e
+                    n::DBNode => AppDB(func, n)
+                    e::Err => e
+                end
+                e::Err => e
+                other => error("unexpected result: $other")
+            end
+            ::AppDB => @match beta_reduce(func) begin
+                ::Err{Normalized} => @match beta_reduce(arg) begin
+                    e::Err{Normalized} => e
+                    n::DBNode => AppDB(n, arg)
+                    e::Err => e
+                end
                 n::DBNode => AppDB(n, arg)
                 e::Err => e
             end
         end
-        AbsDB(body) => AbsDB(@check beta_reduce(body))  
+        n::VarDB || n::ProxyDB => normalized
+        AbsDB(body) => @match beta_reduce(body) begin
+            n::DBNode => AbsDB(n)
+            e::Err => e
+        end
     end
 end
 
@@ -54,9 +70,9 @@ const normalization_limit_exceeded = Err(NormalizationLimitExceeded())
 function normalize(node::DBNode; max_iter=100, normalize_external=false, max_iter_external=100)
     node = node
     for _ in 1:max_iter
-        if normalize_external
-            node = @check external_normalize(node; max_iter=max_iter_external)
-        end
+        # if normalize_external
+        #     node = @check external_normalize(node; max_iter=max_iter_external)
+        # end
         reduced = @check beta_reduce(node) Normalized
         if reduced === normalized
             return node
