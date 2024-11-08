@@ -21,15 +21,16 @@ new_foo = traverse(foo) do x, n
     if x isa VarDB
         VarDB(x.index + 1)
     else
-        x
+        nothing
     end
 end
 @test new_foo == to_debrujin(@lambda (*)->(*)->(&4 * &2 * ((*)->&1 * &3)))
+
 new_foo2 = traverse(new_foo) do x, n
     if x isa VarDB
         ProxyDB(Int(x.index))
     else
-        x
+        nothing
     end
 end
 @test new_foo2 == to_debrujin(@lambda (*)->(*)->(4 * 2 * ((*)->1 * 3)))

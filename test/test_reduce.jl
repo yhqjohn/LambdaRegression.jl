@@ -47,7 +47,7 @@ ift = beta_reduce(ift)
 
 fact = YCOMBINATOR(FACT)
 fact5 = let fact5 = labelize(fact(5))
-    for _ in 1:500
+    for _ in 1:30
         display(fact5)
         fact5 = beta_reduce(fact5)
         if isa(fact5, ProxyDB)

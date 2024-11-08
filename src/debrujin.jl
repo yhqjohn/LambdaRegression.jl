@@ -79,10 +79,15 @@ function traverse(f, node::DBNode)
     node = node
     while !isnothing(node) || !isempty(stack)
         if !isnothing(node)
-            node = @match node begin
-                AbsDB(body) =>(push!(stack, Abs); depth += 1; body)
-                AppDB(func, arg) =>(push!(stack, Right(arg)); func)
-                _ => (result = f(node, depth); node = nothing)
+            result = f(node, depth)
+            if isnothing(result)
+                node = @match node begin
+                    AbsDB(body) =>(push!(stack, Abs); depth += 1; body)
+                    AppDB(func, arg) =>(push!(stack, Right(arg)); func)
+                    _ => (result= node; node = nothing)
+                end
+            else
+                node = nothing
             end
         else
             result = @match pop!(stack) begin
@@ -94,7 +99,7 @@ function traverse(f, node::DBNode)
                 end
                 NewLeft(value) => AppDB(value, result)
             end
-        end
+        end        
     end
     return result
 end
@@ -102,23 +107,37 @@ end
 struct Normalized end
 const normalized = Err(Normalized())
 
-substitute(func::AbsDB, arg::DBNode) = traverse(func.body) do node, depth 
+lambda_substitute(func::AbsDB, arg::DBNode) = traverse(func.body) do node, depth 
     @match node begin # ripped the first lambda, therefore the depth n bounds to variable n, not variable n-1
         VarDB(index) && if index == depth end => shift_free(arg, depth)
         VarDB(index) && if index > depth end => VarDB(index - 1)
-        _ => node
+        _ => nothing
     end
 end
+substitute(func::AbsDB, arg::DBNode) = lambda_substitute(func, arg)
 
 shift_free(node::DBNode, n::UInt) = traverse(node) do node, depth
     @match node begin
         VarDB(index) && if index >= depth end => VarDB(index + n)
+        _ => nothing
+    end
+end
+
+substitute(func::AbsDB, arg::ProxyDB) = eager_normalize(lambda_substitute(func, arg))
+
+function eager_normalize(node::DBNode)
+    @match node begin
+        AbsDB(body) => AbsDB(eager_normalize(body))
+        AppDB(func, arg) => @match (eager_normalize(func), eager_normalize(arg)) begin
+            (new_func::ProxyDB, new_arg::ProxyDB) => substitute(new_func, new_arg)
+            (new_func, new_arg) => AppDB(new_func, new_arg)
+        end
         _ => node
     end
 end
 
-# substitution rules for proxy
-substitute(::ProxyDB, _, _) = normalized
+
+
 
 
 # show specific patterns

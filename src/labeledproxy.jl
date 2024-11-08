@@ -72,7 +72,7 @@ labelize(x) = ProxyDB(TypedTerm(x, typelabel(x)))
 labelize(n::DBNode) = traverse(n) do node, depth
     @match node begin
         ::ProxyDB => labelize(node)
-        _ => node
+        _ => nothing
     end
 end
 labelize(p::ProxyDB) = labelize(p.value)
