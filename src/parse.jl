@@ -1,5 +1,9 @@
 module ParseModule
 using MacroTools, AbstractTrees
+using TestItems
+
+public parse_lambda, unfold
+export @lambda
 
 abstract type AbstractToken <: AbstractNode{Any} end
 abstract type AbstractVariableToken <: AbstractToken end
@@ -173,6 +177,39 @@ function parse_lambda(expr, context=[])
     end
 end
 
+@testitem "parse lambda" begin
+    import LambdaRegression.ParseModule: parse_lambda
+
+    # case 1: a bounded variable
+    ## case 1.1: a named variable `x`
+    @test parse_lambda(:(x), [:x]) == :(VariableToken(:x))
+    ## case 1.2: a de Bruijn index `&1`
+    @test parse_lambda(:(&1), [:x]) == :(DeBruijnToken(1))
+    # case 2: an unbounded variable
+    @test parse_lambda(:(y), [:x]) == :(ProxyToken($(esc(:y))))
+
+    # case 3: an abstraction expression
+    ## case 3.1: a single argument abstraction `x-> M`
+    @test parse_lambda(:(x->x)) == :(LambdaToken(VariableToken(:x), VariableToken(:x)))
+    ## case 3.2: a multiple argument abstraction `(x, y, z)-> M`
+    @test parse_lambda(:((x, y, z)->x)) == :(MultiLambdaToken((VariableToken(:x), VariableToken(:y), VariableToken(:z)), VariableToken(:x)))
+    ## case 3.3: a de Bruijn index abstraction `(*)-> M`
+    @test parse_lambda(:((*)->&0)) == :(DeBruijnLambdaToken(DeBruijnToken(0)))
+    @test parse_lambda(:((*)->(*)->&1)) == :(DeBruijnLambdaToken(DeBruijnLambdaToken(DeBruijnToken(1))))
+    ## case 3.4: a multiple argument De Bruijn index abstraction `(*, *)-> M`
+    @test parse_lambda(:((*, *)->&1)) == :(MultiDeBruijnLambdaToken(2, DeBruijnToken(1)))
+
+    # # case 4: an application expression
+    # ## case 4.1: a single argument application `f*x`
+    @test parse_lambda(:(f*x), [:f, :x]) == :(VariableToken(:f) * VariableToken(:x))
+    
+    # case 5: a multi-apply expression
+    ## case 5.1: a single argument multi-apply `f(x)`
+    @test parse_lambda(:(f(x)), [:f, :x]) == :(MultiApplyToken(VariableToken(:f), (VariableToken(:x),)))
+    ## case 5.2: a multiple argument multi-apply `f(x, y, z)`
+    @test parse_lambda(:(f(x, y, z)), [:f, :x, :y, :z]) == :(MultiApplyToken(VariableToken(:f), (VariableToken(:x), VariableToken(:y), VariableToken(:z))))
+end
+
 function check_arg(arg)
     arg isa Symbol && Base.isidentifier(arg) && return # case 1.1: a symbol
     arg isa Expr && arg.head==:& && arg.args[1] isa Int && return # case 1.2: a de Bruijn index
@@ -187,6 +224,52 @@ end
 macro lambda(expr)
     expr = parse_lambda(expr)
     return expr
+end
+
+@testitem "macro lambda" begin
+    import LambdaRegression.ParseModule: @lambda
+    import LambdaRegression.ParseModule: ProxyToken, LambdaToken, VariableToken, MultiLambdaToken, ApplyToken, MultiApplyToken
+    import LambdaRegression.ParseModule: DeBruijnToken, MultiDeBruijnLambdaToken, DeBruijnLambdaToken
+    using LambdaRegression.ParseModule: AbstractTrees
+
+    # case 1: bounded variable `x` or `&1`: test in later cases
+    # case 2: unbounded variable
+    foo = 1
+    lambda_foo = @lambda foo
+    @test lambda_foo == ProxyToken(1)
+
+    # case 3: abstraction expression
+    # case 3.1: a single argument abstraction `x-> M`
+    id1 = @lambda x->x
+    @test id1 == LambdaToken(VariableToken(:x), VariableToken(:x))
+    # case 3.2: a multiple argument abstraction `(x, y, z)-> M`
+    k1 = @lambda (x, y)->x
+    @test k1 == MultiLambdaToken((VariableToken(:x), VariableToken(:y)), VariableToken(:x))
+    # case 3.3: a de Bruijn index abstraction `(*)-> M`
+    id2 = @lambda (*)->&0
+    @test id2 == DeBruijnLambdaToken(DeBruijnToken(0))
+    # case 3.4: a multiple argument De Bruijn index abstraction `(*, *)-> M`
+    id3 = @lambda (*, *)->&1
+    @test id3 == MultiDeBruijnLambdaToken(2, DeBruijnToken(1))
+    # case 4: an application expression
+    # case 4.1: a single argument application `f*x`
+    app1 = @lambda f->x->y->(f*x*y)
+    @test app1 == LambdaToken(VariableToken(:f), 
+        LambdaToken(VariableToken(:x), 
+            LambdaToken(VariableToken(:y), 
+                ApplyToken(
+                    ApplyToken(VariableToken(:f), VariableToken(:x)),
+                    VariableToken(:y)
+                )
+            )
+        )
+    )
+    # case 5: a multi-apply expression
+    # case 5.1: a single argument multi-apply `f(x)`: should be OK if 5.2 is OK
+    # case 5.2: a multiple argument multi-apply `f(x, y, z)`:
+    app2 = @lambda (f, x, y)->(f(x, y))
+    @test app2 == MultiLambdaToken((VariableToken(:f), VariableToken(:x), VariableToken(:y)), 
+        MultiApplyToken(VariableToken(:f), (VariableToken(:x), VariableToken(:y))))
 end
 
 function unfold(node::AbstractToken)
@@ -231,5 +314,22 @@ function unfold(node::AbstractToken)
     end
 end
 
+@testitem "unfold" begin
+    import LambdaRegression.ParseModule: unfold, @lambda
+    using LambdaRegression.ParseModule: AbstractTrees
+    app1 = @lambda f->x->y->(f*x*y)
+    app2 = @lambda (f, x, y)->(f(x, y))
+    @test unfold(app1) == app1
+    @test unfold(app2) == app1
+
+    fxx1 = @lambda (*)->(*)->&0*&1*&1
+    fxx2 = @lambda (*, *)->&0*&1*&1
+    @test unfold(fxx2) == fxx1
+
+    # hard case: y combinator
+    y_combinator = @lambda f->(x->f(x(x)))(x->f(x(x)))
+    y_combinator2 = @lambda f->((x->f*(x*x)) * (x->f*(x*x)))
+    @test unfold(y_combinator) == y_combinator2
+end
 
 end

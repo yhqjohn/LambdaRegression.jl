@@ -1,17 +1,15 @@
-using LambdaRegression.DeBruijnModule: to_debrujin, ProxyDB
+using LambdaRegression.DeBruijnModule: ProxyDB, DBNode
 using LambdaRegression.ParseModule: @lambda
-using LambdaRegression.ReduceModule: beta_reduce, normalized, external_reduce, external_normalize
+using LambdaRegression.ReduceModule: beta_reduce, normalized
 using LambdaRegression.LabeledProxyModule: labelize
-using LambdaRegression.BuiltinTermsModule
-using LambdaRegression: alias_dict
 using Test
 
 
-# ident1 = to_debrujin(@lambda (x->x)*1)
-# display(ident1)
-# display(beta_reduce(ident1))
-# @test beta_reduce(ident1) == ProxyDB(1)
-# @test beta_reduce(beta_reduce(ident1)) == normalized
+ident1 = DBNode{Int}(@lambda (x->x)*1)
+display(ident1)
+display(beta_reduce(ident1))
+@test beta_reduce(ident1) == ProxyDB(1)
+@test beta_reduce(beta_reduce(ident1)) == normalized
 
 # yid = YCOMBINATOR(ident1)
 # display(yid)
@@ -39,24 +37,24 @@ using Test
 #     @test sub51.value.value == 4
 # end
 
-ift = labelize(@lambda IFTHENELSE*false)
-ift = beta_reduce(ift)
-@test ift === KI
+# ift = labelize(@lambda IFTHENELSE*false)
+# ift = beta_reduce(ift)
+# @test ift === KI
 
 
 
-fact = YCOMBINATOR(FACT)
-fact5 = let fact5 = labelize(fact(5))
-    for _ in 1:30
-        display(fact5)
-        fact5 = beta_reduce(fact5)
-        if isa(fact5, ProxyDB)
-            break
-        end
-    end
-    fact5
-end
-display(fact5)
-@test fact5 == ProxyDB(120)
+# fact = YCOMBINATOR(FACT)
+# fact5 = let fact5 = labelize(fact(5))
+#     for _ in 1:30
+#         display(fact5)
+#         fact5 = beta_reduce(fact5)
+#         if isa(fact5, ProxyDB)
+#             break
+#         end
+#     end
+#     fact5
+# end
+# display(fact5)
+# @test fact5 == ProxyDB(120)
 
 

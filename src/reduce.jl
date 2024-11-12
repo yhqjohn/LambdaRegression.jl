@@ -1,46 +1,45 @@
 module ReduceModule
 
-using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, substitute, Normalized, normalized
+using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, substitute
 using LambdaRegression: Err, @check
 using MLStyle
 
 
-function external_reduce(node::DBNode)
-    @match node begin
-        ::VarDB || ::ProxyDB => normalized
-        AbsDB(body) => AbsDB(@check external_reduce(body))
-        AppDB(func::ProxyDB, arg::ProxyDB) => ProxyDB(@check func.value(arg.value))
-        AppDB(func, arg) => begin
-            reduced_func = @check external_reduce(func) Normalized
-            reduced_arg = @check external_reduce(arg) Normalized
-            reduced_func === normalized && reduced_arg === normalized && return normalized
-            reduced_func = reduced_func === normalized ? func : reduced_func
-            reduced_arg = reduced_arg === normalized ? arg : reduced_arg
-            AppDB(reduced_func, reduced_arg)
-        end
-    end
-end
+# function external_reduce(node::DBNode)
+#     @match node begin
+#         ::VarDB || ::ProxyDB => normalized
+#         AbsDB(body) => AbsDB(@check external_reduce(body))
+#         AppDB(func::ProxyDB, arg::ProxyDB) => ProxyDB(@check func.value(arg.value))
+#         AppDB(func, arg) => begin
+#             reduced_func = @check external_reduce(func) Normalized
+#             reduced_arg = @check external_reduce(arg) Normalized
+#             reduced_func === normalized && reduced_arg === normalized && return normalized
+#             reduced_func = reduced_func === normalized ? func : reduced_func
+#             reduced_arg = reduced_arg === normalized ? arg : reduced_arg
+#             AppDB(reduced_func, reduced_arg)
+#         end
+#     end
+# end
 
-function external_normalize(node::DBNode; max_iter=100)
-    for _ in 1:max_iter
-        reduced = @check external_reduce(node) Normalized
-        if reduced === normalized
-            return node
-        end
-        node = reduced
-    end
-    normalization_limit_exceeded
-end
+# function external_normalize(node::DBNode; max_iter=100)
+#     for _ in 1:max_iter
+#         reduced = @check external_reduce(node) Normalized
+#         if reduced === normalized
+#             return node
+#         end
+#         node = reduced
+#     end
+#     normalization_limit_exceeded
+# end
 
-function beta_reduce(node::DBNode)
+function beta_reduce(node::DBNode{T}) where {T}
     @match node begin
         AppDB(func, arg) => @match func begin
             ::AbsDB => substitute(func, arg)
             ::ProxyDB => @match substitute(func, arg) begin
                 n::DBNode => n
                 ::Err{Normalized} => @match beta_reduce(arg) begin
-                    e::Err{Normalized} => e
-                    n::DBNode => AppDB(func, n)
+                    n::DBNode => AppDB{T}(func, n)
                     e::Err => e
                 end
                 e::Err => e
@@ -48,17 +47,16 @@ function beta_reduce(node::DBNode)
             end
             ::AppDB => @match beta_reduce(func) begin
                 ::Err{Normalized} => @match beta_reduce(arg) begin
-                    e::Err{Normalized} => e
-                    n::DBNode => AppDB(n, arg)
+                    n::DBNode => AppDB{T}(n, arg)
                     e::Err => e
                 end
-                n::DBNode => AppDB(n, arg)
+                n::DBNode => AppDB{T}(n, arg)
                 e::Err => e
             end
         end
         n::VarDB || n::ProxyDB => normalized
         AbsDB(body) => @match beta_reduce(body) begin
-            n::DBNode => AbsDB(n)
+            n::DBNode => AbsDB{T}(n)
             e::Err => e
         end
     end
