@@ -3,6 +3,7 @@ module DeBruijnModule
 import ..ParseModule: AbstractToken, AbstractVariableToken, VariableToken, DeBruijnToken, LambdaToken, DeBruijnLambdaToken, ApplyToken, ProxyToken, unfold
 import LambdaRegression: Err, @alias, alias_dict
 using MLStyle
+using TestItems
 
 ########################################################
 # DeBruijn
@@ -37,8 +38,27 @@ end
 
 # type conversion
 VarDB(x) = VarDB{Union{}}(x)
-AbsDB(x) = AbsDB{Union{}}(x)
-AppDB(x, y) = AppDB{Union{}}(x, y)
+# AbsDB(x) = AbsDB{Union{}}(x) # Not needed
+# AppDB(x, y) = AppDB{Union{}}(x, y) # Not needed
+# AppDB(x::DBNode{T}, y::DBNode{T}) where {T} = AppDB{T}(x, y)
+AppDB(x::DBNode{T}, y::DBNode{S}) where {T, S<:T} = AppDB{T}(x, y)
+AppDB(x::DBNode{T}, y::DBNode{S}) where {S, T<:S} = AppDB{S}(x, y)
+
+
+@testitem "creating DeBruijn nodes" begin
+    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    v1 = VarDB(0)
+    @test VarDB(0) === VarDB{Union{}}(0)
+    v2 = VarDB{Int}(1)
+    l1 = AbsDB(v2)
+    @test l1 === AbsDB{Int}(VarDB{Int}(1))
+    app1 = AppDB(l1, v1)
+    @test app1 === AppDB{Int}(AbsDB{Int}(VarDB{Int}(1)), VarDB{Int}(0))
+    app2 = AppDB(v1, l1)
+    @test app2 === AppDB{Int}(VarDB{Int}(0), AbsDB{Int}(VarDB{Int}(1)))
+    @test ProxyDB(1) === ProxyDB{Int}(1)
+    @test ProxyDB{Int}(1.0) === ProxyDB{Int}(1)
+end
 
 Base.convert(::Type{VarDB{T}}, x::VarDB{S}) where {T, S} = VarDB{T}(x.index)
 Base.convert(::Type{DBNode{T}}, x::VarDB{S}) where {T, S} = convert(VarDB{T}, x)
@@ -48,6 +68,14 @@ Base.convert(::Type{AppDB{T}}, x::AppDB{S}) where {T, S} = AppDB{T}(convert(DBNo
 Base.convert(::Type{DBNode{T}}, x::AppDB{S}) where {T, S} = convert(AppDB{T}, x)
 Base.convert(::Type{ProxyDB{T}}, x::ProxyDB{S}) where {T, S} = ProxyDB{T}(convert(T, x.value))
 Base.convert(::Type{DBNode{T}}, x::ProxyDB{S}) where {T, S} = convert(ProxyDB{T}, x)
+
+@testitem "type conversion" begin
+    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    @test convert(DBNode{Int}, VarDB(0)) == VarDB{Int}(0) # test convert to DBNode and VarDB
+    @test convert(DBNode{Int}, AbsDB(VarDB(1))) == AbsDB{Int}(VarDB{Int}(1)) # test convert to DBNode and AbsDB
+    @test convert(DBNode{Int}, AppDB(AbsDB(VarDB(1)), VarDB(0))) == AppDB{Int}(AbsDB{Int}(VarDB{Int}(1)), VarDB{Int}(0)) # test convert to DBNode and AppDB
+    @test convert(DBNode{Int}, ProxyDB(1.0)) == ProxyDB{Int}(1) # test convert to DBNode and ProxyDB
+end
 
 ## value
 value(node::ProxyDB) = node.value
@@ -75,6 +103,55 @@ function _to_debrujin(node::AbstractToken, T, stack=AbstractVariableToken[])
     else
         throw(ArgumentError("node must be a `VariableToken`, `LambdaToken`, or `ApplyToken`, got $(typeof(node))"))
     end
+end
+
+@testitem "parse" begin
+    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    using LambdaRegression.ParseModule
+    # test default type parse
+    @test DBNode(@lambda x->x+1) == AbsDB{Any}(
+        AppDB{Any}(
+            AppDB{Any}(
+                ProxyDB{Any}(+),
+                VarDB{Any}(0)
+            ),
+            ProxyDB{Any}(1)
+        )
+    )
+    y_combinator = DBNode(@lambda f->(x->f(x*x))*(x->f(x*x)))
+    y_combinator2 = AbsDB{Any}(
+        AppDB{Any}(
+            AbsDB{Any}(
+                AppDB{Any}(
+                    VarDB{Any}(1),
+                    AppDB{Any}(
+                        VarDB{Any}(0),
+                        VarDB{Any}(0)
+                    )
+                )
+            ),
+            AbsDB{Any}(
+                AppDB{Any}(
+                    VarDB{Any}(1),
+                    AppDB{Any}(
+                        VarDB{Any}(0),
+                        VarDB{Any}(0)
+                    )
+                )
+            ),
+        )
+    )
+    display(y_combinator)
+    display(y_combinator2)
+    @test y_combinator == y_combinator2
+
+    # test parse with type
+    @test DBNode{Int}(@lambda x->x*1) == AbsDB{Int}(
+        AppDB{Int}(
+            VarDB{Int}(0),
+            ProxyDB{Int}(1)
+        )
+    )
 end
 
 # pretty_print
@@ -143,6 +220,28 @@ function traverse(f, node::DBNode{T}) where {T}
     return result
 end
 
+@testitem "traverse" begin
+    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
+    using LambdaRegression.ParseModule
+    foo = DBNode(@lambda (*)->(*)->(&3 * &1 * ((*)->&0 * &2)))
+    new_foo = traverse(foo) do x, n
+        if x isa VarDB
+            VarDB(x.index + 1)
+        else
+            nothing
+        end
+    end
+    @test new_foo == DBNode(@lambda (*)->(*)->(&4 * &2 * ((*)->&1 * &3)))
+    new_foo2 = traverse(new_foo) do x, n
+        if x isa VarDB
+            ProxyDB(Int(x.index))
+        else
+            nothing
+        end
+    end
+    @test new_foo2 == DBNode(@lambda (*)->(*)->(4 * 2 * ((*)->1 * 3)))
+end
+
 struct Normalized end
 const normalized = Err(Normalized())
 
@@ -161,6 +260,21 @@ shift_free(node::DBNode{T}, n::UInt) where {T} = traverse(node) do node, depth
         VarDB(index) && if index >= depth end => VarDB{T}(index + n)
         _ => nothing
     end
+end
+
+@testitem "shift_free" begin
+    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, shift_free
+    using LambdaRegression.ParseModule
+    foo = DBNode(@lambda (*)->(*)->(&3 * &1 * ((*)->&0 * &2)))
+    @test shift_free(foo, UInt(1)) == DBNode(@lambda (*)->(*)->(&4 * &1 * ((*)->&0 * &2)))
+end
+
+@testitem "substitute" begin
+    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, substitute
+    using LambdaRegression.ParseModule
+    foo = DBNode(@lambda (*)->(*)->(&3 * &1 * ((*)->&0 * &2)))
+    bar = DBNode(@lambda (*)->(&4 * &0))
+    @test substitute(foo, bar) == DBNode(@lambda (*)->(&2 * ((*)->(&5 * &0)) * ((*)->&0 * (*)->(&6 * &0))))
 end
 
 # substitute(func::AbsDB, arg::ProxyDB) = eager_normalize(lambda_substitute(func, arg))

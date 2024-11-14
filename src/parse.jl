@@ -249,8 +249,8 @@ end
     id2 = @lambda (*)->&0
     @test id2 == DeBruijnLambdaToken(DeBruijnToken(0))
     # case 3.4: a multiple argument De Bruijn index abstraction `(*, *)-> M`
-    id3 = @lambda (*, *)->&1
-    @test id3 == MultiDeBruijnLambdaToken(2, DeBruijnToken(1))
+    k2 = @lambda (*, *)->&1
+    @test k2 == MultiDeBruijnLambdaToken(2, DeBruijnToken(1))
     # case 4: an application expression
     # case 4.1: a single argument application `f*x`
     app1 = @lambda f->x->y->(f*x*y)
@@ -270,6 +270,14 @@ end
     app2 = @lambda (f, x, y)->(f(x, y))
     @test app2 == MultiLambdaToken((VariableToken(:f), VariableToken(:x), VariableToken(:y)), 
         MultiApplyToken(VariableToken(:f), (VariableToken(:x), VariableToken(:y))))
+
+    # test tree utils
+    display(id1)
+    display(id2)
+    display(k1)
+    display(k2)
+    display(app1)
+    display(app2)
 end
 
 function unfold(node::AbstractToken)

@@ -1,8 +1,9 @@
 module ReduceModule
 
-using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, substitute
+using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, substitute, Normalized, normalized
 using LambdaRegression: Err, @check
 using MLStyle
+using TestItems
 
 
 # function external_reduce(node::DBNode)
@@ -47,10 +48,10 @@ function beta_reduce(node::DBNode{T}) where {T}
             end
             ::AppDB => @match beta_reduce(func) begin
                 ::Err{Normalized} => @match beta_reduce(arg) begin
-                    n::DBNode => AppDB{T}(n, arg)
+                    new_arg::DBNode => AppDB{T}(func, new_arg)
                     e::Err => e
                 end
-                n::DBNode => AppDB{T}(n, arg)
+                new_func::DBNode => AppDB{T}(new_func, arg)
                 e::Err => e
             end
         end
@@ -60,6 +61,29 @@ function beta_reduce(node::DBNode{T}) where {T}
             e::Err => e
         end
     end
+end
+
+@testitem "beta reduce" begin
+    import LambdaRegression.ReduceModule: beta_reduce, normalized
+
+    # test basic substitution
+    ident1 = DBNode{Int}(@lambda (x->x)*1)
+    @test beta_reduce(ident1) === ProxyDB(1)
+    @test beta_reduce(beta_reduce(ident1)) === normalized
+
+    # test reduce order
+    ident = DBNode{Int}(@lambda x->x)
+    replicate1 = DBNode{Int}(@lambda x->(x*x))
+    @test beta_reduce(ident(replicate1(ident))) === replicate1(ident)
+    @test beta_reduce(ident(replicate1)(ident)) === replicate1(ident)
+    @test beta_reduce(ProxyDB(1)(replicate1(ident))) === ProxyDB(1)(beta_reduce(replicate1(ident)))
+    any_to_ident1 = DBNode{Int}(@lambda y->((x->x)*1))
+    @test beta_reduce(any_to_ident1) === DBNode{Int}(@lambda y->1)
+    nonsense_on_replicate_ident = DBNode{Int}(@lambda (1*1)*((x->(x*x))*(x->x)))
+    display(nonsense_on_replicate_ident)
+    display(beta_reduce(nonsense_on_replicate_ident))
+    display(DBNode{Int}(@lambda (1*1)*((x->x)*(x->x))))
+    @test beta_reduce(nonsense_on_replicate_ident) === DBNode{Int}(@lambda (1*1)*((x->x)*(x->x)))
 end
 
 
