@@ -13,6 +13,12 @@ end
     value::E
 end
 
+Result{T, E} = Union{T, Err{E}}
+Base.convert(::Type{Result{T, E}}, x) where {T, E} = convert(T, x)
+Base.convert(::Type{Result{T, E}}, x::Err{E2}) where {T, E, E2} = Err(convert(E, x.value))
+Base.convert(::Type{Result{T, E}}, x::T) where {T, E} = x
+Base.convert(::Type{Result{T, E}}, x::Err{E}) where {T, E} = x
+
 # struct UncheckedException <: Exception
 #     value:: Err
 # end
