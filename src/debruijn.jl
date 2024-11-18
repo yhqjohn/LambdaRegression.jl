@@ -69,6 +69,45 @@ Base.convert(::Type{DBNode{T}}, x::AppDB{S}) where {T, S} = convert(AppDB{T}, x)
 Base.convert(::Type{ProxyDB{T}}, x::ProxyDB{S}) where {T, S} = ProxyDB{T}(convert(T, x.value))
 Base.convert(::Type{DBNode{T}}, x::ProxyDB{S}) where {T, S} = convert(ProxyDB{T}, x)
 
+## hash
+Base.hash(x::VarDB, h::UInt) = hash(x.index, h)
+Base.:(==)(x::VarDB, y::VarDB) = x.index == y.index
+
+Base.hash(x::AbsDB, h::UInt) = hash(x.body, h)
+Base.:(==)(x::AbsDB, y::AbsDB) = x.body == y.body
+
+Base.hash(x::AppDB, h::UInt) = hash(x.func, hash(x.arg, h))
+Base.:(==)(x::AppDB, y::AppDB) = x.func == y.func && x.arg == y.arg
+
+Base.hash(x::ProxyDB, h::UInt) = hash(x.value, h)
+Base.:(==)(x::ProxyDB, y::ProxyDB) = x.value == y.value
+
+@testitem "hash and equality" begin
+    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    
+    # Test VarDB
+    @test hash(VarDB{Int}(1)) == hash(VarDB{Float64}(1))
+    @test VarDB{Int}(1) == VarDB{Float64}(1)
+    @test VarDB{Int}(1) != VarDB{Int}(2)
+    
+    # Test AbsDB
+    v1 = VarDB{Int}(0)
+    v2 = VarDB{Float64}(0)
+    @test hash(AbsDB{Int}(v1)) == hash(AbsDB{Float64}(v2))
+    @test AbsDB{Int}(v1) == AbsDB{Float64}(v2)
+    
+    # Test AppDB
+    app1 = AppDB{Int}(v1, v1)
+    app2 = AppDB{Float64}(v2, v2)
+    @test hash(app1) == hash(app2)
+    @test app1 == app2
+    
+    # Test ProxyDB
+    @test hash(ProxyDB{Int}(1)) == hash(ProxyDB{Float64}(1.0))
+    @test ProxyDB{Int}(1) == ProxyDB{Float64}(1.0)
+    @test ProxyDB{Int}(1) != ProxyDB{Int}(2)
+end
+
 @testitem "type conversion" begin
     import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
     @test convert(DBNode{Int}, VarDB(0)) == VarDB{Int}(0) # test convert to DBNode and VarDB
@@ -79,7 +118,6 @@ end
 
 ## value
 value(node::ProxyDB) = node.value
-Base.:(==)(p::ProxyDB, q::ProxyDB) = value(p) == value(q)
 
 ## parse
 DBNode(x) = DBNode{Any}(x)
@@ -174,7 +212,7 @@ function pretty_string(node::AppDB)
     node.arg isa AppDB && (arg_str = "($arg_str)")
     return "$func_str $arg_str"
 end
-pretty_string(node::ProxyDB) = string(value(node))
+pretty_string(node::ProxyDB) = "$(node.value)"
 Base.display(io::IO, node::DBNode) = println(io, pretty_string(node))
 Base.display(node::DBNode) = println(pretty_string(node))
 

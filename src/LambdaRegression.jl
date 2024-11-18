@@ -17,9 +17,7 @@ export beta_reduce, normalize
 
 include("terms.jl")
 
-# include("labeledproxy.jl")
-# using .LabeledProxyModule: labelize
-# export labelize
+include("builtin.jl")
 
-# include("builtin.jl")
+
 end # module LambdaRegression

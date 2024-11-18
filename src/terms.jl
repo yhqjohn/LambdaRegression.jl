@@ -2,7 +2,7 @@ module TermsModule
 
 using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
 using MLStyle
-import LambdaRegression: Err, Result
+import LambdaRegression: Err, Result, @alias
 import ..DeBruijnModule: substitute
 using TestItems
 ########################################
@@ -30,6 +30,11 @@ rettype(x::ArrowType) = x.ret
 -->(a::Symbol, b::TypeLabel) = LabelType(a) --> b
 -->(a::TypeLabel, b::Symbol) = a --> LabelType(b)
 -->(a::Symbol, b::Symbol) = LabelType(a) --> LabelType(b)
+Base.show(io::IO, x::LabelType) = print(io, x.label)
+Base.show(io::IO, x::ArrowType) = print(io, x.arg, " --> ", x.ret)
+Base.show(io::IO, x::UnresolvedType) = print(io, "Unresolved")
+Base.show(io::IO, x::UnknownType) = print(io, "Unknown")
+Base.show(io::IO, x::AnyType) = print(io, "Any")
 
 Base.convert(::Type{LabelType}, x::Symbol) = LabelType(x)
 Base.convert(::Type{TypeLabel}, x::Symbol) = LabelType(x)
@@ -68,6 +73,20 @@ end
 value(term::Term) = term.value
 TermProxy{T} = ProxyDB{Term{T}}
 TermDB{T} = DBNode{Term{T}}
+
+@alias Term
+
+### hash
+Base.hash(x::Term, h::UInt) = hash(x.value, h)
+Base.:(==)(x::Term, y::Term) = x.value == y.value
+
+@testitem "untyped term and hash" begin
+    import LambdaRegression.TermsModule: Term, TermProxy, TermDB, value, ProxyDB
+    term1 = Term(1)
+    term2 = Term(1)
+    @test hash(term1) == hash(term2)
+    @test term1 == term2
+end
 
 ### coversion
 Base.convert(::Type{Term{T}}, x::Term{S}) where {T, S<:T} = Term{T}(x.value)
@@ -130,6 +149,20 @@ TypedTerm(x, type::Symbol) = TypedTerm(x, LabelType(type))
 
 TypedTermProxy{T} = ProxyDB{TypedTerm{T}}
 TypedTermDB{T} = DBNode{TypedTerm{T}}
+
+@alias TypedTerm
+
+### hash
+Base.hash(x::TypedTerm, h::UInt) = hash(x.value, h)
+Base.:(==)(x::TypedTerm, y::TypedTerm) = x.value == y.value && x.type == y.type
+
+@testitem "typed term and hash" begin
+    import LambdaRegression.TermsModule: TypedTerm, TypedTermProxy, TypedTermDB, value, ProxyDB, LabelType
+    term1 = TypedTerm(1, :Int)
+    term2 = TypedTerm(1, :Int)
+    @test hash(term1) == hash(term2)
+    @test term1 == term2
+end
 
 ### conversion
 Base.convert(::Type{TypedTerm{T}}, x::TypedTerm{S}) where {T, S<:T} = TypedTerm{T}(x.value, x.type)
