@@ -1,9 +1,11 @@
 module TermsModule
 
-using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+using ..DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, normalized, Normalized
 using MLStyle
 import LambdaRegression: Err, Result, @alias
+import LambdaRegression
 import ..DeBruijnModule: substitute
+import ..ReduceModule: beta_reduce, beta_reduce_app
 using TestItems
 ########################################
 # Type system for terms
@@ -18,10 +20,12 @@ end
 Base.:<=(::TypeLabel, ::TypeLabel) = false
 Base.:<=(a::LabelType, b::LabelType) = a===b
 Base.:<=(::UnknownType, ::TypeLabel) = false
-Base.:<=(::UnresolvedType, ::TypeLabel) = false
+# Base.:<=(::UnresolvedType, ::TypeLabel) = true # UnresolvedType could be any type
 Base.:<=(::TypeLabel, ::AnyType) = true
 Base.:<=(::UnknownType, ::AnyType) = true
-Base.:<=(::UnresolvedType, ::AnyType) = true
+# Base.:<=(::UnresolvedType, ::AnyType) = true
+Base.:<=(::UnresolvedType, ::TypeLabel) = throw(ArgumentError("UnresolvedType cannot be compared to a TypeLabel"))
+Base.:<=(::UnresolvedType, ::AnyType) = throw(ArgumentError("UnresolvedType cannot be compared to a TypeLabel"))
 
 argtype(x::ArrowType) = x.arg
 rettype(x::ArrowType) = x.ret
@@ -49,9 +53,9 @@ end
     @test LabelType(:Int) <= LabelType(:Int)
     @test !(LabelType(:Int) <= LabelType(:Float64))
     @test !(UnknownType() <= UnknownType())
-    @test !(UnresolvedType() <= UnknownType())
+    @test_throws ArgumentError UnresolvedType() <= LabelType(:Int)
     @test UnknownType() <= AnyType()
-    @test UnresolvedType() <= AnyType()
+    @test_throws ArgumentError UnresolvedType() <= AnyType()
     @test (:Int --> :Int) === ArrowType(LabelType(:Int), LabelType(:Int))
     @test (:Int --> :Int) === (LabelType(:Int) --> LabelType(:Int))
     @test (:Int --> :Int) === (LabelType(:Int) --> :Int)
@@ -150,7 +154,14 @@ TypedTerm(x, type::Symbol) = TypedTerm(x, LabelType(type))
 TypedTermProxy{T} = ProxyDB{TypedTerm{T}}
 TypedTermDB{T} = DBNode{TypedTerm{T}}
 
-@alias TypedTerm
+# @alias TypedTerm
+function Base.show(io::IO, x::TypedTerm)
+    if haskey(LambdaRegression.alias_dict, x)
+        print(io, LambdaRegression.alias_dict[x])
+    else
+        print(io, x.value)
+    end
+end
 
 ### hash
 Base.hash(x::TypedTerm, h::UInt) = hash(x.value, h)
@@ -180,7 +191,8 @@ end
 
 unpack_to_value(x::TypedTerm) = x.value
 
-typelabel(n::TypedTermDB) = typelabel(n.value)
+typelabel(n::TypedTermDB) = UnresolvedType()
+typelabel(n::TypedTermProxy) = typelabel(n.value)
 typelabel(x::TypedTerm) = x.type
 typelabel(::Int) = LabelType(:Int)
 typelabel(::Float64) = LabelType(:Float64)
@@ -190,6 +202,31 @@ typelabel(_) = UnknownType()
 pack_to_typedtermnode(n::DBNode) = n
 pack_to_typedtermnode(n::TypedTerm) = ProxyDB(n)
 pack_to_typedtermnode(x) = ProxyDB(TypedTerm(x, typelabel(x)))
+
+#### two argument pack_to_typedtermnode
+pack_to_typedtermnode(n::DBNode, _) = n
+function pack_to_typedtermnode(x::TypedTerm, type::TypeLabel) 
+    term_type = typelabel(x)
+    if type === UnresolvedType()
+        return ProxyDB(x)
+    elseif term_type <= type
+        return ProxyDB(x)
+    else
+        throw(ArgumentError("The term type $(typelabel(n)) does not match the type $type"))
+    end
+end
+pack_to_typedtermnode(x, type::TypeLabel) = ProxyDB(TypedTerm(x, type))
+function pack_to_typedtermnode(n::DBNode, type::TypeLabel)
+    term_type = typelabel(n)
+    if type === UnresolvedType()
+        return n
+    elseif term_type <= type
+        return n
+    else
+        throw(ArgumentError("The term type $(typelabel(n)) does not match the type $type"))
+    end
+end
+
 
 @testitem "pack and unpack typed term" begin
     import LambdaRegression.TermsModule: TypedTerm, TypedTermProxy, TypedTermDB, value, ProxyDB, typelabel, pack_to_typedtermnode, unpack_to_value, LabelType
@@ -204,7 +241,10 @@ end
 
 # TypedTermDBResult{T} = Union{TypedTermDB{T}, Err{TypeMismatch}}
 # Base.convert(::Type{TypedTermDBResult{T}}, x) where {T} = convert(TypedTermDB{T}, x)
-TypedTermDBResult{T} = Result{TypedTermDB{T}, TypeMismatch}
+TypedTermDBResult{T} = Union{TypedTermDB{T}, Err{TypeMismatch}, Err{Normalized}}
+
+
+### substitute
 
 function substitute(func::TypedTermProxy{T}, arg::TypedTermDB{T})::TypedTermDBResult{T} where {T}
     if !(typelabel(func) isa ArrowType)
@@ -213,15 +253,24 @@ function substitute(func::TypedTermProxy{T}, arg::TypedTermDB{T})::TypedTermDBRe
     param_type = argtype(typelabel(func))
     ret_type = rettype(typelabel(func))
     arg_type = typelabel(arg)
+    if arg_type === UnresolvedType()
+        return normalized
+    end
     if arg_type <= param_type
         func = unpack_to_value(func)
         arg = unpack_to_value(arg)
         result = func(arg)
-        return pack_to_typedtermnode(TypedTerm(result, ret_type))
+        return pack_to_typedtermnode(result, ret_type)
     else
         return Err(TypeMismatch(param_type, arg_type))
     end
 end
+
+### optimization: substitute for binary operations
+function beta_reduce_app_typed(func::TypedTermProxy{T}, arg::TypedTermDB{T})::TypedTermDBResult{T} where {T}
+    return beta_reduce_app(func, arg)
+end
+
 
 @testitem "substitute typed term" begin
     import LambdaRegression.TermsModule: TypedTerm, TypedTermProxy, TypedTermDB, value, ProxyDB, substitute, LabelType, -->, Err, TypeMismatch
@@ -234,6 +283,5 @@ end
     @test_throws ArgumentError substitute(proxy2, proxy2)
     @test substitute(proxy1, proxy1) === Err(TypeMismatch(LabelType(:Int), :Int --> :Int))
 end
-
 
 end

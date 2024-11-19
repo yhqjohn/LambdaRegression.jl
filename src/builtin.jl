@@ -1,16 +1,11 @@
 module BuiltinTermsModule
 
 import ..ParseModule: @lambda
-# using ..DeBruijnModule: to_debrujin
+using ..DeBruijnModule: DBNode
 import LambdaRegression: set_alias!
-import ..TermsModule: TypedTerm, TypedTermProxy, TypedTermDB, -->
+import ..TermsModule: TypedTerm, TypedTermProxy, TypedTermDB, -->, UnresolvedType
 
 using TestItems
-
-
-# const SIN = FunctionTerm(x->TypedTerm(sin(x.value.value), :Float64), :Float64, "SIN")
-# const COS = FunctionTerm(x->TypedTerm(cos(x.value.value), :Float64), :Float64, "COS")
-# const TAN = FunctionTerm(x->TypedTerm(tan(x.value.value), :Float64), :Float64, "TAN")
 
 const SIN = TypedTerm(sin, :Float64-->:Float64)
 const COS = TypedTerm(cos, :Float64-->:Float64)
@@ -31,34 +26,6 @@ set_alias!(TAN, "TAN")
     @test substitute(ProxyDB{TypedTerm{Any}}(TAN), ProxyDB{TypedTerm{Any}}(TypedTerm(1.0, :Float64))) === ProxyDB{TypedTerm{Any}}(TypedTerm(tan(1.0), :Float64))
 end
 
-# const FADD = FunctionTerm(x->(
-#     FunctionTerm(y->TypedTerm(x.value.value + y.value.value, :Float64), :Float64)
-# ), :Float64, "+")
-# const FSUB = FunctionTerm(x->(
-#     FunctionTerm(y->TypedTerm(x.value.value - y.value.value, :Float64), :Float64)
-# ), :Float64, "-")
-# const FMUL = FunctionTerm(x->(
-#     FunctionTerm(y->TypedTerm(x.value.value * y.value.value, :Float64), :Float64)
-# ), :Float64, "×")
-# const FDIV = FunctionTerm(x->(
-#     FunctionTerm(y->TypedTerm(x.value.value / y.value.value, :Float64), :Float64)
-# ), :Float64, "÷")
-# const FEQ = FunctionTerm(x->(
-#     FunctionTerm(y->TypedTerm(x.value.value == y.value.value, :Bool), :Float64)
-# ), :Float64, "==")
-# const FGT = FunctionTerm(x->(
-#     FunctionTerm(y->TypedTerm(x.value.value > y.value.value, :Bool), :Float64)
-# ), :Float64, ">")
-# const FLT = FunctionTerm(x->(
-#     FunctionTerm(y->TypedTerm(x.value.value < y.value.value, :Bool), :Float64)
-# ), :Float64, "<")
-# const FGEQ = FunctionTerm(x->(
-#     FunctionTerm(y->TypedTerm(x.value.value >= y.value.value, :Bool), :Float64)
-# ), :Float64, "≥")
-# const FLEQ = FunctionTerm(x->(
-#     FunctionTerm(y->TypedTerm(x.value.value <= y.value.value, :Bool), :Float64)
-# ), :Float64, "≤")
-
 const FADD = TypedTerm(x->(y->x+y), :Float64-->:Float64-->:Float64)
 const FSUB = TypedTerm(x->(y->x-y), :Float64-->:Float64-->:Float64)
 const FMUL = TypedTerm(x->(y->x*y), :Float64-->:Float64-->:Float64)
@@ -69,15 +36,18 @@ const FLT = TypedTerm(x->(y->x<y), :Float64-->:Float64-->:Bool)
 const FGEQ = TypedTerm(x->(y->x>=y), :Float64-->:Float64-->:Bool)
 const FLEQ = TypedTerm(x->(y->x<=y), :Float64-->:Float64-->:Bool)
 
-const IADD = TypedTerm(x->(y->x+y), :Int64-->:Int64-->:Int64)
-const ISUB = TypedTerm(x->(y->x-y), :Int64-->:Int64-->:Int64)
-const IMUL = TypedTerm(x->(y->x*y), :Int64-->:Int64-->:Int64)
-const IDIV = TypedTerm(x->(y->x÷y), :Int64-->:Int64-->:Int64)
-const IEQ = TypedTerm(x->(y->x==y), :Int64-->:Int64-->:Bool)
-const IGT = TypedTerm(x->(y->x>y), :Int64-->:Int64-->:Bool)
-const ILT = TypedTerm(x->(y->x<y), :Int64-->:Int64-->:Bool)
-const IGEQ = TypedTerm(x->(y->x>=y), :Int64-->:Int64-->:Bool)
-const ILEQ = TypedTerm(x->(y->x<=y), :Int64-->:Int64-->:Bool)
+const IADD = TypedTerm(x->(y->x+y), :Int-->:Int-->:Int)
+const ISUB = TypedTerm(x->(y->x-y), :Int-->:Int-->:Int)
+const IMUL = TypedTerm(x->(y->x*y), :Int-->:Int-->:Int)
+const IDIV = TypedTerm(x->(y->x÷y), :Int-->:Int-->:Int)
+const IEQ = TypedTerm(x->(y->x==y), :Int-->:Int-->:Bool)
+const IGT = TypedTerm(x->(y->x>y), :Int-->:Int-->:Bool)
+const ILT = TypedTerm(x->(y->x<y), :Int-->:Int-->:Bool)
+const IGEQ = TypedTerm(x->(y->x>=y), :Int-->:Int-->:Bool)
+const ILEQ = TypedTerm(x->(y->x<=y), :Int-->:Int-->:Bool)
+
+const OR = TypedTerm(x->(y->x||y), :Bool-->:Bool-->:Bool)
+const AND = TypedTerm(x->(y->x&&y), :Bool-->:Bool-->:Bool)
 
 set_alias!(FADD, "+")
 set_alias!(FSUB, "-")
@@ -99,6 +69,8 @@ set_alias!(ILT, "<")
 set_alias!(IGEQ, "≥")
 set_alias!(ILEQ, "≤")
 
+set_alias!(OR, "or")
+set_alias!(AND, "and")
 
 @testitem "binary functions" begin
     import LambdaRegression.BuiltinTermsModule: FADD, FSUB, FMUL, FDIV, FEQ, FGT, FLT, FGEQ, FLEQ, IADD, ISUB, IMUL, IDIV, IEQ, IGT, ILT, IGEQ, ILEQ
@@ -135,10 +107,10 @@ set_alias!(ILEQ, "≤")
     @test substitute(new1leq, ProxyDB{TypedTerm{Any}}(term2)) === ProxyDB{TypedTerm{Any}}(termtrue)
 
 
-    term0 = TypedTerm(0, :Int64)
-    term1 = TypedTerm(1, :Int64)
-    term2 = TypedTerm(2, :Int64)
-    term3 = TypedTerm(3, :Int64)
+    term0 = TypedTerm(0, :Int)
+    term1 = TypedTerm(1, :Int)
+    term2 = TypedTerm(2, :Int)
+    term3 = TypedTerm(3, :Int)
 
     newincre = substitute(ProxyDB{TypedTerm{Any}}(IADD), ProxyDB{TypedTerm{Any}}(term1))
     @test substitute(newincre, ProxyDB{TypedTerm{Any}}(term1)) === ProxyDB{TypedTerm{Any}}(term2)
@@ -166,13 +138,73 @@ end
 # const KI = to_debrujin(@lambda x->(y->y))
 # set_alias!(KI, "KI")
 
-# const IFTHENELSE = FunctionTerm(x->(x.value.value ? K : KI), :Bool, "IFTE")
+const K = DBNode(@lambda(x->(y->x)))
+const KI = DBNode(@lambda(x->(y->y)))
+const _IFTE = x->(x ? K : KI)
+const IFTHENELSE = TypedTerm(_IFTE, :Bool-->UnresolvedType())
+set_alias!(K, "K")
+set_alias!(KI, "KI")
+set_alias!(IFTHENELSE, "IFTE")
 
-# const YCOMBINATOR = to_debrujin(@lambda f->((x->f(x(x)))*(x->f(x(x)))))
-# set_alias!(YCOMBINATOR, "Y")
+@testitem "if-then-else" begin
+    import LambdaRegression.BuiltinTermsModule: K, KI, IFTHENELSE
+    import LambdaRegression.TermsModule: TypedTerm, TypedTermProxy, TypedTermDB, ProxyDB, substitute
+    @test substitute(ProxyDB{TypedTerm{Any}}(IFTHENELSE), ProxyDB{TypedTerm{Any}}(TypedTerm(true, :Bool))) === DBNode{TypedTerm{Any}}(K)
+    @test substitute(ProxyDB{TypedTerm{Any}}(IFTHENELSE), ProxyDB{TypedTerm{Any}}(TypedTerm(false, :Bool))) === DBNode{TypedTerm{Any}}(KI)
+end
 
-# FACT = to_debrujin(@lambda f->(n->(IFTHENELSE * (ILEQ * n * 1) * 1 * (IMUL * n * (f * (ISUB * n * 1))))))
-# set_alias!(FACT, "FACT")
+
+const YCOMBINATOR = DBNode(@lambda f->((x->f(x(x)))*(x->f(x(x)))))
+set_alias!(YCOMBINATOR, "Y")
+
+@testitem "y-combinator" begin
+    import LambdaRegression.BuiltinTermsModule: YCOMBINATOR, SIN
+    import LambdaRegression.TermsModule: TypedTerm, TypedTermProxy, TypedTermDB, ProxyDB, substitute
+    @test substitute(DBNode{TypedTerm{Any}}(YCOMBINATOR), ProxyDB{TypedTerm{Any}}(SIN)) === DBNode{TypedTerm{Any}}(@lambda (x->SIN(x(x)))*(x->SIN(x(x))))
+end
+
+const FACT = DBNode(@lambda f->(n->(IFTHENELSE * (ILEQ * n * 1) * 1 * (IMUL * n * (f * (ISUB * n * 1))))))
+const _type_fact = convert(DBNode{TypedTerm{Any}}, FACT)
+set_alias!(FACT, "FACT")
+set_alias!(_type_fact, "FACT")
+
+const FIB = DBNode(@lambda f->(n->(IFTHENELSE * (OR * (ILEQ * n * 1) * (ILEQ * n * 2)) * 1 * (IADD * (f * (ISUB * n * 1)) * (f * (ISUB * n * 2))))))
+const _type_fib = convert(DBNode{TypedTerm{Any}}, FIB)
+set_alias!(FIB, "FIB")
+set_alias!(_type_fib, "FIB")
+
+@testitem "factorial" begin
+    using LambdaRegression.BuiltinTermsModule: FACT, FIB, YCOMBINATOR
+    using LambdaRegression.TermsModule: TypedTerm, TypedTermProxy, TypedTermDB, ProxyDB, substitute
+    using LambdaRegression.ReduceModule: beta_reduce, normalize
+    using LambdaRegression: alias_dict, @lambda, set_alias!
+    using LambdaRegression.DeBruijnModule: DBNode, normalized
+
+    yf = beta_reduce(DBNode{TypedTerm{Any}}(@lambda YCOMBINATOR * FACT))
+    set_alias!(yf, "YF")
+    display(yf)
+
+    let fact3 = DBNode{TypedTerm{Any}}(@lambda (YCOMBINATOR * FACT) * 3)
+        for i in 1:20
+            display(fact3)
+            fact3 = beta_reduce(fact3)
+        end
+    end
+    @test normalize(DBNode{TypedTerm{Any}}(@lambda (YCOMBINATOR * FACT) * 5)) == ProxyDB{TypedTerm{Any}}(TypedTerm(120, :Int))
+
+    let fib3 = DBNode{TypedTerm{Any}}(@lambda (YCOMBINATOR * FIB) * 3)
+        for i in 1:100
+            display(fib3)
+            fib3 = beta_reduce(fib3)
+            if fib3 === normalized
+                break
+            end
+        end
+    end
+    @test normalize(DBNode{TypedTerm{Any}}(@lambda (YCOMBINATOR * FIB) * 8), max_iter=10_000) == ProxyDB{TypedTerm{Any}}(TypedTerm(21, :Int))
+
+
+end
 
 # export SIN, COS, TAN
 # export FADD, FSUB, FMUL, FDIV, FEQ, FGT, FLT, FGEQ, FLEQ

@@ -69,6 +69,8 @@ Base.convert(::Type{DBNode{T}}, x::AppDB{S}) where {T, S} = convert(AppDB{T}, x)
 Base.convert(::Type{ProxyDB{T}}, x::ProxyDB{S}) where {T, S} = ProxyDB{T}(convert(T, x.value))
 Base.convert(::Type{DBNode{T}}, x::ProxyDB{S}) where {T, S} = convert(ProxyDB{T}, x)
 
+DBNode{T}(n::DBNode{S}) where {T, S} = convert(DBNode{T}, n)
+
 ## hash
 Base.hash(x::VarDB, h::UInt) = hash(x.index, h)
 Base.:(==)(x::VarDB, y::VarDB) = x.index == y.index
@@ -137,7 +139,11 @@ function _to_debrujin(node::AbstractToken, T, stack=AbstractVariableToken[])
     elseif node isa ApplyToken
         return AppDB{T}(_to_debrujin(node.func, T, stack), _to_debrujin(node.arg, T, stack))
     elseif node isa ProxyToken
-        return ProxyDB{T}(node.body)
+        if node.body isa DBNode
+            return convert(DBNode{T}, node.body)
+        else
+            return ProxyDB{T}(node.body)
+        end
     else
         throw(ArgumentError("node must be a `VariableToken`, `LambdaToken`, or `ApplyToken`, got $(typeof(node))"))
     end

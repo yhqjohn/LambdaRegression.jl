@@ -33,28 +33,11 @@ using TestItems
 #     normalization_limit_exceeded
 # end
 
-function beta_reduce(node::DBNode{T}) where {T}
+beta_reduce(node::DBNode{T}) where {T} = beta_reduce_base(node)
+
+function beta_reduce_base(node::DBNode{T}) where {T}
     @match node begin
-        AppDB(func, arg) => @match func begin
-            ::AbsDB => substitute(func, arg)
-            ::ProxyDB => @match substitute(func, arg) begin
-                n::DBNode => n
-                ::Err{Normalized} => @match beta_reduce(arg) begin
-                    n::DBNode => AppDB{T}(func, n)
-                    e::Err => e
-                end
-                e::Err => e
-                other => error("unexpected result: $other")
-            end
-            ::AppDB => @match beta_reduce(func) begin
-                ::Err{Normalized} => @match beta_reduce(arg) begin
-                    new_arg::DBNode => AppDB{T}(func, new_arg)
-                    e::Err => e
-                end
-                new_func::DBNode => AppDB{T}(new_func, arg)
-                e::Err => e
-            end
-        end
+        AppDB(func, arg) => beta_reduce_app(func, arg)
         n::VarDB || n::ProxyDB => normalized
         AbsDB(body) => @match beta_reduce(body) begin
             n::DBNode => AbsDB{T}(n)
@@ -62,6 +45,30 @@ function beta_reduce(node::DBNode{T}) where {T}
         end
     end
 end
+
+function beta_reduce_app_base(func::DBNode{T}, arg::DBNode{T}) where {T}
+    @match func begin
+        ::AbsDB => substitute(func, arg)
+        ::ProxyDB => @match substitute(func, arg) begin
+            n::DBNode => n
+            ::Err{Normalized} => @match beta_reduce(arg) begin
+                n::DBNode => AppDB{T}(func, n)
+                e::Err => e
+            end
+            e::Err => e
+            other => error("unexpected result: $other")
+        end
+        ::AppDB => @match beta_reduce(func) begin
+            ::Err{Normalized} => @match beta_reduce(arg) begin
+                new_arg::DBNode => AppDB{T}(func, new_arg)
+                e::Err => e
+            end
+            new_func::DBNode => AppDB{T}(new_func, arg)
+        end
+    end
+end
+beta_reduce_app(func::DBNode{T}, arg::DBNode{T}) where {T} = beta_reduce_app_base(func, arg)
+
 
 @testitem "beta reduce" begin
     import LambdaRegression.ReduceModule: beta_reduce, normalized
