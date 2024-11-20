@@ -206,10 +206,10 @@ set_alias!(_type_fib, "FIB")
 
 end
 
-# export SIN, COS, TAN
-# export FADD, FSUB, FMUL, FDIV, FEQ, FGT, FLT, FGEQ, FLEQ
-# export IADD, ISUB, IMUL, IDIV, IEQ, IGT, ILT, IGEQ, ILEQ
-# export K, KI, IFTHENELSE, YCOMBINATOR
-# export FACT
+export SIN, COS, TAN
+export FADD, FSUB, FMUL, FDIV, FEQ, FGT, FLT, FGEQ, FLEQ
+export IADD, ISUB, IMUL, IDIV, IEQ, IGT, ILT, IGEQ, ILEQ
+export K, KI, IFTHENELSE, YCOMBINATOR
+export FACT, FIB
 
 end

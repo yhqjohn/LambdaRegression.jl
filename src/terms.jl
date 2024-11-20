@@ -150,6 +150,7 @@ struct TypedTerm{T} <: AbstractTerm
     type::TypeLabel
 end
 TypedTerm(x, type::Symbol) = TypedTerm(x, LabelType(type))
+value(term::TypedTerm) = term.value
 
 TypedTermProxy{T} = ProxyDB{TypedTerm{T}}
 TypedTermDB{T} = DBNode{TypedTerm{T}}

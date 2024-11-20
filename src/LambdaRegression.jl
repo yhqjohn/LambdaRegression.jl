@@ -19,5 +19,9 @@ include("terms.jl")
 
 include("builtin.jl")
 
+include("mutations.jl")
+
+include("regressor.jl")
+
 
 end # module LambdaRegression

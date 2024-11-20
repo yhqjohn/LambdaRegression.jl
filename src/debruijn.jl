@@ -286,6 +286,108 @@ end
     @test new_foo2 == DBNode(@lambda (*)->(*)->(4 * 2 * ((*)->1 * 3)))
 end
 
+## iteration
+_iter_length(node::AbsDB) = 1 + _iter_length(node.body)
+_iter_length(node::AppDB) = 1 + _iter_length(node.func) + _iter_length(node.arg)
+_iter_length(node::VarDB) = 1
+_iter_length(node::ProxyDB) = 1
+
+struct DBPairIterator{T}
+    node::DBNode{T}
+end
+
+Base.pairs(node::DBNode{T}) where {T} = DBPairIterator{T}(node)
+Base.IteratorSize(::Type{DBPairIterator{T}}) where {T} = Base.HasLength()
+Base.length(iter::DBPairIterator{T}) where {T} = _iter_length(iter.node)
+Base.eltype(::Type{DBPairIterator{T}}) where {T} = Pair{UInt, DBNode{T}}
+
+function Base.iterate(iter::DBPairIterator{T}, state=nothing) where {T}
+    # Initial state: start with root node at depth 0
+    # State is a vector of tuples (depth, node)
+    if isnothing(state)
+        state = Tuple{UInt, DBNode{T}}[(UInt(0), iter.node)]
+    end
+    
+    isempty(state) && return nothing
+    
+    # Get the last node from the stack
+    depth, current = pop!(state)
+    
+    # Add children to the stack in reverse order (so left-most is processed first)
+    if current isa AbsDB
+        push!(state, (depth + 1, current.body))
+    elseif current isa AppDB
+        push!(state, (depth, current.arg))
+        push!(state, (depth, current.func))
+    end
+    
+    # Return the next node in sequence
+    return (depth => current), state
+end
+
+Base.IteratorSize(::Type{DBNode{T}}) where {T} = Base.HasLength()
+Base.length(node::DBNode{T}) where {T} = _iter_length(node)
+Base.eltype(::Type{DBNode{T}}) where {T} = DBNode{T}
+function Base.iterate(node::DBNode{T}, state=nothing) where {T}
+    if isnothing(state)
+        state = DBNode{T}[node]
+    end
+    if isempty(state)
+        return nothing
+    end
+    current = pop!(state)
+    if current isa AbsDB
+        push!(state, current.body)
+    elseif current isa AppDB
+        push!(state, current.arg)
+        push!(state, current.func)
+    end
+    return current, state
+end
+
+@testitem "iteration" begin
+    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    foo = DBNode(@lambda (*)->(*)->(&3 * &1 * ((*)->&0 * &2)))
+    results = collect(pairs(foo))
+    @test length(results) == 10
+    @test results[1] == (UInt(0) => foo)
+    @test results[2] == (UInt(1) => foo.body)
+    @test results[3] == (UInt(2) => foo.body.body)
+    @test results[4] == (UInt(2) => foo.body.body.func)
+    @test results[5] == (UInt(2) => foo.body.body.func.func)
+    @test results[6] == (UInt(2) => foo.body.body.func.arg)
+    @test results[7] == (UInt(2) => foo.body.body.arg)
+    @test results[8] == (UInt(3) => foo.body.body.arg.body)
+    @test results[9] == (UInt(3) => foo.body.body.arg.body.func)
+    @test results[10] == (UInt(3) => foo.body.body.arg.body.arg)
+
+    results2 = collect(foo)
+    @test length(results2) == 10
+    @test results2[1] == foo
+    @test results2[2] == foo.body
+    @test results2[3] == foo.body.body
+    @test results2[4] == foo.body.body.func
+    @test results2[5] == foo.body.body.func.func
+    @test results2[6] == foo.body.body.func.arg
+    @test results2[7] == foo.body.body.arg
+    @test results2[8] == foo.body.body.arg.body
+    @test results2[9] == foo.body.body.arg.body.func
+    @test results2[10] == foo.body.body.arg.body.arg
+end
+
+"""
+    max_bound(node::DBNode)
+
+Get the furthest bound distance of a DeBruijn node.
+Note that this is usually 1 larger than the maximum variable index in the node,
+and it returns 0 only when there is no unbound variable in the node.
+"""
+function max_bound end
+max_bound(node::VarDB, depth::UInt=UInt(0)) = max(node.index + 1, depth) - depth
+max_bound(node::AbsDB, depth::UInt=UInt(0)) = max_bound(node.body, depth + 1)
+max_bound(node::AppDB, depth::UInt=UInt(0)) = max(max_bound(node.func, depth), max_bound(node.arg, depth))
+max_bound(node::ProxyDB, depth::UInt=UInt(0)) = UInt(0)
+
 struct Normalized end
 const normalized = Err(Normalized())
 
