@@ -597,12 +597,29 @@ end
 struct JointMutation{T} <: AbstractMutation{T}
     mutations::Vector{AbstractMutation{T}}
 end
+JointMutation(mutations::Vararg{AbstractMutation{T}}) where T = JointMutation{T}(AbstractMutation{T}[mutations...])
+
 
 function mutate(mutation::JointMutation{T}, node::DBNode{T}) where T
     for mut in mutation.mutations
         node = mutate(mut, node)
     end
     return node
+end
+
+@testitem "joint mutation" begin
+    using Random: seed!
+    using LambdaRegression.MutationsModule: JointMutation, ScaleMutation, OffsetMutation, mutate
+    using LambdaRegression.TermsModule: TypedTerm
+    using LambdaRegression.DeBruijnModule: DBNode
+    using LambdaRegression.ParseModule: @lambda
+    
+    seed!(1234) # For reproducible tests
+    
+    node = DBNode{TypedTerm{Any}}(@lambda x->(x*2.0*3))
+    mutation = JointMutation(ScaleMutation{Any}(1.0, 0.1), OffsetMutation{Any}(1.0))
+    mutated_tree = mutate(mutation, node)
+    display(mutated_tree)
 end
 
 end
