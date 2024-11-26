@@ -232,6 +232,16 @@ Base.display(node::DBNode) = println(pretty_string(node))
     NewLeft(DBNode)
 end
 
+"""
+    traverse(f, node::DBNode{T}) where {T}
+
+Traverse all nodes in the tree.
+The first argument is a function that takes a node and its depth, and returns a new node or nothing.
+If the function returns nothing, the traversal will continue to the next node.
+If the function returns a new node, the traversal on the current subtree will be stopped, 
+the new node will replace the current node,
+and the traversal will continue to the sibling or parent node.
+"""
 function traverse(f, node::DBNode{T}) where {T}
     stack = Context[]
     depth = UInt(0)
@@ -287,10 +297,10 @@ end
 end
 
 ## iteration
-_iter_length(node::AbsDB) = 1 + _iter_length(node.body)
-_iter_length(node::AppDB) = 1 + _iter_length(node.func) + _iter_length(node.arg)
-_iter_length(node::VarDB) = 1
-_iter_length(node::ProxyDB) = 1
+iter_length(node::AbsDB) = 1 + iter_length(node.body)
+iter_length(node::AppDB) = 1 + iter_length(node.func) + iter_length(node.arg)
+iter_length(node::VarDB) = 1
+iter_length(node::ProxyDB) = 1
 
 struct DBPairIterator{T}
     node::DBNode{T}
@@ -298,7 +308,7 @@ end
 
 Base.pairs(node::DBNode{T}) where {T} = DBPairIterator{T}(node)
 Base.IteratorSize(::Type{DBPairIterator{T}}) where {T} = Base.HasLength()
-Base.length(iter::DBPairIterator{T}) where {T} = _iter_length(iter.node)
+Base.length(iter::DBPairIterator{T}) where {T} = iter_length(iter.node)
 Base.eltype(::Type{DBPairIterator{T}}) where {T} = Pair{UInt, DBNode{T}}
 
 function Base.iterate(iter::DBPairIterator{T}, state=nothing) where {T}
@@ -326,7 +336,7 @@ function Base.iterate(iter::DBPairIterator{T}, state=nothing) where {T}
 end
 
 Base.IteratorSize(::Type{DBNode{T}}) where {T} = Base.HasLength()
-Base.length(node::DBNode{T}) where {T} = _iter_length(node)
+Base.length(node::DBNode{T}) where {T} = iter_length(node)
 Base.eltype(::Type{DBNode{T}}) where {T} = DBNode{T}
 function Base.iterate(node::DBNode{T}, state=nothing) where {T}
     if isnothing(state)
@@ -442,6 +452,9 @@ end
 @alias AbsDB
 @alias AppDB
 @alias ProxyDB
+
+
+include("cse.jl")
 
 
 export DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
