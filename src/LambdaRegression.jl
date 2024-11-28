@@ -7,21 +7,23 @@ include("Parse.jl")
 using .ParseModule: @lambda
 export @lambda
 
+# include("Debruijn.jl")
+# using .DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
+# export DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
+
 include("Debruijn.jl")
-using .DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
-export DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
 
 
-include("Reduce.jl")
-export beta_reduce, normalize
+# include("Reduce.jl")
+# export beta_reduce, normalize
 
-include("Terms.jl")
+# include("Terms.jl")
 
-include("BuiltinTerms.jl")
+# include("BuiltinTerms.jl")
 
-include("Mutations.jl")
+# include("Mutations.jl")
 
-include("Regressor.jl")
+# include("Regressor.jl")
 
 
 end # module LambdaRegression
