@@ -7,7 +7,7 @@ include("Parse.jl")
 using .ParseModule: @lambda
 export @lambda
 
-# include("Debruijn.jl")
+include("DebruijnNode.jl")
 # using .DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
 # export DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
 

@@ -1,4 +1,4 @@
-module DeBruijnModule
+module DebruijnNodeModule
 
 import ..ParseModule: AbstractToken, AbstractVariableToken, VariableToken, DeBruijnToken, LambdaToken, DeBruijnLambdaToken, ApplyToken, ProxyToken, unfold
 import LambdaRegression: Err, @alias, alias_dict
@@ -46,7 +46,7 @@ AppDB(x::DBNode{T}, y::DBNode{S}) where {S, T<:S} = AppDB{S}(x, y)
 
 
 @testitem "creating DeBruijn nodes" begin
-    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    import LambdaRegression.DebruijnNodeModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
     v1 = VarDB(0)
     @test VarDB(0) === VarDB{Union{}}(0)
     v2 = VarDB{Int}(1)
@@ -85,7 +85,7 @@ Base.hash(x::ProxyDB, h::UInt) = hash(x.value, h)
 Base.:(==)(x::ProxyDB, y::ProxyDB) = x.value == y.value
 
 @testitem "hash and equality" begin
-    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    import LambdaRegression.DebruijnNodeModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
     
     # Test VarDB
     @test hash(VarDB{Int}(1)) == hash(VarDB{Float64}(1))
@@ -111,9 +111,10 @@ Base.:(==)(x::ProxyDB, y::ProxyDB) = x.value == y.value
 end
 
 @testitem "type conversion" begin
-    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    import LambdaRegression.DebruijnNodeModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
     @test convert(DBNode{Int}, VarDB(0)) == VarDB{Int}(0) # test convert to DBNode and VarDB
     @test convert(DBNode{Int}, AbsDB(VarDB(1))) == AbsDB{Int}(VarDB{Int}(1)) # test convert to DBNode and AbsDB
+
     @test convert(DBNode{Int}, AppDB(AbsDB(VarDB(1)), VarDB(0))) == AppDB{Int}(AbsDB{Int}(VarDB{Int}(1)), VarDB{Int}(0)) # test convert to DBNode and AppDB
     @test convert(DBNode{Int}, ProxyDB(1.0)) == ProxyDB{Int}(1) # test convert to DBNode and ProxyDB
 end
@@ -150,7 +151,7 @@ function _to_debrujin(node::AbstractToken, T, stack=AbstractVariableToken[])
 end
 
 @testitem "parse" begin
-    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    import LambdaRegression.DebruijnNodeModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
     using LambdaRegression.ParseModule
     # test default type parse
     @test DBNode(@lambda x->x+1) == AbsDB{Any}(
@@ -275,7 +276,7 @@ function traverse(f, node::DBNode{T}) where {T}
 end
 
 @testitem "traverse" begin
-    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
+    import LambdaRegression.DebruijnNodeModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
     using LambdaRegression.ParseModule
     foo = DBNode(@lambda (*)->(*)->(&3 * &1 * ((*)->&0 * &2)))
     new_foo = traverse(foo) do x, n
@@ -356,7 +357,7 @@ function Base.iterate(node::DBNode{T}, state=nothing) where {T}
 end
 
 @testitem "iteration" begin
-    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
+    import LambdaRegression.DebruijnNodeModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB
     foo = DBNode(@lambda (*)->(*)->(&3 * &1 * ((*)->&0 * &2)))
     results = collect(pairs(foo))
     @test length(results) == 10
@@ -419,14 +420,14 @@ shift_free(node::DBNode{T}, n::UInt) where {T} = traverse(node) do node, depth
 end
 
 @testitem "shift_free" begin
-    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, shift_free
+    import LambdaRegression.DebruijnNodeModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, shift_free
     using LambdaRegression.ParseModule
     foo = DBNode(@lambda (*)->(*)->(&3 * &1 * ((*)->&0 * &2)))
     @test shift_free(foo, UInt(1)) == DBNode(@lambda (*)->(*)->(&4 * &1 * ((*)->&0 * &2)))
 end
 
 @testitem "substitute" begin
-    import LambdaRegression.DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, substitute
+    import LambdaRegression.DebruijnNodeModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, substitute
     using LambdaRegression.ParseModule
     foo = DBNode(@lambda (*)->(*)->(&3 * &1 * ((*)->&0 * &2)))
     bar = DBNode(@lambda (*)->(&4 * &0))
@@ -454,10 +455,10 @@ end
 @alias ProxyDB
 
 
-include("cse.jl")
+# include("cse.jl")
 
 
 export DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
 export shift_free, substitute, Normalized, normalized
 
-end # module DeBruijnModule
+end # module DebruijnNodeModule
