@@ -5,6 +5,9 @@ using ..ParseModule: AbstractToken
 using TestItems
 import ..DebruijnNodeModule: pretty_string
 
+public AbstractItem, arity, DfsTree, DfsTreeLike, isleaf, subtree, children
+public App, Abs, DBVar, Proxy, DBItem, DBTree, DBTreeLike
+
 abstract type AbstractItem end
 function arity end
 
@@ -45,6 +48,8 @@ Base.setindex!(tree::DfsTree{T}, v::T, i::Int) where {T} = (tree.items[i] = v)
 
 const DfsTreeView{T} = SubArray{T, 1, DfsTree{T}, Tuple{UnitRange{Int}}, true}
 const DfsTreeLike{T} = Union{DfsTree{T}, DfsTreeView{T}}
+
+DfsTree{T}(from::DfsTreeLike{T}) where T<:AbstractItem = DfsTree{T}(collect(from))
 
 subtree(tree::DfsTreeLike{T}, index::Int) where {T} = view(tree, index:subtree_end(tree, index))
 
@@ -254,5 +259,82 @@ end
     debruijn_nested = to_debruijn_node(nested_tree)
     @test debruijn_nested == AbsDB(AppDB(VarDB(0), AbsDB(VarDB(0))))
 end
+
+"""
+    shift_free!(tree::DBTree{T}, n::Int) where {T}
+
+In place version of [`shift_free`](@ref).
+"""
+function shift_free!(tree::DBTree{T}, n::Int) where {T}
+    stack = UInt[] # 0 for unvisited child, 1 or more for abstraction chain
+    for i in eachindex(tree)
+        if tree[i] isa Abs 
+            if !isempty(stack) && stack[end] > 0
+                stack[end] += 1
+            else
+                push!(stack, UInt(1))
+            end
+        elseif tree[i] isa App
+            push!(stack, UInt(0)) # use u0 to label the unvisited child of the App node
+        else # tree[i] isa leaf node
+            if tree[i] isa DBVar
+                if tree[i].index >= sum(stack) # free variable
+                    tree[i] = DBVar(tree[i].index + n)
+                end
+            end
+            pop!(stack)
+        end
+    end
+    return tree
+end
+
+"""
+    shift_free(tree::DBTreeLike{T}, n::Int) where {T}
+
+Shift all free variables in a DeBruijn tree up or down by `n`.
+Returns a new tree with the free variables shifted.
+"""
+shift_free(tree::DBTreeLike{T}, n::Int) where {T} = shift_free!(DBTree{T}(tree), n)
+
+@testitem "shift_free operation" begin
+    using LambdaRegression.DebruijnModule: DBTree, shift_free, shift_free!, Abs, App, DBVar, Proxy
+
+    # Test 1: Abstraction with free variable
+    # Tree: [Abs(), DBVar(1)]
+    # In an abstraction, DBVar(1) is free since 1 ≥ 1 and should be shifted.
+    tree1 = DBTree([Abs(), DBVar(1)])
+    shifted1 = shift_free(tree1, 2)
+    @test shifted1[1] == Abs()
+    @test shifted1[2] == DBVar(3)
+
+    # Test 2: Abstraction with bound variable
+    # Tree: [Abs(), DBVar(0)]
+    # DBVar(0) is bound (since 0 < 1) and must remain unchanged.
+    tree2 = DBTree([Abs(), DBVar(0)])
+    shifted2 = shift_free(tree2, 5)
+    @test shifted2[1] == Abs()
+    @test shifted2[2] == DBVar(0)
+
+    # Test 3: In-place shift using shift_free!
+    # Tree represents the term: λ. (DBVar(0) applied to DBVar(2))
+    # The DFS tree is: [Abs(), App(), DBVar(0), DBVar(2)]
+    # Here, the variable DBVar(0) is bound (should not be shifted) whereas DBVar(2) is free.
+    tree3 = DBTree([Abs(), App(), DBVar(0), DBVar(2)])
+    shift_free!(tree3, 3)
+    @test tree3[1] == Abs()
+    @test tree3[2] == App()
+    @test tree3[3] == DBVar(0)   # bound var remains unchanged
+    @test tree3[4] == DBVar(5)   # free var (2) shifted to 5
+
+    # Test 4: Verify that shift_free returns a new tree (i.e. does not modify the original)
+    tree4 = DBTree([Abs(), DBVar(1)])
+    shifted4 = shift_free(tree4, 10)
+    @test tree4[2] == DBVar(1)   # original tree must remain unmodified
+    @test shifted4[2] == DBVar(11)
+end
+
+
+
+
 
 end # module FlattenDebruijn

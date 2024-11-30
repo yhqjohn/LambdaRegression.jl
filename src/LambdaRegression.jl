@@ -14,7 +14,7 @@ include("DebruijnNode.jl")
 include("Debruijn.jl")
 
 
-# include("Reduce.jl")
+include("Reduce.jl")
 # export beta_reduce, normalize
 
 # include("Terms.jl")
