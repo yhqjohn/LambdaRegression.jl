@@ -459,6 +459,6 @@ end
 
 
 export DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
-export shift_free, substitute, Normalized, normalized
+# export shift_free, substitute, Normalized, normalized
 
 end # module DebruijnNodeModule

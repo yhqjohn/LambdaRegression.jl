@@ -282,7 +282,7 @@ function shift_free!(tree::DBTree{T}, n::Int) where {T}
                     tree[i] = DBVar(tree[i].index + n)
                 end
             end
-            pop!(stack)
+            isempty(stack)||pop!(stack)
         end
     end
     return tree
@@ -333,8 +333,117 @@ shift_free(tree::DBTreeLike{T}, n::Int) where {T} = shift_free!(DBTree{T}(tree),
     @test shifted4[2] == DBVar(11)
 end
 
+"""
+    lambda_application(func::DBTreeLike{T}, arg::DBTreeLike{T}) where {T}
+
+Apply a abstraction to an argument.
+The argument `func` has to be a legal abstraction tree.
+The argument will replace all variable nodes bound to the abstraction in the abstraction body with the lifted argument,
+i.e. the argument with the free variables shift up by the abstraction depth of the corresponding bound variable,
+and the abstraction body with replacements will be returned.
+"""
+function lambda_application(func::DBTreeLike{T}, arg::DBTreeLike{T}) where {T}
+    @assert func[1] isa Abs "lambda_application: func has to be a legal abstraction tree"
+    body = func[2:end]
+    stack = UInt[] # 0 for unvisited child, 1 or more for abstraction chain, start from [] as the original abstraction is ripped
+    arglength = length(arg)
+    bodylength = length(body)
+    i = 1
+    while i <= bodylength
+        if body[i] isa Abs
+            if !isempty(stack) && stack[end] > 0
+                stack[end] += 1
+            else
+                push!(stack, UInt(1))
+            end
+        elseif body[i] isa App
+            # For an application node we "descend" into its children by pushing a new context.
+            push!(stack, UInt(0))
+        else  # if we are at a leaf node
+            # The substitution now tests that the occurrence's index equals the current binder depth.
+            if body[i] isa DBVar && body[i].index == sum(stack)
+                splice!(body, i, shift_free(arg, Int(sum(stack))))
+                i += arglength - 1
+                bodylength += arglength - 1
+            end
+            isempty(stack)||pop!(stack)
+        end
+        i += 1
+    end
+    return DBTree{T}(body)
+end
+
+"""
+    application(func::DBTreeLike{T}, arg::DBTreeLike{T}) where {T}
+
+Apply a function to an argument.
+By default, where the function is a legal abstraction, this is equivalent to [`lambda_application`](@ref).
+"""
+application(func::DBTreeLike{T}, arg::DBTreeLike{T}) where {T} = lambda_application(func, arg)
+
+"""
+    isapplicable(func::DBTreeLike{T}, arg::DBTreeLike{T}) where {T}
+
+Check if a function is applicable to an argument.
+By default, this checks if the function is a legal abstraction.
+"""
+isapplicable(func::DBTreeLike{T}, ::DBTreeLike{T}) where {T} = func[1] isa Abs
 
 
+@testitem "lambda_application substitution" begin
+    using LambdaRegression.DebruijnModule: DBTree, lambda_application, shift_free, Abs, App, DBVar
 
+    # Test 1: Identity function.
+    id_func = DBTree([Abs(), DBVar(0)])
+    arg     = DBTree([Abs(), DBVar(5)])
+    expected = DBTree([Abs(), DBVar(5)])
+    result   = lambda_application(id_func, arg)
+    @test result == expected
+
+    # Test 2: lifting
+    func = DBTree([Abs(), Abs(), DBVar(1)])
+    expected = DBTree([Abs(), Abs(), DBVar(6)])
+    result = lambda_application(func, arg)
+    @test result == expected
+
+    # Test 3: Error on non‐abstraction trees.
+    # The lambda_application function asserts that the first element of the function tree is an Abs.
+    # In the following tree the first node is an App so an AssertionError should be thrown.
+    non_lambda = DBTree([App(), DBVar(0)])
+    @test_throws AssertionError lambda_application(non_lambda, arg)
+
+    # Test 4: Function duplicating its bound variable.
+    # Consider a function which duplicates its argument, represented as:
+    #   dup_func = [Abs(), App(), Abs(), DBVar(1), DBVar(0)]
+    # In the DFS traversal of the abstraction body (which is dup_func[2:end]),
+    # the first occurrence of DBVar(1) (encountered in a context with sum(stack)==1)
+    # satisfies the substitution condition and is replaced by shift_free(arg, 1),
+    # whereas the second occurrence is replaced by shift_free(arg, 0).
+    # The expected result is:
+    #   DBTree([App(), Abs(), Abs(), DBVar(6), Abs(), DBVar(5)])
+    dup_func     = DBTree([Abs(), App(), Abs(), DBVar(1), DBVar(0)])
+    expected_dup = DBTree([App(), Abs(), Abs(), DBVar(6), Abs(), DBVar(5)])
+    result_dup   = lambda_application(dup_func, arg)
+    @test result_dup == expected_dup
+
+    # Test 4: Abs chain longer than one.
+    # Here we test a function with a nested chain of Abs nodes in its body.
+    # Consider the function:
+    #    chain_func = [Abs(), Abs(), Abs(), DBVar(2)]
+    # The traversal processes the first Abs in the body by pushing a new binder (stack becomes [1]),
+    # then the second Abs increments the current chain (stack becomes [2]).
+    # When it encounters DBVar(2), the substitution condition is:
+    #    2 == sum(stack), which holds.
+    # Thus, DBVar(2) is substituted by shift_free(arg_for_chain, 2).
+    # For instance, if we let:
+    #    arg = [Abs(), DBVar(5)]
+    # then shift_free(arg, 2) yields [Abs(), DBVar(7)].
+    # After substitution, the expected tree is:
+    #    DBTree([Abs(), Abs(), Abs(), DBVar(7)])
+    chain_func   = DBTree([Abs(), Abs(), Abs(), DBVar(2)])
+    expected_chain = DBTree([Abs(), Abs(), Abs(), DBVar(7)])
+    result_chain   = lambda_application(chain_func, arg)
+    @test result_chain == expected_chain
+end
 
 end # module FlattenDebruijn
