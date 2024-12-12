@@ -1,29 +1,11 @@
 module LambdaRegression
 
-include("common_utils.jl")
+include("trees/Trees.jl")
+using .Trees
+export Trees
 
-include("Parse.jl")
-
-using .ParseModule: @lambda
-export @lambda
-
-include("DebruijnNode.jl")
-# using .DeBruijnModule: DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
-# export DBNode, VarDB, AbsDB, AppDB, ProxyDB, traverse
-
-include("Debruijn.jl")
-
-
-include("Reduce.jl")
-# export beta_reduce, normalize
-
-# include("Terms.jl")
-
-# include("BuiltinTerms.jl")
-
-# include("Mutations.jl")
-
-# include("Regressor.jl")
-
+include("asts/ASTs.jl")
+using .ASTs
+export ASTs
 
 end # module LambdaRegression
