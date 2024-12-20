@@ -55,7 +55,7 @@ module DfsTrees
 
 using TestItems
 import ..Trees: AbstractTree, NodeIndex, root, setroot!, subtree, children, setchild!, arity, isleaf
-import ..Trees: AbstractTraverseState, StateBag, build_state_bag, getstate, Leave, traverse, init, requires, default_states, StackState, enter!, leave!
+import ..Trees: AbstractTraverseState, StateBag, build_state_bag, getstate, Leave, Break, traverse, init, requires, default_states, StackState, enter!, leave!
 
 """
     AbstractNodeItem
@@ -227,8 +227,9 @@ function traverse(f, bag::StateBag, tree::DfsTree{T}, start_node::Int) where T
         
         # Call user function
         result = f(tree, current_index, bag)
-        
-        if result isa Leave
+        if result isa Break
+            return Break()
+        elseif result isa Leave
             # Skip subtree - call leave! for current node then jump to next sibling
             (x->(leave!(x, tree, current_index))).(bag.order)
             

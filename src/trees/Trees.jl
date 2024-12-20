@@ -453,6 +453,13 @@ should be left immediately without visiting its children.
 struct Leave end
 
 """
+    Break()
+
+Return value for traverse functions indicating that the traversal should terminate.
+"""
+struct Break end
+
+"""
     traverse(f, tree::AbstractTree, states...)
 
 Traverse a tree in pre-order depth-first manner with custom states.
@@ -461,6 +468,7 @@ Traverse a tree in pre-order depth-first manner with custom states.
 - `f`: User function called for each node. Should have signature `f(tree, node, bag::StateBag) -> Union{Nothing, Leave}`
   - Return `nothing` to continue normal traversal
   - Return `Leave()` to skip children of current node
+  - Return `Break()` to terminate the traversal
 - `tree`: The tree to traverse
 - `states...`: Variable number of state types to initialize and maintain during traversal
 
@@ -501,14 +509,14 @@ function traverse(f, bag::StateBag, tree::AbstractTree, node)
     # Call enter! for all states in dependency order
     (x->(enter!(x, tree, node))).(bag.order)
     result = f(tree, node, bag)  # Call user function for current node
+    result isa Break && return Break() # If user function returns Break(), terminate the traversal
     if !(result isa Leave)  # If user function returns Leave(), skip children
         for child in children(tree, node)  # Visit children
-            traverse(f, bag, tree, child)
+            traverse(f, bag, tree, child) isa Break && return Break() # terminate and pass Break() to parent
         end
     end
     # Call leave! for all states in dependency order (not reverse!)
     (x->(leave!(x, tree, node))).(bag.order)
-    return nothing
 end
 
 ########################################################
@@ -1247,6 +1255,40 @@ end
     @test modifications_count[] == 1
     @test tree.root.children[1].value == 99  # Node 2 should be replaced with 99
     @test tree.root.children[2].value == 3   # Node 3 should remain unchanged
+end
+
+@testitem "traverse with Break() return" begin
+    using LambdaRegression.Trees: NodeTree, Node, AbstractTraverseState, traverse, getstate, Break, init, enter!, leave!
+    import LambdaRegression.Trees: init, enter!, leave!
+
+    mutable struct CountState <: AbstractTraverseState
+        count::Int
+    end
+    init(::Type{CountState}, _, _) = CountState(0)
+    enter!(state::CountState, _, _) = (state.count += 1)
+    leave!(::CountState, _, _) = nothing
+
+    # Create tree: 1 -> [2 -> [4], 3]
+    grandchild = Node(4)
+    child_with_child = Node(2)
+    push!(child_with_child.children, grandchild)
+    child2 = Node(3)
+    root_node = Node(1)
+    push!(root_node.children, child_with_child, child2)
+    tree = NodeTree(root_node)
+
+    # Traverse and break when node value == 2
+    function count_until_two(_, node, bag)
+        if node.value == 2
+            return Break()
+        end
+        return nothing
+    end
+
+    bag = traverse(count_until_two, tree, CountState)
+
+    # Only nodes 1 and 2 should have been visited (CountState enter! is called before user function)
+    @test getstate(bag, CountState).count == 2
 end
 
 end # module Trees

@@ -44,6 +44,7 @@ StateBag
 getstate
 traverse
 Leave
+Break
 ```
 
 ### Built-in States

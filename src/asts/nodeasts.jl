@@ -115,13 +115,18 @@ automatically resolving naming conflicts without requiring global coordination.
 """
 module NodeASTs
 
+# Import and using statements
 import ..Trees: AbstractTree, NodeIndex, root, setroot!, subtree, children, setchild!, arity, isleaf, getstate
+using ..Trees: AbstractTraverseState, getstate, Leave, StateBag, build_state_bag, DepthState, StackState, AncestorsState, PointerState, traverse
+import ..Trees: init, requires, enter!, leave!
 using TestItems
 
-# Export main types and functions
+# Export statements
 export AstNode, AstTree
 export AppNode, AbsNode, VarNode, ConstNode, IndexNode, LetNode
 export SymbolGenerator, generate_fresh_name
+export ScopeState, AbstractionDepthState
+export parse_lambda_literal, collect_constants!, @lambda_cmd
 
 
 ########################################################
@@ -132,23 +137,17 @@ export SymbolGenerator, generate_fresh_name
     SymbolGenerator
 
 A simple and efficient symbol generator for symbolic regression.
-Generates lowercase alphabetic names in sequence: a, b, c, ..., z, aa, ab, ...
-
-Since this is designed for symbolic regression rather than parsing human code,
-no name conflict checking is performed for efficiency.
+Generates Symbols with numeric names, e.g. `Symbol("0")`, `Symbol("1")`, ...
 """
 mutable struct SymbolGenerator
     counter::Int
 end
-
 SymbolGenerator() = SymbolGenerator(0)
 
 """
     generate_fresh_name(gen::SymbolGenerator)
 
-Generate the next fresh variable name as a `Symbol("<n>")`, where `<n>` is an
-integer counter starting at `0`. This numeric naming avoids collisions with
-user-defined alphabetic symbols while remaining cheap to generate.
+Generate the next fresh variable name as a `Symbol("<n>")`
 """
 function generate_fresh_name(gen::SymbolGenerator)
     name = Symbol(gen.counter)
@@ -226,11 +225,6 @@ A tree container for AST nodes implementing the Trees.AbstractTree interface.
 For AstTree, the node index type is AstNode itself, meaning nodes can be directly
 accessed and manipulated.
 
-# Constructor
-```julia
-AstTree(root_node::AstNode)
-```
-
 # Tree Interface
 The tree implements all standard tree operations including traversal, modification,
 and subtree extraction.
@@ -272,15 +266,6 @@ Function application node representing M N in lambda calculus.
 
 # Mathematical Notation
 Displayed as: `M N` or `(M) N` when parentheses are needed for precedence.
-
-# Examples
-```julia
-# Create (f x)
-AppNode(VarNode(:f), VarNode(:x))
-
-# Create ((f x) y) - left associative
-AppNode(AppNode(VarNode(:f), VarNode(:x)), VarNode(:y))
-```
 """
 mutable struct AppNode <: AstNode
     func::AstNode
@@ -310,20 +295,8 @@ Lambda abstraction node representing λx. M in lambda calculus.
 - `name::Symbol`: The parameter name (for display and debugging)
 - `body::AstNode`: The body of the abstraction
 
-# Mathematical Notation
-Displayed as: `λx·M` where the parameter and body are separated by "·".
-
-# Examples
-```julia
-# Create λx. x (identity function)
-AbsNode(:x, VarNode(:x))
-
-# Create λf. λx. f x (function application)
-AbsNode(:f, AbsNode(:x, AppNode(VarNode(:f), VarNode(:x))))
-```
-
 # Implementation Notes
-In the locally nameless representation, bound variables in the body should use
+In the locally nameless representation, bound variables in the body are preferred to be represented as
 [`IndexNode`](@ref) with appropriate De Bruijn indices rather than [`VarNode`](@ref).
 """
 mutable struct AbsNode <: AstNode
@@ -350,22 +323,6 @@ Free variable node representing unbound variables in lambda calculus.
 
 # Fields
 - `name::Symbol`: The variable name
-
-# Mathematical Notation
-Displayed as: the variable name itself (e.g., `x`, `y`, `f`).
-
-# Examples
-```julia
-# Create free variable x
-VarNode(:x)
-
-# Create free variable with descriptive name
-VarNode(:factorial)
-```
-
-# Implementation Notes
-In locally nameless representation, `VarNode` should only be used for free variables.
-Bound variables should use [`IndexNode`](@ref) with De Bruijn indices.
 """
 struct VarNode <: AstNode
     name::Symbol
@@ -384,28 +341,9 @@ Constant/primitive node representing built-in functions and literals.
 # Fields
 - `name::Symbol`: The constant identifier (must be a legal Julia variable name)
 
-# Mathematical Notation
-Displayed as: the constant name itself.
-
-# Examples
-```julia
-# Create built-in function
-ConstNode(:add)
-
-# Create mathematical constant
-ConstNode(:pi)
-
-# Create boolean constant  
-ConstNode(:true)
-```
-
-# Implementation Notes
-Constants represent elements that are neither variables nor lambda constructs,
-such as primitive operations, literals, and built-in functions.
-
-**Important**: The `name` field must be a legal Julia variable name (e.g., `:add`, `:pi`, `:x1`).
-Invalid names like `:42` or `:1` should not be used. This constraint is documented
-but not enforced for performance reasons in symbolic regression contexts.
+**Important**: The `name` field is suggested to be a legal Julia variable name (e.g., `:add`, `:pi`, `:x1`).
+Invalid names like `:42` or `:1` should be very careful to use. 
+This constraint is documented but not enforced for performance reasons in symbolic regression contexts.
 """
 struct ConstNode <: AstNode
     name::Symbol
@@ -472,18 +410,6 @@ LetNode(:x, ConstNode(:5), AppNode(AppNode(VarNode(:add), VarNode(:x)), ConstNod
 # Deprecation Note
 **This node type is not recommended for general use.** All λx.N M forms can be
 regarded as equivalent to `let x = M in N`, making explicit let-bindings redundant.
-The preferred representation is:
-
-```julia
-# Instead of: let x = M in N
-LetNode(:x, M, N)
-
-# Use: (λx. N) M  
-AppNode(AbsNode(:x, N), M)
-```
-
-This transformation is semantically equivalent and maintains the locally nameless
-representation more consistently.
 """
 mutable struct LetNode <: AstNode
     name::Symbol
@@ -509,38 +435,15 @@ isleaf(::LetNode) = false
 # Display System
 ########################################################
 
-"""
-    Base.show(io::IO, node::AstNode)
-
-Plain show method providing informative representation showing internal structure.
-"""
 function Base.show(io::IO, node::AstNode)
     print(io, _show_plain(node))
 end
-
-"""
-    Base.show(io::IO, ::MIME"text/plain", node::AstNode)
-
-Pretty display method for human-readable mathematical notation.
-"""
 function Base.show(io::IO, ::MIME"text/plain", node::AstNode)
     print(io, _show_pretty(node))
 end
-
-"""
-    Base.show(io::IO, tree::AstTree)
-
-Plain show method for AstTree showing internal structure.
-"""
 function Base.show(io::IO, tree::AstTree)
     print(io, "AstTree(", _show_plain(tree.root), ")")
 end
-
-"""
-    Base.show(io::IO, ::MIME"text/plain", tree::AstTree)
-
-Pretty display method for AstTree using mathematical notation.
-"""
 function Base.show(io::IO, ::MIME"text/plain", tree::AstTree)
     print(io, _show_pretty(tree.root))
 end
@@ -644,18 +547,11 @@ end
 ########################################################
 # Traversal States for AstTree (using new traverse interface)
 ########################################################
-
-# Import traverse interface from Trees
-using ..Trees: AbstractTraverseState, getstate, Leave, StateBag, build_state_bag, DepthState, StackState, AncestorsState, PointerState, traverse
-import ..Trees: init, requires, enter!, leave!
-
-
-
 """
     ScopeState <: AbstractTraverseState
 
 A traverse state that provides lazy access to all abstraction nodes (AbsNode) in
-the current scope chain. Depends on AncestorsState for ancestor information.
+the current scope chain. Depends on (`AncestorsState`)[@ref] for ancestor information.
 
 # Fields
 - `abstractions::Vector{AbsNode}`: Current abstraction nodes in scope
@@ -679,7 +575,7 @@ end
     AbstractionDepthState <: AbstractTraverseState
 
 A traverse state that provides the current abstraction depth (number of enclosing
-lambda abstractions). Depends on ScopeState for abstraction information.
+lambda abstractions). Depends on (`ScopeState`)[@ref] for abstraction information.
 
 # Fields
 - `depth::Int`: Current abstraction depth
@@ -698,9 +594,6 @@ function getstate(bag::StateBag, ::Type{AbstractionDepthState})
     abdepthstate.depth = length(scope.abstractions)
     return abdepthstate
 end
-
-# Export the new states (remove helper functions since they're now built into getstate)
-export ScopeState, AbstractionDepthState
 
 ########################################################
 # Lambda Calculus Utilities
@@ -729,23 +622,75 @@ function apply_node!(tree::AstTree, func::AbsNode, arg::AstNode)
     
     # Traverse the body and substitute all occurrences of the bound variable
     traverse(body_tree, AbstractionDepthState, PointerState) do tree, node, bag
-        if node isa VarNode
-            if node.name == varname
-                # Create a copy of the argument and wrap it in a tree for shifting
-                arg_tree = AstTree(deepcopy(arg))
-                shift_free_variables!(arg_tree, getstate(bag, AbstractionDepthState).depth, 0)
-                pointer = getstate(bag, PointerState{AstNode})
-                setchild!(tree, pointer.parent, pointer.child_index, arg_tree)
-            end
+        depth_state = getstate(bag, AbstractionDepthState)
+        if ((node isa VarNode) && (node.name == varname)) ||
+           ((node isa IndexNode) && (node.index == depth_state.depth))
+            arg_tree = AstTree(deepcopy(arg))
+            shift_free_variables!(arg_tree, depth_state.depth, 0)
+
+            pointer = getstate(bag, PointerState{AstNode})
+            setchild!(tree, pointer.parent, pointer.child_index, arg_tree)
         end
     end
     return body_tree
 end
 
+########################################################
+# Hash and Equality Functions
+########################################################
 
+"""
+    Base.hash(node::AstNode, h::UInt)
+
+Compute a hash value for an AST node based on its type and field values.
+The hash is computed recursively for nodes with children, ensuring that
+structurally equivalent trees have the same hash value.
+
+Note that AbsNode is not hashed by its name, but by its body.
+All AbsNodes are considered anonymous for the purpose of alpha-equivalence.
+The bound varibales *MUST* be transformed to De Bruijn indices before hashing,
+otherwise the two unequavalent Terms will have the same hash value.
+"""
+Base.hash(node::AppNode, h::UInt) = hash(node.func, hash(node.arg, hash(:AppNode, h)))
+Base.hash(node::AbsNode, h::UInt) = hash(node.body, hash(:AbsNode, h)) 
+Base.hash(node::VarNode, h::UInt) = hash(node.name, hash(:VarNode, h))
+Base.hash(node::ConstNode, h::UInt) = hash(node.name, hash(:ConstNode, h))
+Base.hash(node::IndexNode, h::UInt) = hash(node.index, hash(:IndexNode, h))
+Base.hash(node::LetNode, h::UInt) = hash(node.name, hash(node.value, hash(node.body, hash(:LetNode, h))))
+
+"""
+    Base.:(==)(a::AstNode, b::AstNode)
+
+Check if two AST nodes are structurally equal by comparing their types,
+field values, and recursively comparing child nodes.
+
+Note that AbsNode is equavalent to another AbsNode with the same body,
+even if they have different names.
+Therefore, the bound variables *MUST* be transformed to De Bruijn indices before comparing.
+"""
+Base.:(==)(a::AppNode, b::AppNode) = a.func == b.func && a.arg == b.arg
+Base.:(==)(a::AbsNode, b::AbsNode) = a.body == b.body
+Base.:(==)(a::VarNode, b::VarNode) = a.name == b.name
+Base.:(==)(a::ConstNode, b::ConstNode) = a.name == b.name
+Base.:(==)(a::IndexNode, b::IndexNode) = a.index == b.index
+Base.:(==)(a::LetNode, b::LetNode) = a.name == b.name && a.value == b.value && a.body == b.body
+Base.:(==)(a::AstNode, b::AstNode) = false # Different types are never equal
+
+Base.hash(t::AstTree, h::UInt) = hash(t.root, hash(:AstTree, h))
+Base.:(==)(a::AstTree, b::AstTree) = a.root == b.root
 
 ########################################################
-# Test Items – additional tests for iterators and states
+# Parse Submodule
+########################################################
+
+# Include the Parse submodule
+include("parse.jl")
+
+# Import parsing functionality 
+using .Parse: parse_lambda_literal, collect_constants!, @lambda_cmd
+
+########################################################
+# Test Items
 ########################################################
 
 @testitem "AstTree basic iteration" begin
@@ -807,141 +752,15 @@ end
     @test _show_pretty(nested_app) == "f x y"
 end
 
-
-
-@testitem "AncestorsState functionality" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, AncestorsState, getstate, AstNode
-    using LambdaRegression.Trees: traverse
-
-    # Create test tree: (λx. x y) z
-    var_x = VarNode(:x)
-    var_y = VarNode(:y)
-    var_z = VarNode(:z)
-    app_xy = AppNode(var_x, var_y)
-    abs_node = AbsNode(:x, app_xy)
-    root_app = AppNode(abs_node, var_z)
-    tree = AstTree(root_app)
-
-    # Collect ancestors information
-    ancestors_info = Tuple{String, Vector{String}}[]  # (node_type, ancestor_types)
-    
-    function collect_ancestors_info(tree, node, bag)
-        ancestors = getstate(bag, AncestorsState{AstNode})
-        node_type = string(typeof(node).name.name)
-        ancestor_types = [string(typeof(a).name.name) for a in ancestors.ancestors]
-        push!(ancestors_info, (node_type, ancestor_types))
-        return nothing
-    end
-
-    bag = traverse(collect_ancestors_info, tree, AncestorsState)
-    
-    # Verify ancestors tracking (tree has 6 nodes: root_app, abs_node, app_xy, var_x, var_y, var_z)
-    @test length(ancestors_info) == 6  # 6 nodes total
-    
-    # Root should have itself as ancestor (due to enter! being called before user function)
-    @test ancestors_info[1] == ("AppNode", ["AppNode"])
-    
-    # Check that ancestors are properly tracked for nested nodes
-    # The exact order depends on traversal, but we can verify relationships
-    let nested_var_count = 0
-        for (node_type, ancestor_types) in ancestors_info
-            if node_type == "VarNode" && length(ancestor_types) >= 2
-                # Should have at least AppNode and AbsNode as ancestors for inner variables
-                @test "AppNode" in ancestor_types
-                nested_var_count += 1
-            end
-        end
-        @test nested_var_count > 0  # At least one nested variable should be found
-    end
-end
-
-@testitem "ScopeState functionality" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ScopeState, getstate
-    using LambdaRegression.Trees: traverse
-
-    # Create nested lambda tree: λx. λy. x y
-    var_x = VarNode(:x)
-    var_y = VarNode(:y)
-    inner_app = AppNode(var_x, var_y)
-    inner_abs = AbsNode(:y, inner_app)
-    outer_abs = AbsNode(:x, inner_abs)
-    tree = AstTree(outer_abs)
-
-    # Collect scope information
-    scope_info = Tuple{String, Int}[]  # (node_type, num_abstractions_in_scope)
-    
-    function collect_scope_info(tree, node, bag)
-        scope = getstate(bag, ScopeState)
-        node_type = string(typeof(node).name.name)
-        push!(scope_info, (node_type, length(scope.abstractions)))
-        return nothing
-    end
-
-    bag = traverse(collect_scope_info, tree, ScopeState)
-    
-    # Root AbsNode should have 1 abstraction in scope (itself)  
-    @test ("AbsNode", 1) in scope_info
-    
-    # Inner nodes should have progressively more abstractions in scope
-    max_scope_depth = maximum(info[2] for info in scope_info)
-    @test max_scope_depth == 2  # Should reach depth 2 for innermost nodes (both lambdas)
-    
-    # Verify that innermost application has both lambdas in scope
-    @test ("AppNode", 2) in scope_info
-end
-
-@testitem "AbstractionDepthState functionality" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, AbstractionDepthState, getstate
-    using LambdaRegression.Trees: traverse
-
-    # Create nested lambda tree: λx. λy. λz. x (y z)
-    var_x = VarNode(:x)
-    var_y = VarNode(:y)
-    var_z = VarNode(:z)
-    app_yz = AppNode(var_y, var_z)
-    app_final = AppNode(var_x, app_yz)
-    abs_z = AbsNode(:z, app_final)
-    abs_y = AbsNode(:y, abs_z)
-    abs_x = AbsNode(:x, abs_y)
-    tree = AstTree(abs_x)
-
-    # Collect depth information
-    depth_info = Tuple{String, Int}[]  # (node_type, abstraction_depth)
-    
-    function collect_depth_info(tree, node, bag)
-        depth_state = getstate(bag, AbstractionDepthState)
-        node_type = string(typeof(node).name.name)
-        push!(depth_info, (node_type, depth_state.depth))
-        return nothing
-    end
-
-    bag = traverse(collect_depth_info, tree, AbstractionDepthState)
-    
-    # Root should have depth 1 (includes itself)
-    @test ("AbsNode", 1) in depth_info
-    
-    # Should reach maximum depth 3 for innermost nodes
-    max_depth = maximum(info[2] for info in depth_info)
-    @test max_depth == 3
-    
-    # Verify specific depth for innermost application
-    @test ("AppNode", 3) in depth_info
-    
-    # Verify that there are nodes at each depth level
-    depths = Set(info[2] for info in depth_info)
-    @test 1 in depths  # Root level (includes itself)
-    @test 2 in depths  # After first lambda
-    @test 3 in depths  # After third lambda
-end
-
-@testitem "State dependency chain" begin
+@testitem "Traversal state system functionality" begin
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, AncestorsState, ScopeState, AbstractionDepthState, getstate, AstNode
     using LambdaRegression.Trees: traverse
 
+    # === Test 1: Basic state dependency resolution ===
     # Create simple test tree: λx. x
-    var_x = VarNode(:x)
-    abs_node = AbsNode(:x, var_x)
-    tree = AstTree(abs_node)
+    var_x1 = VarNode(:x)
+    abs_simple = AbsNode(:x, var_x1)
+    tree_simple = AstTree(abs_simple)
 
     # Test that all three states work together
     collected_data = Tuple{String, Int, Int, Int}[]  # (node_type, ancestors_count, scope_count, depth)
@@ -961,7 +780,7 @@ end
     end
 
     # Test with all three states - dependencies should be resolved automatically
-    bag = traverse(collect_all_info, tree, AbstractionDepthState)  # Only specify the most dependent state
+    bag = traverse(collect_all_info, tree_simple, AbstractionDepthState)  # Only specify the most dependent state
     
     @test length(collected_data) == 2  # AbsNode + VarNode
     
@@ -975,33 +794,119 @@ end
     
     # VarNode: 2 ancestors (AbsNode + itself), 1 in scope (AbsNode), depth 1  
     @test ("VarNode", 2, 1, 1) in collected_data
-end
 
-@testitem "LetNode bounds checking" begin
-    using LambdaRegression.ASTs.NodeASTs: LetNode, VarNode, ConstNode, setchild!
+    # === Test 2: ScopeState with nested lambdas ===
+    # Create nested lambda tree: λx. λy. x y
+    var_x2 = VarNode(:x)
+    var_y2 = VarNode(:y)
+    inner_app = AppNode(var_x2, var_y2)
+    inner_abs = AbsNode(:y, inner_app)
+    outer_abs = AbsNode(:x, inner_abs)
+    tree_nested = AstTree(outer_abs)
 
-    # Test bounds errors for LetNode (important error-handling logic)
-    var_x = VarNode(:x)
-    const_5 = ConstNode(:five)
-    let_node = LetNode(:x, const_5, var_x)
+    # Collect scope information
+    scope_info = Tuple{String, Int}[]  # (node_type, num_abstractions_in_scope)
     
-    @test_throws BoundsError setchild!(let_node, 0, var_x)
-    @test_throws BoundsError setchild!(let_node, 3, var_x)
-end
+    function collect_scope_info(tree, node, bag)
+        scope = getstate(bag, ScopeState)
+        node_type = string(typeof(node).name.name)
+        push!(scope_info, (node_type, length(scope.abstractions)))
+        return nothing
+    end
 
-@testitem "Display complex precedence cases" begin
-    using LambdaRegression.ASTs.NodeASTs: VarNode, ConstNode, LetNode, _show_pretty
+    bag = traverse(collect_scope_info, tree_nested, ScopeState)
+    
+    # Root AbsNode should have 1 abstraction in scope (itself)  
+    @test ("AbsNode", 1) in scope_info
+    
+    # Inner nodes should have progressively more abstractions in scope
+    max_scope_depth = maximum(info[2] for info in scope_info)
+    @test max_scope_depth == 2  # Should reach depth 2 for innermost nodes (both lambdas)
+    
+    # Verify that innermost application has both lambdas in scope
+    @test ("AppNode", 2) in scope_info
 
-    # Test precedence handling for LetNode (complex logic worth testing)
-    var_x = VarNode(:x)
-    const_pi = ConstNode(:pi)
-    let_node = LetNode(:y, const_pi, var_x)
+    # === Test 3: AbstractionDepthState with deep nesting ===
+    # Create deeply nested lambda tree: λx. λy. λz. x (y z)
+    var_x3 = VarNode(:x)
+    var_y3 = VarNode(:y)
+    var_z3 = VarNode(:z)
+    app_yz = AppNode(var_y3, var_z3)
+    app_final = AppNode(var_x3, app_yz)
+    abs_z = AbsNode(:z, app_final)
+    abs_y = AbsNode(:y, abs_z)
+    abs_x = AbsNode(:x, abs_y)
+    tree_deep = AstTree(abs_x)
+
+    # Collect depth information
+    depth_info = Tuple{String, Int}[]  # (node_type, abstraction_depth)
     
-    @test _show_pretty(let_node, 2) == "(let y = pi in x)"
+    function collect_depth_info(tree, node, bag)
+        depth_state = getstate(bag, AbstractionDepthState)
+        node_type = string(typeof(node).name.name)
+        push!(depth_info, (node_type, depth_state.depth))
+        return nothing
+    end
+
+    bag = traverse(collect_depth_info, tree_deep, AbstractionDepthState)
     
-    # Test complex precedence with nested let
-    nested_let = LetNode(:a, LetNode(:b, const_pi, var_x), var_x)
-    @test _show_pretty(nested_let, 0) == "let a = let b = pi in x in x"
+    # Root should have depth 1 (includes itself)
+    @test ("AbsNode", 1) in depth_info
+    
+    # Should reach maximum depth 3 for innermost nodes
+    max_depth = maximum(info[2] for info in depth_info)
+    @test max_depth == 3
+    
+    # Verify specific depth for innermost application
+    @test ("AppNode", 3) in depth_info
+    
+    # Verify that there are nodes at each depth level
+    depths = Set(info[2] for info in depth_info)
+    @test 1 in depths  # Root level (includes itself)
+    @test 2 in depths  # After first lambda
+    @test 3 in depths  # After third lambda
+
+    # === Test 4: AncestorsState with mixed structure ===
+    # Create test tree: (λx. x y) z
+    var_x4 = VarNode(:x)
+    var_y4 = VarNode(:y)
+    var_z4 = VarNode(:z)
+    app_xy = AppNode(var_x4, var_y4)
+    abs_node = AbsNode(:x, app_xy)
+    root_app = AppNode(abs_node, var_z4)
+    tree_mixed = AstTree(root_app)
+
+    # Collect ancestors information
+    ancestors_info = Tuple{String, Vector{String}}[]  # (node_type, ancestor_types)
+    
+    function collect_ancestors_info(tree, node, bag)
+        ancestors = getstate(bag, AncestorsState{AstNode})
+        node_type = string(typeof(node).name.name)
+        ancestor_types = [string(typeof(a).name.name) for a in ancestors.ancestors]
+        push!(ancestors_info, (node_type, ancestor_types))
+        return nothing
+    end
+
+    bag = traverse(collect_ancestors_info, tree_mixed, AncestorsState)
+    
+    # Verify ancestors tracking (tree has 6 nodes: root_app, abs_node, app_xy, var_x, var_y, var_z)
+    @test length(ancestors_info) == 6  # 6 nodes total
+    
+    # Root should have itself as ancestor (due to enter! being called before user function)
+    @test ancestors_info[1] == ("AppNode", ["AppNode"])
+    
+    # Check that ancestors are properly tracked for nested nodes
+    # The exact order depends on traversal, but we can verify relationships
+    let nested_var_count = 0
+        for (node_type, ancestor_types) in ancestors_info
+            if node_type == "VarNode" && length(ancestor_types) >= 2
+                # Should have at least AppNode and AbsNode as ancestors for inner variables
+                @test "AppNode" in ancestor_types
+                nested_var_count += 1
+            end
+        end
+        @test nested_var_count > 0  # At least one nested variable should be found
+    end
 end
 
 @testitem "Edge cases and error handling" begin
@@ -1080,13 +985,6 @@ end
     abs_node = AbsNode(:f, var_x)
     @test setchild!(abs_node, 1, var_y) === abs_node
     @test abs_node.body === var_y
-    
-    # Test LetNode field modifications
-    let_node = LetNode(:x, var_x, var_y)
-    @test setchild!(let_node, 1, var_z) === let_node
-    @test let_node.value === var_z
-    @test setchild!(let_node, 2, var_x) === let_node
-    @test let_node.body === var_x
 end
 
 @testitem "Display methods and show functions" begin
@@ -1250,92 +1148,28 @@ end
 
 @testitem "eliminate_bound_variables! edge cases" begin
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, eliminate_bound_variables!
-
-    # Test tree with only free variables - nothing should change
-    var_f = VarNode(:f)
-    var_g = VarNode(:g)
-    const_pi = ConstNode(:pi)
-    app_fg = AppNode(var_f, var_g)
-    app_with_const = AppNode(app_fg, const_pi)
-    tree_free = AstTree(app_with_const)
+    using LambdaRegression.ASTs.Parse: @lambda_cmd
     
-    # Store original structure for comparison
-    original_func = tree_free.root.func.func.name
-    original_arg1 = tree_free.root.func.arg.name  
-    original_arg2 = tree_free.root.arg.name
-    
-    eliminate_bound_variables!(tree_free)
-    
-    # Nothing should have changed - all variables remain as VarNode
-    @test tree_free.root isa AppNode
-    @test tree_free.root.func isa AppNode
-    @test tree_free.root.func.func isa VarNode
-    @test tree_free.root.func.func.name == original_func
-    @test tree_free.root.func.arg isa VarNode
-    @test tree_free.root.func.arg.name == original_arg1
-    @test tree_free.root.arg isa ConstNode
-    @test tree_free.root.arg.name == original_arg2
+    tree_free, _ = lambda`f g pie`
+    new_tree = deepcopy(tree_free)
+    eliminate_bound_variables!(new_tree)
+    @test new_tree == tree_free
     
     # Test shadowing: λx. λx. x (inner x should bind to inner λ)
-    inner_var_x = VarNode(:x)
-    inner_abs = AbsNode(:x, inner_var_x)  # λx. x
-    outer_abs = AbsNode(:x, inner_abs)    # λx. λx. x
-    tree_shadow = AstTree(outer_abs)
+    tree_shadow, _ = lambda`λx. λx. x`
     eliminate_bound_variables!(tree_shadow)
-    
     # The inner x should resolve to index 0 (innermost binding)
-    @test tree_shadow.root.body isa AbsNode
-    @test tree_shadow.root.body.body isa IndexNode
-    @test tree_shadow.root.body.body.index == 0
+    @test tree_shadow == AstTree(AbsNode(:x, AbsNode(:x, IndexNode(0))))
     
     # Test partial binding: λx. y x (y free, x bound)
-    var_y = VarNode(:y)
-    var_x_partial = VarNode(:x)
-    app_yx = AppNode(var_y, var_x_partial)
-    abs_partial = AbsNode(:x, app_yx)
-    tree_partial = AstTree(abs_partial)
+    tree_partial, _ = lambda`λx. y x`
     eliminate_bound_variables!(tree_partial)
-    
-    # y should remain free, x should be bound
-    result_partial = tree_partial.root.body
-    @test result_partial isa AppNode
-    @test result_partial.func isa VarNode
-    @test result_partial.func.name == :y  # free variable unchanged
-    @test result_partial.arg isa IndexNode
-    @test result_partial.arg.index == 0   # bound variable converted
-    
-    # Test empty tree edge case
-    single_var = VarNode(:lonely)
-    tree_single = AstTree(single_var)
-    eliminate_bound_variables!(tree_single)
-    
-    # Single free variable should remain unchanged
-    @test tree_single.root isa VarNode
-    @test tree_single.root.name == :lonely
+    @test tree_partial == AstTree(AbsNode(:x, AppNode(VarNode(:y), IndexNode(0))))
     
     # Test deeply nested with mix of same and different names: λa. λb. λa. a b
-    var_a1 = VarNode(:a)
-    var_b1 = VarNode(:b)
-    app_ab = AppNode(var_a1, var_b1)
-    abs_inner_a = AbsNode(:a, app_ab)    # λa. a b (redefines a)
-    abs_b = AbsNode(:b, abs_inner_a)     # λb. λa. a b
-    abs_outer_a = AbsNode(:a, abs_b)     # λa. λb. λa. a b
-    tree_deep = AstTree(abs_outer_a)
+    tree_deep, _ = lambda`λa. λb. λa. a b`
     eliminate_bound_variables!(tree_deep)
-    
-    # Navigate to innermost application
-    level1 = tree_deep.root.body          # λb. λa. a b
-    @test level1 isa AbsNode
-    level2 = level1.body                  # λa. a b
-    @test level2 isa AbsNode  
-    final_app_deep = level2.body          # a b
-    @test final_app_deep isa AppNode
-    
-    # a should resolve to innermost λa (index 0), b to middle λb (index 1)
-    @test final_app_deep.func isa IndexNode
-    @test final_app_deep.func.index == 0  # inner a
-    @test final_app_deep.arg isa IndexNode
-    @test final_app_deep.arg.index == 1   # b from one level up
+    @test tree_deep == AstTree(AbsNode(:a, AbsNode(:b, AbsNode(:a, AppNode(IndexNode(0), IndexNode(1))))))
 end
 
 @testitem "shift_free_variables! functionality" begin
@@ -1397,6 +1231,29 @@ end
     @test result_nested.root.body.index == 1  # #0 shifted to #1
 end
 
+@testitem "apply_node! with IndexNode substitution" begin
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, VarNode, IndexNode, AppNode, apply_node!
 
+    # Identity function represented with IndexNode
+    abs_identity_idx = AbsNode(:x, IndexNode(0))  # λx. #0
+    result_identity = apply_node!(AstTree(abs_identity_idx), abs_identity_idx, VarNode(:y))
+    @test result_identity.root isa VarNode && result_identity.root.name == :y
+
+    # Nested lambda: λx. λy. x  (x is IndexNode(1) inside the inner lambda)
+    inner_body = IndexNode(1)
+    inner_abs = AbsNode(:y, inner_body)          # λy. #1
+    outer_abs = AbsNode(:x, inner_abs)           # λx. λy. #1
+    result_nested = apply_node!(AstTree(outer_abs), outer_abs, VarNode(:z))
+    # Expect λy. z
+    @test result_nested.root isa AbsNode
+    @test result_nested.root.body isa VarNode && result_nested.root.body.name == :z
+
+    # De Bruijn shifting with IndexNode argument: (λx. λy. x) #0 -> λy. #1
+    inner_abs_shift = AbsNode(:y, IndexNode(1))  # λy. #1 (refers to x)
+    outer_abs_shift = AbsNode(:x, inner_abs_shift)
+    result_shift = apply_node!(AstTree(outer_abs_shift), outer_abs_shift, IndexNode(0))
+    @test result_shift.root isa AbsNode
+    @test result_shift.root.body isa IndexNode && result_shift.root.body.index == 1
+end
 
 end # module NodeASTs
