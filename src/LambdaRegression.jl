@@ -1,5 +1,9 @@
 module LambdaRegression
 
+include("Utils.jl")
+using .Utils
+export Utils
+
 include("trees/Trees.jl")
 using .Trees
 export Trees

@@ -213,7 +213,7 @@ function traverse(f, bag::StateBag, tree::DfsTree{T}, start_node::Int) where T
     current_pos = 1
     # Stack tracks (node_index, subtree_end_index) for nodes that need leave! called
     leave_stack = Tuple{Int,Int}[]
-    
+    result = nothing
     while current_pos <= length(tree)
         current_index = current_pos
         
@@ -228,7 +228,7 @@ function traverse(f, bag::StateBag, tree::DfsTree{T}, start_node::Int) where T
         # Call user function
         result = f(tree, current_index, bag)
         if result isa Break
-            return Break()
+            return result, bag
         elseif result isa Leave
             # Skip subtree - call leave! for current node then jump to next sibling
             (x->(leave!(x, tree, current_index))).(bag.order)
@@ -248,7 +248,7 @@ function traverse(f, bag::StateBag, tree::DfsTree{T}, start_node::Int) where T
             end
             current_pos += 1
         end
-        
+       
         # Check if we need to call leave! for any parent nodes whose subtrees are complete
         while !isempty(leave_stack) && current_pos > leave_stack[end][2]
             parent_idx, _ = pop!(leave_stack)
@@ -262,7 +262,7 @@ function traverse(f, bag::StateBag, tree::DfsTree{T}, start_node::Int) where T
         (x->(leave!(x, tree, idx))).(bag.order)
     end
     
-    return nothing
+    return result, bag
 end
 
 ########################################################
@@ -576,7 +576,7 @@ end
         return nothing
     end
     
-    bag = traverse(collect_values, tree)
+    _, bag = traverse(collect_values, tree)
     
     @test visited_nodes == [1, 2, 3, 5]  # Verify all nodes were visited in correct pre-order
     
@@ -607,7 +607,7 @@ end
         return nothing
     end
     
-    bag = traverse(collect_and_skip_2, tree)
+    _, bag = traverse(collect_and_skip_2, tree)
     
     @test visited_nodes == [1, 2, 5]  # Should visit: root(1), first child(2), second child(5)
     # Should skip: grandchild(3) because we returned Leave() for node 2

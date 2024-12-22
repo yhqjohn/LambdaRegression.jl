@@ -119,6 +119,7 @@ module NodeASTs
 import ..Trees: AbstractTree, NodeIndex, root, setroot!, subtree, children, setchild!, arity, isleaf, getstate
 using ..Trees: AbstractTraverseState, getstate, Leave, StateBag, build_state_bag, DepthState, StackState, AncestorsState, PointerState, traverse
 import ..Trees: init, requires, enter!, leave!
+using MLStyle
 using TestItems
 
 # Export statements
@@ -126,7 +127,7 @@ export AstNode, AstTree
 export AppNode, AbsNode, VarNode, ConstNode, IndexNode, LetNode
 export SymbolGenerator, generate_fresh_name
 export ScopeState, AbstractionDepthState
-export parse_lambda_literal, collect_constants!, @lambda_cmd
+export parse_lambda_literal, collect_constants!, @lambda
 
 
 ########################################################
@@ -240,8 +241,8 @@ setroot!(tree::AstTree, new_tree::AstTree) = setroot!(tree, new_tree.root)
 subtree(::AstTree, index::AstNode) = AstTree(index)
 
 children(::AstTree, index::AstNode) = children(index)
-setchild!(::AstTree, index::AstNode, childindex::Int, newchild::AstNode) = setchild!(index, childindex, newchild)
-setchild!(::AstTree, index::AstNode, childindex::Int, newchild::AstTree) = setchild!(index, childindex, newchild.root)
+setchild!(tree::AstTree, index::AstNode, childindex::Int, newchild::AstNode) = (setchild!(index, childindex, newchild); tree)
+setchild!(tree::AstTree, index::AstNode, childindex::Int, newchild::AstTree) = (setchild!(index, childindex, newchild.root); tree)
 arity(::AstTree, node::AstNode) = arity(node)
 isleaf(::AstTree, node::AstNode) = isleaf(node)
 
@@ -570,6 +571,7 @@ function getstate(bag::StateBag, ::Type{ScopeState})
     scopestate.abstractions = AbsNode[node for node in ancestors.ancestors if node isa AbsNode]
     return scopestate
 end
+hasname(state::ScopeState, name::Symbol) = any(x -> x.name == name, state.abstractions)
 
 """
     AbstractionDepthState <: AbstractTraverseState
@@ -687,7 +689,7 @@ Base.:(==)(a::AstTree, b::AstTree) = a.root == b.root
 include("parse.jl")
 
 # Import parsing functionality 
-using .Parse: parse_lambda_literal, collect_constants!, @lambda_cmd
+using .Parse: parse_lambda_literal, collect_constants!, @lambda
 
 ########################################################
 # Test Items
@@ -780,7 +782,7 @@ end
     end
 
     # Test with all three states - dependencies should be resolved automatically
-    bag = traverse(collect_all_info, tree_simple, AbstractionDepthState)  # Only specify the most dependent state
+    _, bag = traverse(collect_all_info, tree_simple, AbstractionDepthState)  # Only specify the most dependent state
     
     @test length(collected_data) == 2  # AbsNode + VarNode
     
@@ -814,7 +816,7 @@ end
         return nothing
     end
 
-    bag = traverse(collect_scope_info, tree_nested, ScopeState)
+    _, bag = traverse(collect_scope_info, tree_nested, ScopeState)
     
     # Root AbsNode should have 1 abstraction in scope (itself)  
     @test ("AbsNode", 1) in scope_info
@@ -848,7 +850,7 @@ end
         return nothing
     end
 
-    bag = traverse(collect_depth_info, tree_deep, AbstractionDepthState)
+    _, bag = traverse(collect_depth_info, tree_deep, AbstractionDepthState)
     
     # Root should have depth 1 (includes itself)
     @test ("AbsNode", 1) in depth_info
@@ -887,7 +889,7 @@ end
         return nothing
     end
 
-    bag = traverse(collect_ancestors_info, tree_mixed, AncestorsState)
+    _, bag = traverse(collect_ancestors_info, tree_mixed, AncestorsState)
     
     # Verify ancestors tracking (tree has 6 nodes: root_app, abs_node, app_xy, var_x, var_y, var_z)
     @test length(ancestors_info) == 6  # 6 nodes total
@@ -1148,26 +1150,26 @@ end
 
 @testitem "eliminate_bound_variables! edge cases" begin
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, eliminate_bound_variables!
-    using LambdaRegression.ASTs.Parse: @lambda_cmd
+    using LambdaRegression.ASTs.Parse: @lambda
     
-    tree_free, _ = lambda`f g pie`
+    tree_free, _ = @lambda "f g pie"
     new_tree = deepcopy(tree_free)
     eliminate_bound_variables!(new_tree)
     @test new_tree == tree_free
     
     # Test shadowing: λx. λx. x (inner x should bind to inner λ)
-    tree_shadow, _ = lambda`λx. λx. x`
+    tree_shadow, _ = @lambda "λx. λx. x"
     eliminate_bound_variables!(tree_shadow)
     # The inner x should resolve to index 0 (innermost binding)
     @test tree_shadow == AstTree(AbsNode(:x, AbsNode(:x, IndexNode(0))))
     
     # Test partial binding: λx. y x (y free, x bound)
-    tree_partial, _ = lambda`λx. y x`
+    tree_partial, _ = @lambda "λx. y x"
     eliminate_bound_variables!(tree_partial)
     @test tree_partial == AstTree(AbsNode(:x, AppNode(VarNode(:y), IndexNode(0))))
     
     # Test deeply nested with mix of same and different names: λa. λb. λa. a b
-    tree_deep, _ = lambda`λa. λb. λa. a b`
+    tree_deep, _ = @lambda "λa. λb. λa. a b"
     eliminate_bound_variables!(tree_deep)
     @test tree_deep == AstTree(AbsNode(:a, AbsNode(:b, AbsNode(:a, AppNode(IndexNode(0), IndexNode(1))))))
 end

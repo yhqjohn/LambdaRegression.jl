@@ -11,7 +11,7 @@ public T, F
 ###############################################################################
 
 using ..NodeASTs: ConstNode, AstTree, AstNode, AbsNode, IndexNode  # re-exported by `ASTs` parent module
-using ..NodeASTs.Parse: @lambda_cmd
+
 import ..NodeASTs: apply_node!
 
 using Bijections
@@ -25,6 +25,11 @@ Base.getindex(map::ConstantsMap, index) = get(map.globals, index) do
     map.locals[index]
 end
 
+struct ConstantProxy
+    body
+end
+get_value(x) = x
+get_value(x::ConstantProxy) = x.body()
 
 """
     new_constant!(context, value) -> ConstNode
@@ -78,8 +83,8 @@ enabling flexible context implementations like layered dictionaries.
 """
 function apply_node!(tree::AstTree, f::ConstNode, x::ConstNode, context)
     # Look up the Julia values bound to the constant symbols
-    f_val = context[f.name]
-    x_val = context[x.name]
+    f_val = get_value(context[f.name])
+    x_val = get_value(context[x.name])
     # Perform the call; no checking – we follow the "let it crash" philosophy
     result_val = f_val(x_val)
     # If the host function already built a piece of AST, we can return it

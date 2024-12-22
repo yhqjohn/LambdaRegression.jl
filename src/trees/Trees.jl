@@ -72,10 +72,10 @@ init(::Type{CountState}, tree, root) = CountState(0)
 enter!(state::CountState, tree, node) = (state.count += 1)
 leave!(::CountState, tree, node) = nothing
 
-bag = traverse(tree, CountState) do tree, node, bag
+result, bag = traverse(tree, CountState) do tree, node, bag
     nothing # State is automatically managed via enter!/leave!
 end
-total = getstate(bag, CountState).count
+total = getstate(bag, CountState).count # 3
 
 # Conditional traversal (skip subtrees)
 function process_conditionally(tree, node, bag)
@@ -86,7 +86,20 @@ function process_conditionally(tree, node, bag)
     return nothing
 end
 
-traverse(process_conditionally, tree, SomeState)
+result, bag = traverse(process_conditionally, tree, SomeState)
+
+# Return values from traversal
+function find_node_with_value(target)
+    return function(tree, node, bag)
+        if get_node_value(tree, node) == target
+            return Break(node)  # Early termination with result
+        end
+        return nothing
+    end
+end
+
+found_node, bag = traverse(find_node_with_value(42), tree)
+# found_node contains the matching node, or nothing if not found
 ```
 
 # Implementation Notes
@@ -100,7 +113,12 @@ and specialized algorithms.
 """
 module Trees
 
+using ..Utils
 using TestItems
+
+export AbstractTree, NodeIndex, root, setroot!, subtree, children, setchild!, arity, isleaf
+export traverse, AbstractTraverseState, requires, init, enter!, leave!, StateBag, getstate, default_states, build_state_bag
+export lca
 
 ########################################################
 # 1. AbstractTree Interface
@@ -457,7 +475,10 @@ struct Leave end
 
 Return value for traverse functions indicating that the traversal should terminate.
 """
-struct Break end
+struct Break{T}
+    value::T
+end
+Break() = Break{Nothing}(nothing)
 
 """
     traverse(f, tree::AbstractTree, states...)
@@ -465,15 +486,23 @@ struct Break end
 Traverse a tree in pre-order depth-first manner with custom states.
 
 # Arguments
-- `f`: User function called for each node. Should have signature `f(tree, node, bag::StateBag) -> Union{Nothing, Leave}`
-  - Return `nothing` to continue normal traversal
+- `f`: User function called for each node. Should have signature `f(tree, node, bag::StateBag) -> Union{Nothing, Leave, Break}`
   - Return `Leave()` to skip children of current node
-  - Return `Break()` to terminate the traversal
+  - Return `Break(value)` to terminate the traversal and return the value
+  - Return other values to continue the last returning value will be the result for the whole traversal.
 - `tree`: The tree to traverse
 - `states...`: Variable number of state types to initialize and maintain during traversal
 
 # Returns
-The `StateBag` containing final state after traversal.
+A tuple `(result, bag)` where:
+- `result`: The value returned by the user function (typically `nothing`, or the value from `Break(value)`)
+- `bag`: The `StateBag` containing final state after traversal
+
+# Notes on Return Values
+The `traverse` function enables values to be returned from the traversal process:
+- For normal completion, `result` will be `nothing`
+- For early termination via `Break(value)`, `result` will be the provided value
+- This design allows both state accumulation (via `StateBag`) and direct result passing
 
 # Example
 ```julia
@@ -490,9 +519,22 @@ function count_nodes(tree, node, bag)
     return nothing  # Continue traversal
 end
 
-# Traverse
-bag = traverse(count_nodes, tree, CountState)
-total = getstate(bag, CountState).count
+# Traverse and get both result and state
+result, bag = traverse(count_nodes, tree, CountState)
+total = getstate(bag, CountState).count[]
+
+# Example with Break() to return a value
+function find_node_with_value(target_value)
+    return function(tree, node, bag)
+        if node.value == target_value
+            return Break(node)  # Return the found node
+        end
+        return nothing
+    end
+end
+
+found_node, bag = traverse(find_node_with_value(42), tree)
+# found_node will be the node with value 42, or nothing if not found
 ```
 """
 function traverse(f, tree::AbstractTree, states...)
@@ -500,8 +542,11 @@ function traverse(f, tree::AbstractTree, states...)
     tree_root === nothing && return StateBag(AbstractTraverseState[], IdDict{DataType,AbstractTraverseState}())
     state_types = collect(states)  # Just collect all state types as-is
     bag = build_state_bag(state_types, tree, tree_root)
-    traverse(f, bag, tree, tree_root)  # Start traversal from root
-    return bag
+    result, _ = traverse(f, bag, tree, tree_root)  # Start traversal from root
+    if result isa Break
+        result = result.value
+    end
+    return result, bag
 end
 
 # Default traverse implementation with state enter!/leave! support
@@ -509,14 +554,16 @@ function traverse(f, bag::StateBag, tree::AbstractTree, node)
     # Call enter! for all states in dependency order
     (x->(enter!(x, tree, node))).(bag.order)
     result = f(tree, node, bag)  # Call user function for current node
-    result isa Break && return Break() # If user function returns Break(), terminate the traversal
+    result isa Break && return result, bag # If user function returns Break(), terminate the traversal
     if !(result isa Leave)  # If user function returns Leave(), skip children
         for child in children(tree, node)  # Visit children
-            traverse(f, bag, tree, child) isa Break && return Break() # terminate and pass Break() to parent
+            result, _ = traverse(f, bag, tree, child)
+            result isa Break && return result, bag # terminate and pass Break() to parent
         end
     end
     # Call leave! for all states in dependency order (not reverse!)
     (x->(leave!(x, tree, node))).(bag.order)
+    return result, bag
 end
 
 ########################################################
@@ -553,7 +600,7 @@ function process_with_stack(tree, node, bag)
     return nothing
 end
 
-bag = traverse(process_with_stack, tree, StackState)
+result, bag = traverse(process_with_stack, tree, StackState)
 ```
 
 # Implementation Notes
@@ -699,7 +746,6 @@ function setchild!(tree::NodeTree{T}, node_index::Node{T}, child_index, newchild
     node_index.children[child_index] = newchild.root  # Let Julia handle bounds checking naturally
     return tree
 end
-
 Base.length(tree::NodeTree) = _count_nodes(tree.root)
 
 function _count_nodes(node::Node{T}) where T
@@ -708,10 +754,11 @@ end
 
 
 ########################################################
-# 6. Reference Implementation (DfsTrees)
+# 6. Reference Implementation
 ########################################################
 
 include("dfstrees.jl")
+include("utils.jl")
 
 ########################################################
 # 7. Test Items
@@ -878,7 +925,7 @@ end
     tree = NodeTree(root_node)
     
     count_all(_, _, _) = nothing
-    bag = traverse(count_all, tree, CountState)
+    result, bag = traverse(count_all, tree, CountState)
     @test getstate(bag, CountState).count == 3
 end
 
@@ -904,7 +951,7 @@ end
     
     count_and_skip_2(_, node, bag) = node.value == 2 ? Leave() : nothing
     
-    bag = traverse(count_and_skip_2, tree, CountState)
+    result, bag = traverse(count_and_skip_2, tree, CountState)
     @test getstate(bag, CountState).count == 3  # Skip grandchild(4)
 end
 
@@ -935,7 +982,7 @@ end
     
     sum_and_count(_, _, _) = nothing
     
-    bag = traverse(sum_and_count, tree, CountState)
+    _, bag = traverse(sum_and_count, tree, CountState)
     
     @test getstate(bag, SumState).total == 6   # 1 + 2 + 3
     @test getstate(bag, CountState).count == 3  # 3 nodes
@@ -962,7 +1009,7 @@ end
     collected_depths = Tuple{Int, Int}[]
     collect_depths(_, node, bag) = push!(collected_depths, (node.value, getstate(bag, DepthState).depth))
     
-    bag = traverse(collect_depths, tree, DepthState)
+    _, bag = traverse(collect_depths, tree, DepthState)
     
     @test length(collected_depths) == 4
     @test (1, 1) in collected_depths  # Root depth after enter
@@ -996,7 +1043,7 @@ end
         return nothing
     end
     
-    bag = traverse(collect_stack_info, tree, StackState)
+    _, bag = traverse(collect_stack_info, tree, StackState)
     
     @test length(stack_info) == 4  # 4 nodes total
     
@@ -1051,7 +1098,7 @@ end
         return nothing
     end
     
-    bag = traverse(collect_ancestors_info, tree, AncestorsState)
+    _, bag = traverse(collect_ancestors_info, tree, AncestorsState)
     
     @test length(ancestors_info) == 4  # 4 nodes total
     
@@ -1098,7 +1145,7 @@ end
         return nothing
     end
     
-    bag = traverse(verify_ancestors_match_stack, tree, AncestorsState)
+    _, bag = traverse(verify_ancestors_match_stack, tree, AncestorsState)
     
     @test verification_count[] == 3  # Verified for all 3 nodes
 end
@@ -1115,9 +1162,9 @@ end
     visited_values = Int[]
     collect_values(_, node, _) = push!(visited_values, node.value)
     
-    result = traverse(collect_values, tree)
-    @test result isa StateBag
-    @test length(result.order) == 0
+    _, bag = traverse(collect_values, tree)
+    @test bag isa StateBag
+    @test length(bag.order) == 0
     @test visited_values == [1, 2, 3]
     
     # Test with Leave()
@@ -1127,7 +1174,7 @@ end
     grandchild = Node(4)
     push!(child1.children, grandchild)
     
-    traverse(collect_and_skip_2, tree)
+    _, bag = traverse(collect_and_skip_2, tree)
     @test visited_with_leave == [1, 2, 3]  # Skipped grandchild(4)
 end
 
@@ -1155,7 +1202,7 @@ end
         return nothing
     end
     
-    bag = traverse(collect_pointer_info, tree, PointerState)
+    _, bag = traverse(collect_pointer_info, tree, PointerState)
     
     @test length(pointer_info) == 4  # 4 nodes total
     
@@ -1192,7 +1239,7 @@ end
         return nothing
     end
     
-    bag = traverse(collect_single_pointer_info, single_tree, PointerState)
+    _, bag = traverse(collect_single_pointer_info, single_tree, PointerState)
     
     @test length(single_pointer_info) == 1
     @test single_pointer_info[1] == (42, nothing, 1)  # Root has no parent, child_index = 1
@@ -1214,7 +1261,7 @@ end
         return nothing
     end
     
-    bag = traverse(collect_multi_pointer_info, multi_child_tree, PointerState)
+    _, bag = traverse(collect_multi_pointer_info, multi_child_tree, PointerState)
     
     @test length(multi_pointer_info) == 5
     @test multi_pointer_info[1] == (1, nothing, 1)  # Root
@@ -1250,7 +1297,7 @@ end
         return nothing
     end
     
-    bag = traverse(replace_node_2_with_99, tree, PointerState)
+    _, bag = traverse(replace_node_2_with_99, tree, PointerState)
     
     @test modifications_count[] == 1
     @test tree.root.children[1].value == 99  # Node 2 should be replaced with 99
@@ -1285,10 +1332,129 @@ end
         return nothing
     end
 
-    bag = traverse(count_until_two, tree, CountState)
+    _, bag = traverse(count_until_two, tree, CountState)
 
     # Only nodes 1 and 2 should have been visited (CountState enter! is called before user function)
     @test getstate(bag, CountState).count == 2
+end
+
+@testitem "lca function basic functionality" begin
+    using LambdaRegression.Trees: NodeTree, Node, lca, root
+
+    # Test 1: Single node matches query
+    tree = NodeTree(1)
+    result = lca((tree, node) -> node.value == 1, tree, root(tree))
+    @test result === root(tree)
+
+    # Test 2: No nodes match query
+    result = lca((tree, node) -> node.value == 999, tree, root(tree))
+    @test result === nothing
+
+    # Test 3: Simple tree with one matching node
+    #   1
+    #  / \
+    # 2   3
+    child1 = Node(2)
+    child2 = Node(3)
+    root_node = Node(1)
+    push!(root_node.children, child1, child2)
+    tree = NodeTree(root_node)
+    
+    # Find node with value 2
+    result = lca((tree, node) -> node.value == 2, tree, root(tree))
+    @test result === child1
+
+    # Test 4: Multiple nodes match - should return LCA
+    #   1
+    #  / \
+    # 2   2
+    child1_dup = Node(2)
+    child2_dup = Node(2)
+    root_node_dup = Node(1)
+    push!(root_node_dup.children, child1_dup, child2_dup)
+    tree_dup = NodeTree(root_node_dup)
+    
+    # Both children have value 2, so LCA should be root
+    result = lca((tree, node) -> node.value == 2, tree_dup, root(tree_dup))
+    @test result === root_node_dup
+end
+
+@testitem "lca function complex tree scenarios" begin
+    using LambdaRegression.Trees: NodeTree, Node, lca, root
+
+    # Test complex tree:
+    #       1
+    #      / \
+    #     2   3
+    #    /   / \
+    #   4   5   6
+    #      /
+    #     7
+    
+    node7 = Node(7)
+    node4 = Node(4)
+    node5 = Node(5)
+    push!(node5.children, node7)
+    node6 = Node(6)
+    node2 = Node(2)
+    push!(node2.children, node4)
+    node3 = Node(3)
+    push!(node3.children, node5, node6)
+    root_node = Node(1)
+    push!(root_node.children, node2, node3)
+    tree = NodeTree(root_node)
+    
+    # Test 1: Find LCA of nodes 4 and 7 (should be root)
+    result = lca((tree, node) -> node.value == 4 || node.value == 7, tree, root(tree))
+    @test result === root_node
+    
+    # Test 2: Find LCA of nodes 5 and 6 (should be node3)
+    result = lca((tree, node) -> node.value == 5 || node.value == 6, tree, root(tree))
+    @test result === node3
+    
+    # Test 3: Find LCA of just node 7 (should be node7 itself)
+    result = lca((tree, node) -> node.value == 7, tree, root(tree))
+    @test result === node7
+    
+    # Test 4: Find LCA in subtree (search only in node3's subtree)
+    result = lca((tree, node) -> node.value == 5 || node.value == 6, tree, node3)
+    @test result === node3
+    
+    # Test 5: Query that matches nodes in different subtrees
+    result = lca((tree, node) -> node.value == 2 || node.value == 3, tree, root(tree))
+    @test result === root_node
+end
+
+@testitem "setindex! function functionality" begin
+    using LambdaRegression.Trees: NodeTree, Node, setindex!, root
+
+    # Test basic replacement
+    #   1
+    #  / \
+    # 2   3
+    # Replace node 2 with new subtree
+    child1 = Node(2)
+    child2 = Node(3)
+    root_node = Node(1)
+    push!(root_node.children, child1, child2)
+    tree = NodeTree(root_node)
+    
+    # Create replacement subtree
+    new_subtree = NodeTree(Node(999))
+    
+    # Replace child1 with new_subtree
+    result_tree = setindex!(tree, new_subtree, child1)
+    
+    # Verify replacement
+    @test root_node.children[1].value == 999
+    @test root_node.children[2] === child2  # Other child unchanged
+    
+    # Test replacing root
+    original_tree = NodeTree(Node(100))
+    replacement = NodeTree(Node(200))
+    result_tree = setindex!(original_tree, replacement, root(original_tree))
+    display(result_tree)
+    @test root(result_tree).value == 200
 end
 
 end # module Trees
