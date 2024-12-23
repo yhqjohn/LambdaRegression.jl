@@ -2,11 +2,14 @@ module TypeSystem
 
 using ..ASTs.NodeASTs: AstTree, AstNode, VarNode, IndexNode, AbsNode, AppNode, ConstNode
 using ..Utils
+using ..ASTs.Contexts: COND
 using TestItems
 
-export Ty, TyConst, TyVar, TyFun, TyMu, TyProd, TySum, TyList, TyScheme, TyLike
+export Ty, TyConst, TyVar, TyFun, TyMu, TyProd, TySum, TyList, TyNat, TyArray, TyScheme, TyLike
 export infer, UnboundVariableError, OccursCheckError, MismatchError
-export →, ×, μ, ∀, newvar
+export →, ×, μ, ∀, newtyvar, collect_types, get_type
+
+public BoolTy, IntTy, FloatTy, COND
 
 # ------------------------------------------------------------
 # Basic type data structures (internal)
@@ -81,6 +84,23 @@ struct TyList <: Ty
 end
 
 """
+    TyNat(value)
+Type-level natural number constant used for fixed-size arrays.
+"""
+struct TyNat <: Ty
+    value::Int
+end
+
+"""
+    TyArray(len, elem)
+Fixed-length array type  `Array[len, elem]`, where `len` is a `TyNat` and `elem` is element type.
+"""
+struct TyArray <: Ty
+    len::TyNat
+    elem::Ty
+end
+
+"""
     TyScheme(vars, ty)
 Polymorphic type scheme  ∀ vars. ty
 • `vars` – vector of bound TyVar (no instance)
@@ -97,6 +117,8 @@ Base.hash(t::TyProd, h::UInt) = hash(t.left, hash(t.right, (hash(:TyProd, h))))
 Base.hash(t::TySum, h::UInt) = hash(t.left, hash(t.right, (hash(:TySum, h))))
 Base.hash(t::TyMu, h::UInt) = hash(t.var, hash(t.body, (hash(:TyMu, h))))
 Base.hash(t::TyScheme, h::UInt) = hash(t.vars, hash(t.ty, (hash(:TyScheme, h))))
+Base.hash(t::TyNat, h::UInt) = hash(t.value, hash(:TyNat, h))
+Base.hash(t::TyArray, h::UInt) = hash(t.len, hash(t.elem, hash(:TyArray, h)))
 
 Base.:(==)(t1::TyVar, t2::TyVar) = t1.id == t2.id && t1.level == t2.level
 Base.:(==)(t1::TyFun, t2::TyFun) = t1.arg == t2.arg && t1.res == t2.res
@@ -104,6 +126,8 @@ Base.:(==)(t1::TyProd, t2::TyProd) = t1.left == t2.left && t1.right == t2.right
 Base.:(==)(t1::TySum, t2::TySum) = t1.left == t2.left && t1.right == t2.right
 Base.:(==)(t1::TyMu, t2::TyMu) = t1.var == t2.var && t1.body == t2.body
 Base.:(==)(t1::TyScheme, t2::TyScheme) = t1.vars == t2.vars && t1.ty == t2.ty
+Base.:(==)(t1::TyNat, t2::TyNat) = t1.value == t2.value
+Base.:(==)(t1::TyArray, t2::TyArray) = t1.len == t2.len && t1.elem == t2.elem
 
 # ------------------------------------------------------------
 # Error reporting
@@ -139,7 +163,7 @@ end
 VarFactory() = VarFactory(_TYVAR_COUNTER)
 (n::VarFactory)(level::Int)::TyVar = TyVar(n.counter(), level, nothing)
 
-const newvar = VarFactory() # aliasing for compatibility with old code
+const newtyvar = VarFactory() # aliasing for compatibility with old code
 
 # ------------------------------------------------------------
 # Utility: prune – follow instances to canonical representative
@@ -161,6 +185,10 @@ function prune(t::Ty)::Ty
             return TyProd(_prune(t.left), _prune(t.right))
         elseif t isa TySum
             return TySum(_prune(t.left), _prune(t.right))
+        elseif t isa TyArray
+            return TyArray(t.len, _prune(t.elem))
+        elseif t isa TyNat
+            return t
         elseif t isa TyList
             return TyList(_prune(t.elem))
         else
@@ -205,6 +233,10 @@ function occurs(var::TyVar, ty::Ty, depth::Int=0)::Tuple{Bool,Bool}
         occ1, con1 = occurs(var, ty.left, depth + 1)
         occ2, con2 = occurs(var, ty.right, depth + 1)
         return (occ1 || occ2, con1 || con2)
+    elseif ty isa TyArray
+        return occurs(var, ty.elem, depth + 1)
+    elseif ty isa TyNat
+        return (false, false)
     elseif ty isa TyMu
         # Bound var shadows outer one
         if ty.var === var
@@ -274,6 +306,13 @@ function _unify!(t1::Ty, t2::Ty, seen::Set{Tuple{Ty,Ty}})
     elseif a isa TySum && b isa TySum
         @✓ _unify!(a.left, b.left, seen)
         @✓ _unify!(a.right, b.right, seen)
+    elseif a isa TyArray && b isa TyArray
+        if a.len.value != b.len.value
+            return Err(MismatchError(a, b))
+        end
+        @✓ _unify!(a.elem, b.elem, seen)
+    elseif a isa TyNat && b isa TyNat && a.value == b.value
+        return nothing
     elseif a isa TyMu
         @✓ _unify!(a.body, b, seen)
     elseif b isa TyMu
@@ -293,7 +332,7 @@ function instantiate(s::TyScheme, level::Int)::Ty
     # Create substitution only for quantified vars
     subst = Dict{Int,TyVar}()
     for v in s.vars
-        subst[v.id] = newvar(level)
+        subst[v.id] = newtyvar(level)
     end
     return _inst(s.ty, v -> get(subst, v.id, v))
 end
@@ -315,6 +354,8 @@ function _inst(t::Ty, mapvar)
         return TyMu(t.var, _inst(t.body, mapvar))
     elseif t isa TyList
         return TyList(_inst(t.elem, mapvar))
+    elseif t isa TyArray
+        return TyArray(t.len, _inst(t.elem, mapvar))
     else
         return t
     end
@@ -342,6 +383,8 @@ function collect_free_vars(t::Ty)::Set{TyVar}
         elseif t isa TyMu
             _collect_free_vars(t.body)
         elseif t isa TyList
+            _collect_free_vars(t.elem)
+        elseif t isa TyArray
             _collect_free_vars(t.elem)
         end
         return vars
@@ -386,7 +429,7 @@ end
 const TyLike = Union{Ty,TyScheme}
 
 """
-    infer(tree::AstTree, ctx::Dict{Symbol,<:TyLike}[, factory=newvar])
+    infer(tree::AstTree, ctx::Dict{Symbol,<:TyLike}[, factory=newtyvar])
 
 Infer the type given the AST and context.
 
@@ -395,7 +438,7 @@ Infer the type given the AST and context.
 - `ctx::Dict{Symbol,<:TyLike}`: The context of the inference.
 - `factory::Function`: A function to create fresh type variables.
 """
-function infer(tree::AstTree, ctx::Dict{Symbol,<:TyLike}, factory=newvar)
+function infer(tree::AstTree, ctx::Dict{Symbol,<:TyLike}, factory=newtyvar)
     env = Env()
     level = 0
     ty = @✓(_infer(tree.root, env, ctx, level, factory))
@@ -456,6 +499,10 @@ function _show_ty(t::Ty, seen=Dict{TyVar,Int}())
         return "μ." * _show_ty(t.body, seen)
     elseif t isa TyList
         return "List[" * _show_ty(t.elem, seen) * "]"
+    elseif t isa TyNat
+        return string(t.value)
+    elseif t isa TyArray
+        return "Array[" * _show_ty(t.len, seen) * "," * _show_ty(t.elem, seen) * "]"
     else
         return "<?>"
     end
@@ -469,9 +516,6 @@ Base.show(io::IO, t::Ty) = print(io, _show_ty(t))
 # operators that construct our composite types directly. These
 # only apply when both operands are `Ty` (or sub-types thereof),
 # so they do not interfere with normal arithmetic on numbers.
-
-# Import the relevant Base operators so we can extend them.
-import Base: +  # × and → are not in Base, we define them ourselves
 
 """Construct `TyFun(arg, res)`."""
 (→)(arg::Ty, res::Ty)::TyFun = TyFun(arg, res)
@@ -520,6 +564,83 @@ function validate_ctx(ctx::Dict{Symbol,TyLike})
         end
     end
 end
+
+# ------------------------------------------------------------
+# Typed term
+# ------------------------------------------------------------
+get_type(constant) = nothing
+
+function collect_types(constants_ctx::Dict{Symbol, Any}, types_ctx::Dict{Symbol, Ty}=Dict{Symbol, Ty}())::Dict{Symbol, Ty}
+    for (key, value) in pairs(constants_ctx)
+        if haskey(types_ctx, key)
+            continue
+        end
+        result = get_type(value)
+        if !isnothing(result)
+            types_ctx[key] = result
+        else
+            warning("No type set for constant $key, please specify it manually.")
+        end
+    end
+    return types_ctx
+end
+
+# ------------------------------------------------------------
+# Primitive base types and Prelude constant typing
+# ------------------------------------------------------------
+
+# Primitive value-type constants
+const BoolTy  = TyConst(:Bool)
+const IntTy   = TyConst(:Int)
+const FloatTy = TyConst(:Float)
+const NilErr  = TyConst(:NilErr)
+
+# Sum type basic functions
+INL(x) = x
+INR(x) = x
+
+# Product type basic functions
+PAIR(x, y) = (x, y)
+FST(x) = x.first
+SND(x) = x.second
+
+# List type basic functions
+NIL() = []
+struct _NilErr end
+const NILERR = _NilErr()
+CONS(x) = l -> [x;l]
+HEAD(xs) = isempty(xs) ? NILERR : xs[1]
+TAIL(xs) = isempty(xs) ? NILERR : xs[2:end]
+LENGTH(xs) = length(xs)
+CASENILERR(f) = g -> (x ->(x isa _NilErr ? g(x) : f(x)))
+TOLIST(xs) = collect(xs)
+
+_α, _β, _γ = newtyvar(0), newtyvar(0), newtyvar(0)
+
+# Fallbacks for primitive constants (already defined earlier)
+get_type(::Bool)  = BoolTy
+get_type(::Int)   = IntTy
+get_type(::Float) = FloatTy
+
+get_type(::typeof(COND)) = ∀([_α], BoolTy → _α → _α → _α)
+
+get_type(::typeof(INL)) = ∀([_α, _β], _α → (_α + _β))
+get_type(::typeof(INR)) = ∀([_α, _β], _β → (_α + _β))
+# Just an example. As inexchangable sum type is not supported in Julia, case function must be implemented manually for each sum type.
+# get_type(::typeof(CASE)) = ∀([_α, _β, _γ], (_α → _γ) → (_β → _γ) → (_α + _β) → _γ)
+
+get_type(::typeof(PAIR)) = ∀([_α, _β], _α → _β → (_α × _β))
+get_type(::typeof(FST)) = ∀([_α, _β], (_α × _β) → _α)
+get_type(::typeof(SND)) = ∀([_α, _β], (_α × _β) → _β)
+get_type(t::Tuple{T, S}) where {T, S} = get_type(t[1]) × get_type(t[2])
+
+get_type(::typeof(NIL)) = ∀([_α], TyList(_α))
+get_type(::typeof(CONS)) = ∀([_α], _α → TyList(_α) → TyList(_α))
+get_type(::typeof(HEAD)) = ∀([_α], TyList(_α) → (_α + _NilErr))
+get_type(::typeof(TAIL)) = ∀([_α], TyList(_α) → TyList(_α) + _NilErr)
+get_type(::typeof(LENGTH)) = ∀([_α], TyList(_α) → IntTy)
+get_type(::typeof(CASENILERR)) = ∀([_α, _β], (_α → _β) → (NilErr → _β) → _β)
+get_type(::typeof(TOLIST)) = ∀([_α, _β], TyArray(_α, _β) → TyList(_β))
 
 # ------------------------------------------------------------
 # Test items (basic sanity)
@@ -582,9 +703,9 @@ end
 
 @testitem "positive μ-type via unify" begin
     using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: newvar, unify!
+    using LambdaRegression.TypeSystem: newtyvar, unify!
 
-    α = newvar(0)
+    α = newtyvar(0)
     int_ty = TyConst(:Int)
     unify!(α, TyFun(int_ty, α))
     # α should now be folded to μ-type
@@ -627,8 +748,8 @@ end
     using LambdaRegression.TypeSystem
     using LambdaRegression.TypeSystem: collect_free_vars, prune
 
-    α = newvar(0)
-    β = newvar(0)
+    α = newtyvar(0)
+    β = newtyvar(0)
     mu = μ(α, β→α)
     α.instance = mu
 
@@ -643,11 +764,11 @@ end
     using LambdaRegression.ASTs.Parse: @lambda
     using LambdaRegression.Reduces: prepare
     using LambdaRegression.ASTs.Contexts
-    using LambdaRegression.TypeSystem: newvar, TyLike
+    using LambdaRegression.TypeSystem: newtyvar, TyLike
 
     IntTy = TyConst(:Int)
     BoolTy = TyConst(:Bool)
-    α = newvar(0)
+    α = newtyvar(0)
 
     # Define basic arithmetic and logical operations for our lambda calculus
     add = x -> y -> x + y  # Curried addition
@@ -692,7 +813,7 @@ end
     BoolTy = TyConst(:Bool)
 
     # if2 : ∀α. Bool → α → α → α
-    α = newvar(0)
+    α = newtyvar(0)
     ctx = Dict{Symbol,TyLike}(
         :if2 => ∀([α], BoolTy → α → α → α), 
         :boolTrue => BoolTy, 
@@ -712,14 +833,14 @@ end
 @testitem "product unify and projection" begin
     using LambdaRegression.TypeSystem
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.TypeSystem: newvar
+    using LambdaRegression.TypeSystem: newtyvar
 
     IntTy = TyConst(:Int)
     BoolTy = TyConst(:Bool)
 
     # fst : ∀α β. (α × β) → α
-    α = newvar(0)
-    β = newvar(0)
+    α = newtyvar(0)
+    β = newtyvar(0)
     ctx = Dict{Symbol,TyLike}(
         :fst => ∀([α,β], (α × β) → α), 
         :pair => ∀([α,β], α → β → (α × β)),
@@ -737,11 +858,11 @@ end
 @testitem "sum inl inr case" begin
     using LambdaRegression.TypeSystem
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.TypeSystem: newvar
+    using LambdaRegression.TypeSystem: newtyvar
 
     IntTy = TyConst(:Int)
     BoolTy = TyConst(:Bool)
-    α, β, γ = newvar(0), newvar(0), newvar(0)
+    α, β, γ = newtyvar(0), newtyvar(0), newtyvar(0)
     ctx = Dict{Symbol,TyLike}(
         :inl=>∀([α,β], α → (α + β)), 
         :inr=>∀([α,β], β → (α + β)), 
@@ -758,8 +879,21 @@ end
     @test ty === BoolTy
 end
 
+@testitem "array fixed length typing" begin
+    using LambdaRegression.TypeSystem
+    IntTy = TyConst(:Int)
+    arr5_ty = TyArray(TyNat(5), IntTy)
+    # toList5 : Array[5,Int] -> List[Int]
+    tolist_scheme = TyScheme([], TyFun(arr5_ty, TyList(IntTy)))
+    ctx = Dict{Symbol,TyLike}(:arr5 => arr5_ty, :toList5 => tolist_scheme)
+    expr = AppNode(ConstNode(:toList5), ConstNode(:arr5))
+    tree = LambdaRegression.ASTs.NodeASTs.AstTree(expr)
+    ty = infer(tree, ctx)
+    @test ty == TyList(IntTy)
+end
 
-# -------------------- Advanced type invariance tests --------------------
+# ------------------------------------------------------------
+# Advanced type invariance tests --------------------
 
 @testitem "factorial via Y combinator – type invariance under reduction" begin
     using LambdaRegression.TypeSystem
@@ -767,11 +901,11 @@ end
     using LambdaRegression.ASTs.Parse: @lambda
     using LambdaRegression.Reduces: prepare, beta_reduce!
     using LambdaRegression.ASTs.Contexts
-    using LambdaRegression.TypeSystem: newvar, TyLike
+    using LambdaRegression.TypeSystem: newtyvar, TyLike
 
     IntTy  = TyConst(:Int)
     BoolTy = TyConst(:Bool)
-    α = newvar(0)
+    α = newtyvar(0)
 
     # Deterministic integer identifiers to avoid random gensym names
     int0, int1, int4 = 0, 1, 4
@@ -812,11 +946,11 @@ end
     using LambdaRegression.ASTs.Parse: @lambda
     using LambdaRegression.Reduces: prepare, beta_reduce!
     using LambdaRegression.ASTs.Contexts
-    using LambdaRegression.TypeSystem: newvar, TyLike
+    using LambdaRegression.TypeSystem: newtyvar, TyLike
 
     IntTy  = TyConst(:Int)
     BoolTy = TyConst(:Bool)
-    α, β = newvar(0), newvar(0)
+    α, β = newtyvar(0), newtyvar(0)
 
     # List primitives implemented in Julia (used only for evaluation)
     cons   = x -> xs -> [x, xs...]

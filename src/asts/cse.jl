@@ -4,10 +4,6 @@ using ..Trees: traverse, getstate, lca, root, setchild!, Leave, setindex!, Stack
 
 using MLStyle, DataStructures, TestItems
 
-# Simple variable name generator for CSE
-let counter = Ref(0)
-    global newvar() = Symbol(:cse_, counter[] += 1)
-end
 
 @data CanonicalNode begin
     CanonicalAbs(body::CanonicalNode)
@@ -45,7 +41,7 @@ function canonical_set(tree::AstTree)
     return s
 end
 
-function rebuild_node(form::CanonicalNode, factory=newvar)
+function rebuild_node(form::CanonicalNode, factory=newtyvar)
     @match form begin
         CanonicalAbs(body) => AbsNode(factory(), rebuild_node(body, factory))
         CanonicalIndex(index) => IndexNode(index)
@@ -54,16 +50,16 @@ function rebuild_node(form::CanonicalNode, factory=newvar)
         CanonicalApp(func, arg) => AppNode(rebuild_node(func), rebuild_node(arg))
     end
 end
-rebuild_tree(form::CanonicalNode, factory=newvar) = AstTree(rebuild_node(form, factory))
+rebuild_tree(form::CanonicalNode, factory=newtyvar) = AstTree(rebuild_node(form, factory))
 
 """
-    eliminate_expression!(tree::AstTree, form::CanonicalNode, factory=newvar)
+    eliminate_expression!(tree::AstTree, form::CanonicalNode, factory=newtyvar)
 
 Eliminate the expression in `form` N in the tree `tree` by replacing it with a variable,
 and replacing the lowest common ancestor M of the qualified nodes with a new application node (λx. M\\[N=x\\]) N.
 The nodes to be eliminated should be ensured to be more than one in advance.
 """
-function elimniate_expression!(tree::AstTree, form::CanonicalNode, factory=newvar)
+function elimniate_expression!(tree::AstTree, form::CanonicalNode, factory=newtyvar)
     varname = factory()
     traverse(tree, StackState{AstNode}, PointerState{AstNode}, ScopeState) do tree, node, bag
         if canonicalize(tree, node, getstate(bag, ScopeState)) == form
