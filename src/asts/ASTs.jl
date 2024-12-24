@@ -15,8 +15,8 @@ export NodeASTs
 using .Contexts
 export Contexts
 
-# Export the lambda macro from parse.jl
+# Export parse entry points from parse.jl
 using .Parse
-export @lambda
+export parse_lambda, @terms
 
 end # module ASTs

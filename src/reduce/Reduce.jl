@@ -253,7 +253,7 @@ end
 
 @testitem "Y Combinator with Complex Computations" begin
     using LambdaRegression.ASTs.NodeASTs: AstTree
-    using LambdaRegression.ASTs.Parse: @lambda
+    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
     using LambdaRegression.Reduces: beta_reduce!, prepare
     using LambdaRegression.ASTs.Contexts
 
@@ -266,13 +266,13 @@ end
     cond = p -> p ? Contexts.T : Contexts.F # boolean to boolean combinator
     
     # Pre-define context dictionary for flag
-    ctx = Dict{Symbol,Any}()
-    Y, _ = @lambda "λf.(λx.f (x x)) (λx.f (x x))"
+    ctx = @terms(add, mul, sub, eq, lt, cond, 0, 1, 4, 2, 6)
+    merge!(ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", ctx)))
 
     # Test 1: Factorial using Y combinator
     # fac = Y (λfac.λn. cond (eq n 0) 1 (mul n (fac (sub n 1))))
-    fac, _ = @lambda "Y (λfac.λn. cond (eq n 0) 1 (mul n (fac (sub n 1))))" ctx
-    fac4, _ = @lambda "fac 4" ctx
+    merge!(ctx, @terms(fac=parse_lambda("Y (λfac.λn. cond (eq n 0) 1 (mul n (fac (sub n 1))))", ctx)))
+    fac4 = parse_lambda("fac 4", ctx)
     fac4 = prepare(fac4)
 
     result = beta_reduce!(fac4, 10_000, ctx)
@@ -281,8 +281,8 @@ end
 
     # Test 2: Fibonacci using Y combinator  
     # fib = Y (λfib.λn. cond (lt n 2) n (add (fib (sub n 1)) (fib (sub n 2))))
-    fib, _ = @lambda "Y (λf.λn. cond (lt n 2) n (add (f (sub n 1)) (f (sub n 2))))" ctx
-    fib6, _ = @lambda "fib 6" ctx
+    merge!(ctx, @terms(fib=parse_lambda("Y (λf.λn. cond (lt n 2) n (add (f (sub n 1)) (f (sub n 2))))", ctx)))
+    fib6 = parse_lambda("fib 6", ctx)
     fib6 = prepare(fib6)
     result = beta_reduce!(fib6, 10_000, ctx)    
     final_value = ctx[fib6.root.name]
@@ -291,7 +291,7 @@ end
 
 @testitem "Apply Operator with List Operations for Square Sum" begin
     using LambdaRegression.ASTs.NodeASTs: AstTree
-    using LambdaRegression.ASTs.Parse: @lambda
+    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
     using LambdaRegression.Reduces: beta_reduce!, prepare
     using LambdaRegression.ASTs.Contexts
     # Define list operations using Julia arrays as lists
@@ -310,16 +310,16 @@ end
     null = xs -> isempty(xs)
 
     test_list = [1, 2, 3, 4, 5]
-    ctx = Dict{Symbol,Any}()
+    ctx = @terms(cons, car, cdr, nil, add, mul, square, cond, null, test_list, 0)
     
     # Y combinator for recursion
-    Y, _ = @lambda "λf.(λx.f (x x)) (λx.f (x x))"
+    merge!(ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", ctx)))
 
     # Test 1: Simple apply operator - apply a function to each element
-    appl, _ = @lambda "Y (λappl.λf.λlist. cond (null list) nil ((cons (f (car list))) (appl f (cdr list))))" ctx
+    merge!(ctx, @terms(appl=parse_lambda("Y (λappl.λf.λlist. cond (null list) nil ((cons (f (car list))) (appl f (cdr list))))", ctx)))
 
     # Apply square function to test_list
-    apply_square_tree, _ = @lambda "appl square test_list" ctx
+    apply_square_tree = parse_lambda("appl square test_list", ctx)
     apply_square_tree = prepare(apply_square_tree)
     result = beta_reduce!(apply_square_tree, 10_000, ctx)
     # Check the result should be [1, 4, 9, 16, 25]
@@ -328,9 +328,9 @@ end
 
     # Test 2: Sum of squares computation
     # sum = Y (λsum.λlist. cond (null list) 0 (add (car list) (sum (cdr list))))
-    SUM, _ = @lambda "Y (λsum.λlist. cond (null list) 0 (add (car list) (sum (cdr list))))" ctx
-    sum_of_squares, _ = @lambda "λlist. SUM (appl square list)" ctx
-    result_tree, _ = @lambda "sum_of_squares test_list" ctx  
+    merge!(ctx, @terms(SUM=parse_lambda("Y (λsum.λlist. cond (null list) 0 (add (car list) (sum (cdr list))))", ctx)))
+    merge!(ctx, @terms(sum_of_squares=parse_lambda("λlist. SUM (appl square list)", ctx)))
+    result_tree = parse_lambda("sum_of_squares test_list", ctx)
     result_tree = prepare(result_tree)
     result = beta_reduce!(result_tree, 10_000, ctx)    
     # Check result: 1² + 2² + 3² + 4² + 5² = 1 + 4 + 9 + 16 + 25 = 55
@@ -341,7 +341,7 @@ end
 @testitem "Step Limit Comparison Tests" begin
     using LambdaRegression.ASTs.Contexts
     using LambdaRegression.ASTs.NodeASTs: AstTree
-    using LambdaRegression.ASTs.Parse: @lambda
+    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
     using LambdaRegression.Reduces: beta_reduce!
 
     # Define arithmetic functions
@@ -352,20 +352,19 @@ end
     cond = p -> p ? Contexts.T : Contexts.F # boolean to boolean combinator
     
     # Pre-define context dictionary for flag
-    step_ctx = Dict{Symbol,Any}()
+    step_ctx = @terms(add, mul, sub, eq, cond, 0, 1)
     
     # Y combinator
-    y_combinator, _ = @lambda "λf.(λx.f (x x)) (λx.f (x x))"
-    Y = y_combinator
+    merge!(step_ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", step_ctx)))
     
     # Factorial function
-    factorial_tree, _ = @lambda "Y (λfac.λn. cond (eq n 0) 1 (mul n (fac (sub n 1))))" step_ctx
-    factorial_fn = factorial_tree
+    merge!(step_ctx, @terms(factorial_fn=parse_lambda("Y (λfac.λn. cond (eq n 0) 1 (mul n (fac (sub n 1))))", step_ctx)))
     
     # Test factorial of 3 with different step limits
-    fac_3_tree_low, _ = @lambda "factorial_fn 3" step_ctx
-    fac_3_tree_medium, _ = @lambda "factorial_fn 3" step_ctx  
-    fac_3_tree_high, _ = @lambda "factorial_fn 3" step_ctx
+    step_ctx[Symbol("3")] = 3
+    fac_3_tree_low = parse_lambda("factorial_fn 3", step_ctx)
+    fac_3_tree_medium = parse_lambda("factorial_fn 3", step_ctx)
+    fac_3_tree_high = parse_lambda("factorial_fn 3", step_ctx)
     
     # Test with low step count (should not complete)
     result_low = beta_reduce!(fac_3_tree_low, 10, step_ctx)

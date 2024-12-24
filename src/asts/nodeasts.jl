@@ -127,7 +127,7 @@ export AstNode, AstTree
 export AppNode, AbsNode, VarNode, ConstNode, IndexNode, LetNode
 export SymbolGenerator, generate_fresh_name
 export ScopeState, AbstractionDepthState
-export parse_lambda_literal, collect_constants!, @lambda
+export parse_lambda_literal, collect_constants!, parse_lambda, @terms
 
 
 ########################################################
@@ -155,6 +155,7 @@ function generate_fresh_name(gen::SymbolGenerator)
     gen.counter += 1
     return name
 end
+(s::SymbolGenerator)() = generate_fresh_name(s)
 
 # -------------------------------------------------------------------------
 # Pretty-printing helpers for numeric symbols
@@ -689,7 +690,7 @@ Base.:(==)(a::AstTree, b::AstTree) = a.root == b.root
 include("parse.jl")
 
 # Import parsing functionality 
-using .Parse: parse_lambda_literal, collect_constants!, @lambda
+using .Parse: parse_lambda_literal, collect_constants!, parse_lambda, @terms
 
 ########################################################
 # Test Items
@@ -1150,26 +1151,26 @@ end
 
 @testitem "eliminate_bound_variables! edge cases" begin
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, eliminate_bound_variables!
-    using LambdaRegression.ASTs.Parse: @lambda
+    using LambdaRegression.ASTs.Parse: parse_lambda
     
-    tree_free, _ = @lambda "f g pie"
+    tree_free = parse_lambda("f g pie")
     new_tree = deepcopy(tree_free)
     eliminate_bound_variables!(new_tree)
     @test new_tree == tree_free
     
     # Test shadowing: λx. λx. x (inner x should bind to inner λ)
-    tree_shadow, _ = @lambda "λx. λx. x"
+    tree_shadow = parse_lambda("λx. λx. x")
     eliminate_bound_variables!(tree_shadow)
     # The inner x should resolve to index 0 (innermost binding)
     @test tree_shadow == AstTree(AbsNode(:x, AbsNode(:x, IndexNode(0))))
     
     # Test partial binding: λx. y x (y free, x bound)
-    tree_partial, _ = @lambda "λx. y x"
+    tree_partial = parse_lambda("λx. y x")
     eliminate_bound_variables!(tree_partial)
     @test tree_partial == AstTree(AbsNode(:x, AppNode(VarNode(:y), IndexNode(0))))
     
     # Test deeply nested with mix of same and different names: λa. λb. λa. a b
-    tree_deep, _ = @lambda "λa. λb. λa. a b"
+    tree_deep = parse_lambda("λa. λb. λa. a b")
     eliminate_bound_variables!(tree_deep)
     @test tree_deep == AstTree(AbsNode(:a, AbsNode(:b, AbsNode(:a, AppNode(IndexNode(0), IndexNode(1))))))
 end

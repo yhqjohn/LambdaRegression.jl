@@ -20,4 +20,10 @@ include("typesystem/TypeSystem.jl")
 using .TypeSystem
 export TypeSystem
 
+include("generate/GenerateTree.jl")
+using .GenerateTree
+
+include("mutate/Mutations.jl")
+using .Mutations
+
 end # module LambdaRegression

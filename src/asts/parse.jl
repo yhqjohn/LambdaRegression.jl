@@ -5,7 +5,7 @@ using ...Trees: PointerState, traverse, getstate
 using ....Utils
 using TestItems
 
-export parse_lambda, @lambda
+export parse_lambda, @terms
 
 struct LambdaParseErr # Err type for lambda parsing
     str::String
@@ -181,50 +181,34 @@ function _parse_atom(toks, pos)::AstNode
 end
 
 """
-    parse_lambda(str::AbstractString, ctx=Dict{Symbol,Any}(); mod::Union{Module,Nothing}=nothing)
+    parse_lambda(str::AbstractString, ctx::Dict{Symbol,Any}=Dict{Symbol,Any}()) -> AstTree
 
 Parse a locally-nameless lambda calculus literal contained in `str` and return
-an `AstTree` constructed from the [`AstNode`](@ref)s defined in this module, along with a context dictionary `ctx`.
-The context dictionary can be used to resolve variable names to their values. 
-If a module is provided, it will be used to resolve variables that are not found in the context dictionary.
-the specific behavior is as follows:
-- If a variable is bound, don't replace it, just keep it as a variable node.
-- If a variable is found in the context dictionary, it will be replaced with a constant node that points to the value in the dictionary.
-- If a variable is found in the context dictionary, and more specifically, if the value is an `AstTree` or an `AstNode`, it will replace the variable as a subtree.
-- If a variable is not found in the context dictionary, it will try to resolve it from the provided module or try to parse it as a literal. If success, it will be added to the context dictionary and do the same replacement as above.
-The accepted grammar is the same as for [`parse_lambda_literal`](@ref).
-"""    
-function parse_lambda(str::AbstractString, ctx=Dict{Symbol,Any}(); mod::Union{Module,Nothing}=nothing)
-    tree = parse_lambda_literal(str)
-    collect_constants!(tree, ctx, mod)
-    return tree, ctx
-end 
+an `AstTree` constructed from the [`AstNode`](@ref)s defined in this module.
+The context dictionary `ctx` is used to resolve constants:
 
-function collect_constants!(tree::AstTree, ctx::Dict{Symbol,Any}, mod::Union{Module,Nothing}=nothing)
-    errored = Ref{Union{Nothing, LambdaParseErr}}(nothing)
+- If a variable is bound, keep it as a variable node.
+- If a variable is found in `ctx`, it will be replaced with a constant node,
+  or a subtree if the value is an `AstTree` or `AstNode`.
+- If a variable is not found in `ctx`, it remains a `VarNode`.
+
+The accepted grammar is the same as for [`parse_lambda_literal`](@ref).
+"""
+function parse_lambda(str::AbstractString, ctx::Dict{Symbol,Any}=Dict{Symbol,Any}())
+    tree = parse_lambda_literal(str)
+    collect_constants!(tree, ctx)
+    return tree
+end
+
+function collect_constants!(tree::AstTree, ctx::Dict{Symbol,Any})
     traverse(tree, PointerState, ScopeState) do t, node, bag
         if node isa VarNode
             name = node.name
-            constant_val = nothing
-            if hasname(getstate(bag, ScopeState), name) # Priority 0: scope context, pass
-            elseif haskey(ctx, name) # Priority 1: flag context
-                constant_val = ctx[name]
-            elseif !isnothing(mod) && isdefined(mod, name) # Priority 2: module context
-                constant_val = getfield(mod, name)
-                ctx[name] = constant_val
-            else # Priority 3: literal
-                strname = String(name)
-                parsed = Meta.parse(strname)
-                if parsed isa Expr
-                    errored[] = LambdaParseErr(strname)
-                elseif parsed isa Symbol # pass
-                else # literal
-                    constant_val = parsed
-                    ctx[name] = constant_val
-                end
+            if hasname(getstate(bag, ScopeState), name)
+                return nothing
             end
-            
-            if constant_val !== nothing
+            if haskey(ctx, name)
+                constant_val = ctx[name]
                 pointer = getstate(bag, PointerState{AstNode})
                 if constant_val isa AstTree
                     setchild!(tree, pointer.parent, pointer.child_index, constant_val)
@@ -236,25 +220,61 @@ function collect_constants!(tree::AstTree, ctx::Dict{Symbol,Any}, mod::Union{Mod
             end
         end
     end
-    if !isnothing(errored[])
-        return Err(errored[])
+    return tree
+end
+
+
+"""
+    @terms args...
+
+Build a context dictionary for `parse_lambda` from a list of terms.
+Identifiers map to their in-scope values. Literal values are keyed by
+`Symbol(string(literal))`. Assignments like `n=11` are supported, and the
+right-hand side can be any valid Julia expression.
+
+### Using `@terms` as a template pool
+
+`@terms` can also be used to register AST-valued entries for later reuse, e.g.
+`Y=parse_lambda(...)` stores an `AstTree` under `:Y`. This is useful for tree
+generation modules that want to sample from a template pool.
+
+If you need a **type context** (`Dict{Symbol,TyLike}`) from a `@terms` dictionary:
+
+- Use `TypeSystem.get_type_ctx` for non-AST values (it intentionally skips `AstTree`/`AstNode` entries).
+- Use `TypeSystem.get_ast_type_ctx` to infer types for AST-valued entries (templates).
+
+Examples
+```julia
+ctx = @terms(IADD, IMUL, 12, n=11)
+merge!(ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", ctx)))
+```
+"""
+macro terms(args...)
+    pairs = Expr[]
+    for arg in args
+        if arg isa Expr && (arg.head == :(=) || arg.head == :kw)
+            lhs = arg.args[1]
+            rhs = arg.args[2]
+            if !(lhs isa Symbol)
+                return :(throw(ArgumentError("@terms only supports Symbol on the left-hand side of assignments")))
+            end
+            push!(pairs, :($(QuoteNode(lhs)) => $(esc(rhs))))
+        elseif arg isa Symbol
+            push!(pairs, :($(QuoteNode(arg)) => $(esc(arg))))
+        elseif arg isa QuoteNode && arg.value isa Symbol
+            sym = arg.value
+            push!(pairs, :($(QuoteNode(sym)) => $(QuoteNode(sym))))
+        elseif arg isa Number || arg isa String || arg isa Char || arg isa Bool || arg === nothing
+            key = Symbol(string(arg))
+            push!(pairs, :($(QuoteNode(key)) => $(arg)))
+        else
+            key = Symbol(string(arg))
+            push!(pairs, :($(QuoteNode(key)) => $(esc(arg))))
+        end
     end
-end 
-
-"""
-    @lambda str
-    @lambda str ctx
-
-Macro to parse a locally-nameless lambda calculus literal contained in `str`.
-The specific behavior is the same as [`parse_lambda`](@ref), but it use the caller module as the default module to resolve variables.
-"""
-macro lambda(str)
-    :(parse_lambda($str; mod=$(__module__)))
+    return :(Dict{Symbol,Any}($(pairs...)))
 end
 
-macro lambda(str, ctx)
-    :(parse_lambda($str, $(esc(ctx)); mod=$(__module__)))
-end
 
 @testitem "parse_lambda_literal basic cases" begin
     using LambdaRegression.ASTs.Parse: parse_lambda_literal
@@ -291,76 +311,99 @@ end
     @test app.arg isa IndexNode && app.arg.index == 0
 end
 
-@testitem "lambda macro basic parsing" begin
-    using LambdaRegression.ASTs.Parse: @lambda
+@testitem "parse_lambda basic parsing" begin
+    using LambdaRegression.ASTs.Parse: parse_lambda
     using LambdaRegression.ASTs.NodeASTs: VarNode, IndexNode, AbsNode, AppNode
 
-    tree, _ = @lambda "x"
+    tree = parse_lambda("x")
     @test tree.root isa VarNode
 
-    tree, _ = @lambda "#0"
+    tree = parse_lambda("#0")
     @test tree.root isa IndexNode && tree.root.index == 0
 
-    tree, _ = @lambda "λx.x"
+    tree = parse_lambda("λx.x")
     @test tree.root isa AbsNode
 
-    tree, _ = @lambda "f g"
+    tree = parse_lambda("f g")
     @test tree.root isa AppNode
 end
 
-@testitem "lambda macro constant collection" begin
-    using LambdaRegression.ASTs.Parse: @lambda
+@testitem "parse_lambda constant collection" begin
+    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
     using LambdaRegression.ASTs.NodeASTs: VarNode, IndexNode, AbsNode, AppNode, ConstNode
 
     # Numeric literals
-    tree, dict = @lambda "λx. 42"
-    @test haskey(dict, Symbol("42"))
-    @test dict[Symbol("42")] == 42
+    ctx = @terms 42
+    tree = parse_lambda("λx. 42", ctx)
+    @test haskey(ctx, Symbol("42"))
+    @test ctx[Symbol("42")] == 42
     @test tree.root.body isa ConstNode
 
     # Variables stay as variables
-    tree, dict = @lambda "λx. y"
-    @test isempty(dict)
+    tree = parse_lambda("λx. y")
     @test tree.root.body isa VarNode
 
-    # with module variable
-    const test_const = 99
-    tree, dict = @lambda "λx. test_const"
-    @test haskey(dict, :test_const)
-    @test dict[:test_const] == 99
+    ctx = @terms test_const=99
+    tree = parse_lambda("λx. test_const", ctx)
+    @test haskey(ctx, :test_const)
+    @test ctx[:test_const] == 99
     @test tree.root.body isa ConstNode
 
     # multiple constants
-    tree, dict = @lambda "λx1.1.45 42"
-    @test length(dict) == 2
-    @test haskey(dict, Symbol("42"))
-    @test haskey(dict, Symbol("1.45"))
+    ctx = @terms(1.45, 42)
+    tree = parse_lambda("λx1.1.45 42", ctx)
+    @test length(ctx) == 2
+    @test haskey(ctx, Symbol("42"))
+    @test haskey(ctx, Symbol("1.45"))
 end
 
-@testitem "lambda macro with user context" begin
-    using LambdaRegression.ASTs.Parse: @lambda
+@testitem "parse_lambda with user context" begin
+    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
     using LambdaRegression.ASTs.NodeASTs: VarNode, IndexNode, AbsNode, AppNode, ConstNode
 
-    ctx = Dict{Symbol, Any}(:foo=>123, :bar=>"hello")
-    tree, dict = @lambda("λx. foo bar", ctx)
-    @test dict[:foo] == 123
-    @test dict[:bar] == "hello"
+    ctx = @terms(foo=123, bar="hello")
+    tree = parse_lambda("λx. foo bar", ctx)
+    @test ctx[:foo] == 123
+    @test ctx[:bar] == "hello"
     @test tree.root.body.func isa ConstNode
 
     # priority
     foo = 111
-    ## with ctx
-    ctx = Dict{Symbol, Any}(:foo=>123, Symbol(1)=>42)
-    tree, dict = @lambda "λx. foo 1" ctx
-    @test dict[:foo] == 123
-    @test dict[Symbol(1)] == 42
+    # with ctx
+    ctx = @terms(foo=123, 1)
+    tree = parse_lambda("λx. foo 1", ctx)
+    @test ctx[:foo] == 123
+    @test ctx[Symbol(1)] == 1
     @test tree.root.body.func isa ConstNode
     
-    ## without ctx
-    tree, dict = @lambda "λx. foo 1"
-    @test dict[:foo] == 111
-    @test dict[Symbol(1)] == 1
-    @test tree.root.body.func isa ConstNode
+    # without ctx
+    tree = parse_lambda("λx. foo 1")
+    @test tree.root.body.func isa VarNode
+    @test tree.root.body.arg isa VarNode
+end
+
+@testitem "terms macro basics" begin
+    using LambdaRegression.ASTs.Parse: @terms
+    using LambdaRegression.ASTs.NodeASTs: AstTree, VarNode, ConstNode
+
+    IADD = :add_impl
+    IMUL = :mul_impl
+    ctx = @terms(IADD, IMUL, 12, n=11)
+
+    @test ctx[:IADD] == :add_impl
+    @test ctx[:IMUL] == :mul_impl
+    @test ctx[Symbol("12")] == 12
+    @test ctx[:n] == 11
+end
+
+@testitem "terms macro supports rhs expressions" begin
+    using LambdaRegression.ASTs.Parse: @terms, parse_lambda
+    using LambdaRegression.ASTs.NodeASTs: AstTree
+
+    base_ctx = @terms(0, 1)
+    ctx = merge(base_ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", base_ctx)))
+    @test haskey(ctx, :Y)
+    @test ctx[:Y] isa AstTree
 end
 
 end # module Parse
