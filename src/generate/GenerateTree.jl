@@ -1,35 +1,46 @@
 """
     GenerateTree
 
-Tree generation module for symbolic regression using lambda expressions.
+Typed AST generation under `max_depth` / `max_try` budgets.
 
-This module provides a recursive tree generation system based on constructor patterns
-and chooser strategies. It uses a context-based composition pattern with NamedTuple
-to manage generation state, including depth/try budgets, type constraints, and optional
-template pools. The generation strategy balances success rate and diversity through controlled
-recursion with leaf/template anchored application construction.
+`GenerateTree` synthesizes lambda-calculus ASTs (see `ASTs.NodeASTs`) that satisfy a target type (`TypeSystem.Ty`).
+Generation is driven by a small set of *constructors* (`AbstractCtor`) and a *chooser* (`AbstractChooser`) that selects
+among qualified constructors.
 
-Key components:
-- Abstract constructor system (`AbstractCtor`) for different node types
-- Chooser strategies (`AbstractChooser`) for constructor selection  
-- Context management through flattened namespace pattern
-- Special handling for application nodes with leaf/template anchoring
-- Error types for generation failure cases
+Quickstart
+```julia
+using Random
+using LambdaRegression.GenerateTree: generate_tree, AbsCtor, IndexCtor, ApplyLeafCtor, IntegerCtor, UniformChooser
+using LambdaRegression.TypeSystem: TyLike, IntTy, TyFun
 
-## Type contexts (`Ty` vs `TyScheme`)
+tree = generate_tree(
+    TyFun(IntTy, IntTy);
+    ctors=[AbsCtor(), IndexCtor(), ApplyLeafCtor(), IntegerCtor()],
+    chooser=UniformChooser(),
+    rng=MersenneTwister(1),
+    max_depth=6,
+    max_try=20,
+    global_consts_ty=Dict{Symbol,TyLike}(),
+    local_consts_ty=Dict{Symbol,TyLike}(),
+    local_consts=Dict{Symbol,Any}(),
+)
+```
 
-`GenerateTree` expects constant/template typing contexts to follow the `TypeSystem` discipline:
-use `Ty` for monomorphic entries and `TyScheme` for polymorphic entries. (See `TypeSystem.validate_ctx`.)
+Capabilities
+- Budget control: `max_depth` (recursive depth) and `max_try` (retry budget per node).
+- Constructor system: leaf constructors (constants/vars), abstraction (`AbsCtor`), application (leaf-anchored and template-anchored).
+- Template pools (optional): treat a closed `AstTree` as an anchor for application constructors.
+  - Provide `templates::Dict{Symbol,AstTree}` (and optionally `templates_ty::Dict{Symbol,TyLike}`), or
+  - Provide `terms_ctx::Dict{Symbol,Any}` from `@terms(...)` and extract AST-valued entries automatically.
+  - When `templates_ty` is omitted, it is inferred via `TypeSystem.infer_scheme` using `global_consts_ty` (and `local_consts_ty` if present),
+    and validated with `TypeSystem.validate_ctx` as fail-fast initialization.
+- Context discipline: in `Dict{Symbol,TyLike}`, store monomorphic entries as `Ty` and polymorphic entries as `TyScheme`
+  (enforced by `TypeSystem.validate_ctx`).
 
-## Template pools
-
-Application constructors can optionally anchor one side to a **template** (a closed `AstTree`):
-
-- Pass `templates::Dict{Symbol,AstTree}` and optionally `templates_ty::Dict{Symbol,TyLike}`; or
-- Pass `terms_ctx::Dict{Symbol,Any}` (from `@terms(...)`) and let template constructors extract AST-valued entries.
-
-When `templates_ty` is not provided, it is inferred via `TypeSystem.infer_scheme` using `global_consts_ty`
-and validated as fail-fast initialization.
+Key context fields
+- `ctors`, `chooser`, `rng`, `tyfactory`, `symfactory`, `max_depth`, `max_try`
+- `global_consts_ty`, `local_consts_ty`, `local_consts`
+- `templates`, `templates_ty`, or `terms_ctx`
 """
 module GenerateTree
 
@@ -462,7 +473,46 @@ function construct_tree(::ApplyToLeafCtor, ty::Ty, ctx::NamedTuple)
     return _anchored_apply(:arg, arg_tree, inst_arg_ty, ty, ctx)
 end
 
+"""
+    ApplyTemplateCtor <: AbstractAppCtor
+
+Template-anchored application constructor (template as the **function** side).
+
+This constructor selects a closed template `t` from `ctx.templates`, whose type (from `ctx.templates_ty[name]`)
+can be unified with `arg_ty -> target_ty`. It then calls `_anchored_apply(:func, ...)` to generate an argument subtree
+of the inferred `arg_ty` under the remaining depth budget, finally returning `AppNode(t, arg)`.
+
+Context contract
+- Requires `templates::Dict{Symbol,AstTree}` and `templates_ty::Dict{Symbol,TyLike}` in `ctx`.
+  These are produced by `initialize_ctx(ApplyTemplateCtor(), ctx)` via `_initialize_templates_ctx`.
+- If `templates_ty` is not provided, it is inferred via `TypeSystem.infer_scheme` using `global_consts_ty`
+  (and `local_consts_ty` if present), then validated via `TypeSystem.validate_ctx`.
+- Every template must be a closed term (`_is_closed_term`) and must satisfy the depth guard
+  `ast_depth(template) <= ctx.max_depth - 1`.
+
+Failure modes
+- No templates / no typing context / no qualified template for `target_ty`
+- Template not closed, or type inference fails during initialization
+- Argument generation exhausts `max_try` within the remaining `max_depth`
+"""
 struct ApplyTemplateCtor <: AbstractAppCtor end
+
+"""
+    ApplyToTemplateCtor <: AbstractAppCtor
+
+Template-anchored application constructor (template as the **argument** side).
+
+This constructor selects a closed template `t` from `ctx.templates` as the argument. It freshens the template type to
+`arg_ty`, constructs the required function type `arg_ty -> target_ty`, and calls `_anchored_apply(:arg, ...)` to generate
+the function subtree under the remaining depth budget, returning `AppNode(func, t)`.
+
+Context contract
+- Same template requirements as [`ApplyTemplateCtor`](@ref): `templates`, `templates_ty`, and `global_consts_ty` must be present.
+
+Implementation note
+- Candidate templates are filtered only by depth; type compatibility is attempted via `_anchored_apply` and retried up to `max_try`.
+  If the template pool mixes unrelated types, prefer splitting pools or increasing `max_try`.
+"""
 struct ApplyToTemplateCtor <: AbstractAppCtor end
 
 function _extract_templates_from_terms_ctx(terms_ctx)
@@ -475,6 +525,15 @@ function _extract_templates_from_terms_ctx(terms_ctx)
         end
     end
     return templates
+end
+
+function _specialized_y_scheme(factory)::TyScheme
+    # Function-only fixpoint:
+    #   ∀α β. ((α→β)→(α→β)) → (α→β)
+    α = factory(0)
+    β = factory(0)
+    σ = TyFun(α, β)
+    return TyScheme([α, β], TyFun(TyFun(σ, σ), σ))
 end
 
 function _initialize_templates_ctx(ctx::NamedTuple)
@@ -507,7 +566,14 @@ function _initialize_templates_ctx(ctx::NamedTuple)
             error("Failed to infer type for template :$name: $(e)")
         end
         scheme isa Err && error("Failed to infer type for template :$name: $(scheme.value)")
-        templates_ty[name] = scheme
+        if name == :Y
+            specialized = _specialized_y_scheme(ctx.tyfactory)
+            TypeSystem.islesseq(specialized, scheme) ||
+                error("Specialized :Y scheme is not a subset of inferred scheme: inferred=$scheme specialized=$specialized")
+            templates_ty[name] = specialized
+        else
+            templates_ty[name] = scheme
+        end
     end
     TypeSystem.validate_ctx(templates_ty)
     return (;templates=templates, templates_ty=templates_ty)
@@ -1165,113 +1231,287 @@ end
     @test isqualified(IntTy, ApplyTemplateCtor(), ctx) in (true, false)
 end
 
-@testitem "GenerateTree ApplyTemplateCtor handles Y-map template" begin
+@testitem "GenerateTree ApplyTemplateCtor anchors Y combinator template (μ / higher-order)" begin
     using Random
-    using LambdaRegression.GenerateTree: construct_tree, initialize_ctx, UniformChooser, SymbolGenerator, ApplyTemplateCtor, GlobalConstCtor
+    using LambdaRegression.GenerateTree: construct_tree, initialize_ctx, ApplyTemplateCtor, AbsCtor, IndexCtor, SymbolGenerator
+    using LambdaRegression.GenerateTree: AbstractChooser, isqualified, NoQualifiedCtorErr, Err
     using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: TyLike, IntTy, NilErr, TyList, CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND, get_type_ctx
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
+    using LambdaRegression.TypeSystem: TyLike, IntTy, TyScheme, TyFun, iscompatible
+    using LambdaRegression.ASTs.Parse: parse_lambda
     using LambdaRegression.ASTs.NodeASTs
 
-    β = newtyvar(0)
-    id = x -> x
-    nil_to_zero = _ -> 0
-    nil_to_empty = _ -> Int[]
-    empty_list = Int[]
-    test_list = [1, 2, 3, 4]
+    struct FirstChooser <: AbstractChooser end
+    function LambdaRegression.GenerateTree.choose_ctor(::FirstChooser, ty::TyLike, ctx::NamedTuple)
+        for ctor in ctx.ctors
+            isqualified(ty, ctor, ctx) && return ctor
+        end
+        return Err(NoQualifiedCtorErr())
+    end
 
-    terms_ctx = @terms(CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND, id, nil_to_zero, nil_to_empty, empty_list, int0=0, test_list)
-    merge!(terms_ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", terms_ctx)))
-    merge!(terms_ctx, @terms(MAP=parse_lambda("Y (λappl.λf.λlist. COND (IEQ (LENGTH list) int0) empty_list ((CONS (f (CASENILERR id nil_to_zero (HEAD list)))) (appl f (CASENILERR id nil_to_empty (TAIL list)))))", terms_ctx)))
-    map_square = parse_lambda("λlist. MAP (λx. IMUL x x) list", terms_ctx)
+    function has_self_app(node::AstNode)::Bool
+        if node isa AppNode
+            if node.func isa VarNode && node.arg isa VarNode && node.func.name == node.arg.name
+                return true
+            elseif node.func isa IndexNode && node.arg isa IndexNode && node.func.index == node.arg.index
+                return true
+            end
+            return has_self_app(node.func) || has_self_app(node.arg)
+        elseif node isa AbsNode
+            return has_self_app(node.body)
+        else
+            return false
+        end
+    end
 
-    global_consts_ty = get_type_ctx(terms_ctx, Dict{Symbol,TyLike}(
-        :id => ∀([β], β → β),
-        :nil_to_zero => NilErr → IntTy,
-        :nil_to_empty => NilErr → TyList(IntTy),
-        :empty_list => TyList(IntTy),
-        :test_list => TyList(IntTy),
-    ))
+    lam = Char(0x03bb)
+    y_src = string(lam, "f.(", lam, "x.f (x x)) (", lam, "x.f (x x))")
+    y_tree = parse_lambda(y_src)
+    templates = Dict{Symbol,AstTree}(:Y => y_tree)
+    @test has_self_app(y_tree.root)
 
+    target_ty = TyFun(IntTy, IntTy)
     base_ctx = (;
-        ctors=[GlobalConstCtor()],
-        chooser=UniformChooser(),
-        max_depth=20,
+        ctors=[AbsCtor(), IndexCtor()],
+        chooser=FirstChooser(),
+        max_depth=8,
         max_try=10,
         tyfactory=newtyvar,
         symfactory=SymbolGenerator(),
         rng=MersenneTwister(42),
-        global_consts_ty=global_consts_ty,
+        global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=Dict{Symbol,Any}(),
-        templates=Dict{Symbol,AstTree}(:MAP_SQUARE => map_square),
-    )
-    ctx = merge(base_ctx, initialize_ctx(ApplyTemplateCtor(), base_ctx))
-    ctx = merge(ctx, initialize_ctx(ctx.chooser, ctx))
-
-    tree = construct_tree(ApplyTemplateCtor(), TyList(IntTy), ctx)
-    @test tree isa AstTree
-    @test tree.root isa AppNode
-    @test infer(tree, merge(ctx.global_consts_ty, ctx.local_consts_ty)) == TyList(IntTy)
-end
-
-@testitem "GenerateTree ApplyToTemplateCtor handles Y-reduce template" begin
-    using Random
-    using LambdaRegression.GenerateTree: construct_tree, initialize_ctx, UniformChooser, SymbolGenerator, ApplyToTemplateCtor, GlobalConstCtor
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: TyLike, IntTy, NilErr, TyList, CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND, get_type_ctx
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.ASTs.NodeASTs
-
-    β = newtyvar(0)
-    id = x -> x
-    nil_to_zero = _ -> 0
-    nil_to_empty = _ -> Int[]
-    empty_list = Int[]
-    int1 = 1
-    int2 = 2
-    int3 = 3
-
-    terms_ctx = @terms(CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND, id, nil_to_zero, nil_to_empty, empty_list, int1, int2, int3)
-    merge!(terms_ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", terms_ctx)))
-    merge!(terms_ctx, @terms(REDUCE_SUM=parse_lambda("Y (λsum.λlist. COND (IEQ (LENGTH list) 0) 0 (IADD (CASENILERR id nil_to_zero (HEAD list)) (sum (CASENILERR id nil_to_empty (TAIL list)))))", terms_ctx)))
-    list_template = parse_lambda("CONS int1 (CONS int2 (CONS int3 empty_list))", terms_ctx)
-
-    global_consts_ty = get_type_ctx(terms_ctx, Dict{Symbol,TyLike}(
-        :id => ∀([β], β → β),
-        :nil_to_zero => NilErr → IntTy,
-        :nil_to_empty => NilErr → TyList(IntTy),
-        :empty_list => TyList(IntTy),
-        :int1 => IntTy,
-        :int2 => IntTy,
-        :int3 => IntTy,
-    ))
-
-    base_ctx = (;
-        ctors=[GlobalConstCtor()],
-        chooser=UniformChooser(),
-        max_depth=7,
-        max_try=10,
-        tyfactory=newtyvar,
-        symfactory=SymbolGenerator(),
-        rng=MersenneTwister(555),
-        global_consts_ty=global_consts_ty,
-        local_consts_ty=Dict{Symbol,TyLike}(),
-        local_consts=Dict{Symbol,Any}(),
-        templates=Dict{Symbol,AstTree}(:LIST123 => list_template),
+        templates=templates,
     )
     ctx = let ctx = base_ctx
-        for ctor in [ApplyToTemplateCtor(), base_ctx.ctors...]
+        for ctor in [AbsCtor(), IndexCtor(), ApplyTemplateCtor()]
             ctx = merge(ctx, initialize_ctx(ctor, ctx))
         end
         merge(ctx, initialize_ctx(ctx.chooser, ctx))
     end
 
-    tree = construct_tree(ApplyToTemplateCtor(), IntTy, ctx)
+    @test haskey(ctx, :templates_ty)
+    @test ctx.templates_ty[:Y] isa TyScheme
+
+    tree = construct_tree(ApplyTemplateCtor(), target_ty, ctx)
     @test tree isa AstTree
     @test tree.root isa AppNode
-    @test tree.root.arg == list_template.root
-    @test infer(tree, merge(ctx.global_consts_ty, ctx.local_consts_ty)) == IntTy
+    @test tree.root.func == y_tree.root
+    type_ctx = merge(ctx.global_consts_ty, ctx.local_consts_ty)
+    @test iscompatible(infer(tree, type_ctx), target_ty)
+    arg_ty = infer(AstTree(tree.root.arg), type_ctx)
+    @test arg_ty isa TyFun
+end
+
+@testitem "GenerateTree Y uses specialized template scheme (function-only fixpoint)" begin
+    using Random
+    using LambdaRegression.GenerateTree: construct_tree, initialize_ctx, ApplyTemplateCtor, AbsCtor, IndexCtor, SymbolGenerator
+    using LambdaRegression.GenerateTree: AbstractChooser, isqualified, NoQualifiedCtorErr, Err
+    using LambdaRegression.TypeSystem
+    using LambdaRegression.TypeSystem: TyLike, IntTy, TyScheme, TyFun, infer, iscompatible, islesseq, newtyvar
+    using LambdaRegression.ASTs.Parse: parse_lambda
+    using LambdaRegression.ASTs.NodeASTs
+
+    struct FirstChooser <: AbstractChooser end
+    function LambdaRegression.GenerateTree.choose_ctor(::FirstChooser, ty::TyLike, ctx::NamedTuple)
+        for ctor in ctx.ctors
+            isqualified(ty, ctor, ctx) && return ctor
+        end
+        return Err(NoQualifiedCtorErr())
+    end
+
+    lam = Char(0x03bb)
+    y_src = string(lam, "f.(", lam, "x.f (x x)) (", lam, "x.f (x x))")
+    y_tree = parse_lambda(y_src)
+
+    base_ctx = (;
+        ctors=[AbsCtor(), IndexCtor()],
+        chooser=FirstChooser(),
+        max_depth=8,
+        max_try=12,
+        tyfactory=newtyvar,
+        symfactory=SymbolGenerator(),
+        rng=MersenneTwister(2000),
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts=Dict{Symbol,Any}(),
+        templates=Dict{Symbol,AstTree}(:Y => y_tree),
+    )
+
+    ctx = let ctx = base_ctx
+        for ctor in [AbsCtor(), IndexCtor(), ApplyTemplateCtor()]
+            ctx = merge(ctx, initialize_ctx(ctor, ctx))
+        end
+        merge(ctx, initialize_ctx(ctx.chooser, ctx))
+    end
+
+    # Expect: ∀α β. ((α→β)→(α→β)) → (α→β)
+    α = newtyvar(0)
+    β = newtyvar(0)
+    σ = TyFun(α, β)
+    expected = TyScheme([α, β], TyFun(TyFun(σ, σ), σ))
+    @test islesseq(expected, ctx.templates_ty[:Y])
+    @test islesseq(ctx.templates_ty[:Y], expected)
+
+    # `Y` is forbidden for non-function targets.
+    @test isqualified(IntTy, ApplyTemplateCtor(), ctx) == false
+
+    # But it must still work for generator-like targets.
+    target_ty = TyFun(IntTy, IntTy)
+    tree = construct_tree(ApplyTemplateCtor(), target_ty, ctx)
+    @test tree isa AstTree
+    @test tree.root isa AppNode
+    @test tree.root.func == y_tree.root
+
+    type_ctx = merge(ctx.global_consts_ty, ctx.local_consts_ty)
+    @test iscompatible(infer(tree, type_ctx), target_ty)
+
+    arg_ty = infer(AstTree(tree.root.arg), type_ctx)
+    expected_arg_ty = TyFun(TyFun(IntTy, IntTy), TyFun(IntTy, IntTy))
+    @test iscompatible(arg_ty, expected_arg_ty)
+end
+
+@testitem "GenerateTree ApplyTemplateCtor anchors MAP/REDUCE templates directly" begin
+    using Random
+    using LambdaRegression.GenerateTree: construct_tree, initialize_ctx, ast_depth
+    using LambdaRegression.GenerateTree: ApplyTemplateCtor, AbsCtor, IndexCtor, NilCtor, SymbolGenerator
+    using LambdaRegression.GenerateTree: AbstractChooser, isqualified, NoQualifiedCtorErr, Err
+    using LambdaRegression.TypeSystem
+    using LambdaRegression.TypeSystem: TyLike, IntTy, NilErr, TyList, TyScheme, TyFun, get_type_ctx, iscompatible
+    using LambdaRegression.TypeSystem: CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND
+    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
+    using LambdaRegression.ASTs.NodeASTs
+
+    struct FirstChooser <: AbstractChooser end
+    function LambdaRegression.GenerateTree.choose_ctor(::FirstChooser, ty::TyLike, ctx::NamedTuple)
+        for ctor in ctx.ctors
+            isqualified(ty, ctor, ctx) && return ctor
+        end
+        return Err(NoQualifiedCtorErr())
+    end
+
+    function has_self_app(node::AstNode)::Bool
+        if node isa AppNode
+            if node.func isa VarNode && node.arg isa VarNode && node.func.name == node.arg.name
+                return true
+            elseif node.func isa IndexNode && node.arg isa IndexNode && node.func.index == node.arg.index
+                return true
+            end
+            return has_self_app(node.func) || has_self_app(node.arg)
+        elseif node isa AbsNode
+            return has_self_app(node.body)
+        else
+            return false
+        end
+    end
+
+    α = newtyvar(0)
+    id = x -> x
+    nil_to_zero = _ -> 0
+    nil_to_empty = _ -> Int[]
+    empty_list = Int[]
+
+    # Scenario A: MAP itself is the template (recursion via inlined Y)
+    lam = Char(0x03bb)
+    y_src = string(lam, "f.(", lam, "x.f (x x)) (", lam, "x.f (x x))")
+    map_src =
+        "Y (" *
+        string(lam) * "appl." *
+        string(lam) * "f." *
+        string(lam) * "list. COND (IEQ (LENGTH list) int0) empty_list " *
+        "((CONS (f (CASENILERR id nil_to_zero (HEAD list)))) (appl f (CASENILERR id nil_to_empty (TAIL list)))))"
+
+    terms_ctx_map = @terms(CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND, id, nil_to_zero, nil_to_empty, empty_list, int0=0)
+    merge!(terms_ctx_map, @terms(Y=parse_lambda(y_src, terms_ctx_map)))
+    merge!(terms_ctx_map, @terms(MAP=parse_lambda(map_src, terms_ctx_map)))
+
+    global_consts_ty_map = get_type_ctx(terms_ctx_map, Dict{Symbol,TyLike}(
+        :id => TyScheme([α], TyFun(α, α)),
+        :nil_to_zero => TyFun(NilErr, IntTy),
+        :nil_to_empty => TyFun(NilErr, TyList(IntTy)),
+        :empty_list => TyList(IntTy),
+        :int0 => IntTy,
+    ))
+
+    map_tree = terms_ctx_map[:MAP]::AstTree
+    map_template_depth = ast_depth(map_tree)
+    @test has_self_app(map_tree.root)
+    map_target_ty = TyFun(TyList(IntTy), TyList(IntTy))
+    base_ctx_map = (;
+        ctors=[AbsCtor(), IndexCtor()],
+        chooser=FirstChooser(),
+        max_depth=map_template_depth + 6,
+        max_try=12,
+        tyfactory=newtyvar,
+        symfactory=SymbolGenerator(),
+        rng=MersenneTwister(555),
+        global_consts_ty=global_consts_ty_map,
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts=Dict{Symbol,Any}(),
+        templates=Dict{Symbol,AstTree}(:MAP => map_tree),
+    )
+    ctx_map = let ctx = base_ctx_map
+        for ctor in [AbsCtor(), IndexCtor(), ApplyTemplateCtor()]
+            ctx = merge(ctx, initialize_ctx(ctor, ctx))
+        end
+        merge(ctx, initialize_ctx(ctx.chooser, ctx))
+    end
+
+    @test ctx_map.templates_ty[:MAP] isa TyScheme
+    map_applied = construct_tree(ApplyTemplateCtor(), map_target_ty, ctx_map)
+    @test map_applied isa AstTree
+    @test map_applied.root isa AppNode
+    @test map_applied.root.func == map_tree.root
+    type_ctx_map = merge(ctx_map.global_consts_ty, ctx_map.local_consts_ty)
+    @test iscompatible(infer(map_applied, type_ctx_map), map_target_ty)
+
+    # Scenario B: REDUCE_SUM itself is the template; argument generation uses NilCtor for List(Int)
+    reduce_src =
+        "Y (" *
+        string(lam) * "sum." *
+        string(lam) * "list. COND (IEQ (LENGTH list) int0) int0 " *
+        "(IADD (CASENILERR id nil_to_zero (HEAD list)) (sum (CASENILERR id nil_to_empty (TAIL list)))))"
+
+    terms_ctx_red = @terms(CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND, id, nil_to_zero, nil_to_empty, empty_list, int0=0)
+    merge!(terms_ctx_red, @terms(Y=parse_lambda(y_src, terms_ctx_red)))
+    merge!(terms_ctx_red, @terms(REDUCE_SUM=parse_lambda(reduce_src, terms_ctx_red)))
+
+    global_consts_ty_red = get_type_ctx(terms_ctx_red, Dict{Symbol,TyLike}(
+        :id => TyScheme([α], TyFun(α, α)),
+        :nil_to_zero => TyFun(NilErr, IntTy),
+        :nil_to_empty => TyFun(NilErr, TyList(IntTy)),
+        :empty_list => TyList(IntTy),
+    ))
+
+    red_tree = terms_ctx_red[:REDUCE_SUM]::AstTree
+    red_template_depth = ast_depth(red_tree)
+    @test has_self_app(red_tree.root)
+    base_ctx_red = (;
+        ctors=[NilCtor()],
+        chooser=FirstChooser(),
+        max_depth=red_template_depth + 6,
+        max_try=12,
+        tyfactory=newtyvar,
+        symfactory=SymbolGenerator(),
+        rng=MersenneTwister(2000),
+        global_consts_ty=global_consts_ty_red,
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts=Dict{Symbol,Any}(),
+        templates=Dict{Symbol,AstTree}(:REDUCE_SUM => red_tree),
+    )
+    ctx_red = let ctx = base_ctx_red
+        ctx = merge(ctx, initialize_ctx(NilCtor(), ctx))
+        ctx = merge(ctx, initialize_ctx(ApplyTemplateCtor(), ctx))
+        merge(ctx, initialize_ctx(ctx.chooser, ctx))
+    end
+
+    @test ctx_red.templates_ty[:REDUCE_SUM] isa TyScheme
+    red_applied = construct_tree(ApplyTemplateCtor(), IntTy, ctx_red)
+    @test red_applied isa AstTree
+    @test red_applied.root isa AppNode
+    @test red_applied.root.func == red_tree.root
+    type_ctx_red = merge(ctx_red.global_consts_ty, ctx_red.local_consts_ty)
+    @test iscompatible(infer(red_applied, type_ctx_red), IntTy)
 end
 
 @testitem "GenerateTree smoke thresholds (deterministic setups)" begin

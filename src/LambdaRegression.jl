@@ -26,4 +26,8 @@ using .GenerateTree
 include("mutate/Mutations.jl")
 using .Mutations
 
+include("regression/Regression.jl")
+using .Regression
+export Regression
+
 end # module LambdaRegression

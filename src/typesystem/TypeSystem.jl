@@ -54,6 +54,8 @@ and rebuild composite types).
 """
 module TypeSystem
 
+import Base.Threads
+
 using ..ASTs.NodeASTs: AstTree, AstNode, VarNode, IndexNode, AbsNode, AppNode, ConstNode
 using ..Utils
 using ..ASTs.Contexts: COND
@@ -61,7 +63,7 @@ using TestItems
 
 export Ty, TyConst, TyVar, TyFun, TyMu, TyProd, TySum, TyList, TyNat, TyArray, TyScheme, TyLike
 export iscompatible, islesseq, infer, UnboundVariableError, OccursCheckError, MismatchError
-export →, ×, μ, ∀, newtyvar, get_type_ctx, get_ast_type_ctx, collect_types, get_type, infer_scheme
+export →, ×, μ, ∀, newtyvar, make_tyvar_factory, get_type_ctx, get_ast_type_ctx, collect_types, get_type, infer_scheme
 
 public BoolTy, IntTy, FloatTy, COND
 
@@ -231,10 +233,10 @@ end
 # Internal fresh id counter
 # ------------------------------------------------------------
 mutable struct Counter
-    value::Int
+    value::Threads.Atomic{Int}
 end
-Counter() = Counter(0)
-(c::Counter)() = c.value += 1
+Counter() = Counter(Threads.Atomic{Int}(0))
+(c::Counter)() = Threads.atomic_add!(c.value, 1) + 1
 
 const _TYVAR_COUNTER = Counter()
 
@@ -245,6 +247,20 @@ VarFactory() = VarFactory(Counter())
 (n::VarFactory)(level::Int)::TyVar = TyVar(n.counter(), level, nothing)
 
 const newtyvar = VarFactory(_TYVAR_COUNTER) # shared global factory for debugging and legacy entry points
+
+"""
+    make_tyvar_factory() -> VarFactory
+
+Create a **fresh** type-variable factory for use in concurrent / multi-threaded
+pipelines (e.g. symbolic regression).
+
+Notes
+- `newtyvar` is a shared global factory intended for debugging and legacy paths.
+- When running SR across individuals in parallel, use a per-task factory created
+  by `make_tyvar_factory()` to avoid shared state and to make determinism easier
+  to reason about.
+"""
+make_tyvar_factory() = VarFactory()
 
 # ------------------------------------------------------------
 # Utility: prune - follow instances to canonical representative
@@ -649,7 +665,11 @@ function _show_ty(t::Ty, seen=Dict{TyVar,Int}())
         idx = get!(seen, t, length(seen))
         return "α$(t.id)"
     elseif t isa TyFun
-        return _show_ty(t.arg, seen) * " → " * _show_ty(t.res, seen)
+        # `→` is right-associative. Parenthesize the argument position only
+        # when it is itself a function type: (A→B)→C.
+        arg_s = _show_ty(t.arg, seen)
+        t.arg isa TyFun && (arg_s = "(" * arg_s * ")")
+        return arg_s * " → " * _show_ty(t.res, seen)
     elseif t isa TyProd
         return "(" * _show_ty(t.left, seen) * " × " * _show_ty(t.right, seen) * ")"
     elseif t isa TySum
@@ -895,6 +915,17 @@ get_type(::typeof(FDIV)) = FloatOp
     @test sum_ty isa TySum && sum_ty.left === IntTy && sum_ty.right === BoolTy
 end
 
+@testitem "TypeSystem pretty print arrow precedence" begin
+    using LambdaRegression.TypeSystem
+    using LambdaRegression.TypeSystem: IntTy, TyFun
+
+    # `(A→B)→C` must print with parentheses on the argument side.
+    arrow = string(Char(0x2192))
+    t = TyFun(TyFun(IntTy, IntTy), TyFun(IntTy, IntTy))
+    s = replace(sprint(show, t), " " => "")
+    @test s == "(Int$(arrow)Int)$(arrow)Int$(arrow)Int"
+end
+
 @testitem "simple hashing and equality" begin
     using LambdaRegression.TypeSystem
     using LambdaRegression.ASTs.NodeASTs
@@ -930,6 +961,23 @@ end
     s = Set([∀([α, β], α → β)])
     @test ∀([β, α], β → α) in s
     @test ∀([α, β], α → α) ∉ s    
+end
+
+@testitem "TypeSystem make_tyvar_factory is detached" begin
+    using LambdaRegression.TypeSystem: make_tyvar_factory
+
+    f1 = make_tyvar_factory()
+    f2 = make_tyvar_factory()
+
+    a1 = f1(0)
+    a2 = f1(0)
+    b1 = f2(0)
+    b2 = f2(0)
+
+    @test a1.id == 1
+    @test a2.id == 2
+    @test b1.id == 1
+    @test b2.id == 2
 end
 
 @testitem "simple identity typing" begin

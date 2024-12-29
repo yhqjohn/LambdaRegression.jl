@@ -3,7 +3,7 @@ module Contexts
 # A simple context implementation for `ConstNode` evaluation using positional
 # argument dispatch for maximum extensibility. Any Dict-like object can serve as a context.
 
-export new_constant!
+export new_constant!, ConstSymbolFactory, EvalContext
 public T, F
 
 ###############################################################################
@@ -15,6 +15,28 @@ using ..NodeASTs: ConstNode, AstTree, AstNode, AbsNode, IndexNode  # re-exported
 import ..NodeASTs: apply_node!
 
 using Bijections
+using TestItems
+
+"""
+    ConstSymbolFactory(; prefix=:c)
+
+Deterministic, **non-global** constant-name generator for SR/evaluation contexts.
+
+In multi-threaded symbolic regression, cross-individual global uniqueness is not
+useful and can become a source of shared mutable state. This factory generates
+names like `:c1`, `:c2`, ... and is intended to be **per-individual** or
+**per-evaluation**.
+"""
+mutable struct ConstSymbolFactory
+    counter::Int
+    prefix::Symbol
+end
+ConstSymbolFactory(; prefix::Symbol=:c) = ConstSymbolFactory(0, prefix)
+
+function _next_const_symbol!(f::ConstSymbolFactory)::Symbol
+    f.counter += 1
+    return Symbol(String(f.prefix), f.counter)
+end
 
 struct ConstantsMap
     globals::Dict{Symbol,Any}
@@ -55,6 +77,94 @@ function new_constant!(context::ConstantsMap, value)
     else
         name = gensym(:c)
         context.locals[name] = value
+        return ConstNode(name)
+    end
+end
+
+"""
+    new_constant!(context, value, factory::ConstSymbolFactory) -> ConstNode
+
+Deterministic variant of [`new_constant!`](@ref) that uses a user-supplied,
+non-global symbol factory instead of `gensym`.
+"""
+function new_constant!(context, value, factory::ConstSymbolFactory)
+    while true
+        name = _next_const_symbol!(factory)
+        haskey(context, name) && continue
+        context[name] = value
+        return ConstNode(name)
+    end
+end
+
+function new_constant!(context::ConstantsMap, value, factory::ConstSymbolFactory)
+    if hasvalue(context.locals, value)
+        return ConstNode(context.locals(value))
+    else
+        while true
+            name = _next_const_symbol!(factory)
+            haskey(context.locals, name) && continue
+            context.locals[name] = value
+            return ConstNode(name)
+        end
+    end
+end
+
+"""
+    EvalContext(; overlay, locals, globals, symfactory)
+
+Thread-safe evaluation context for `ConstNode` execution.
+
+Reads consult layered maps in the order:
+`overlay -> locals -> globals`.
+
+Writes (including `new_constant!`) go only to `overlay`.
+This makes it safe to run per-individual evaluations in parallel while sharing
+`globals` as read-only configuration.
+"""
+mutable struct EvalContext
+    overlay::Dict{Symbol,Any}
+    locals::Dict{Symbol,Any}
+    globals::Dict{Symbol,Any}
+    symfactory::ConstSymbolFactory
+end
+
+function EvalContext(;
+    overlay::Dict{Symbol,Any}=Dict{Symbol,Any}(),
+    locals::Dict{Symbol,Any}=Dict{Symbol,Any}(),
+    globals::Dict{Symbol,Any}=Dict{Symbol,Any}(),
+    symfactory::ConstSymbolFactory=ConstSymbolFactory(),
+)
+    return EvalContext(overlay, locals, globals, symfactory)
+end
+
+Base.haskey(ctx::EvalContext, key::Symbol) = haskey(ctx.overlay, key) || haskey(ctx.locals, key) || haskey(ctx.globals, key)
+function Base.getindex(ctx::EvalContext, key::Symbol)
+    if haskey(ctx.overlay, key)
+        return ctx.overlay[key]
+    elseif haskey(ctx.locals, key)
+        return ctx.locals[key]
+    elseif haskey(ctx.globals, key)
+        return ctx.globals[key]
+    end
+    throw(KeyError(key))
+end
+Base.setindex!(ctx::EvalContext, value, key::Symbol) = (ctx.overlay[key] = value)
+function Base.get(ctx::EvalContext, key::Symbol, default)
+    if haskey(ctx.overlay, key)
+        return ctx.overlay[key]
+    elseif haskey(ctx.locals, key)
+        return ctx.locals[key]
+    elseif haskey(ctx.globals, key)
+        return ctx.globals[key]
+    end
+    return default
+end
+
+function new_constant!(ctx::EvalContext, value)
+    while true
+        name = _next_const_symbol!(ctx.symfactory)
+        haskey(ctx, name) && continue
+        ctx.overlay[name] = value
         return ConstNode(name)
     end
 end
@@ -102,5 +212,46 @@ y = gensym(:y)
 const T = AstTree(AbsNode(x, AbsNode(y, IndexNode(1))))
 const F = AstTree(AbsNode(x, AbsNode(y, IndexNode(0))))
 COND(x) = x ? T : F
+
+########################################################
+# Test Items
+########################################################
+
+@testitem "EvalContext overlay write isolation + deterministic new_constant!" begin
+    using LambdaRegression.ASTs.Contexts: EvalContext, ConstSymbolFactory, new_constant!
+
+    globals = Dict{Symbol,Any}(:g => 1)
+    locals = Dict{Symbol,Any}(:l => 2)
+    overlay = Dict{Symbol,Any}(:o => 3)
+    ctx = EvalContext(overlay=overlay, locals=locals, globals=globals, symfactory=ConstSymbolFactory(prefix=:c))
+
+    ctx[:k] = 10
+    @test haskey(overlay, :k)
+    @test !haskey(globals, :k)
+    @test !haskey(locals, :k)
+
+    c1 = new_constant!(ctx, 42)
+    @test c1.name == :c1
+    @test ctx.overlay[:c1] == 42
+    @test !haskey(globals, :c1)
+end
+
+@testitem "EvalContext integrates with Reduce ConstNode evaluation" begin
+    using LambdaRegression.ASTs.Contexts: EvalContext, ConstSymbolFactory
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, ConstNode
+    using LambdaRegression.Reduces: beta_reduce!
+
+    globals = Dict{Symbol,Any}(:double => (x -> 2x))
+    overlay = Dict{Symbol,Any}(:three => 3)
+    ctx = EvalContext(overlay=overlay, globals=globals, symfactory=ConstSymbolFactory(prefix=:c))
+
+    tree = AstTree(AppNode(ConstNode(:double), ConstNode(:three)))
+    r = beta_reduce!(tree, ctx)
+    @test r == false
+    @test tree.root isa ConstNode
+    @test tree.root.name == :c1
+    @test ctx.overlay[:c1] == 6
+    @test !haskey(globals, :c1)
+end
 
 end # module Contexts
