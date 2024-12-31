@@ -768,7 +768,7 @@ function get_type_ctx(constants_ctx::Dict{Symbol, Any}, types_ctx::Dict{Symbol, 
         if !isnothing(result)
             types_ctx[key] = result
         else
-            warning("No type set for constant $key, please specify it manually.")
+            @warn "No type set for constant $key, please specify it manually."
         end
     end
     return types_ctx
