@@ -17,7 +17,8 @@ Design goals
   whose types are visible to individuals.
 
 Status
-- `fit!` is a stub (returns `Err(NotImplementedErr())`).
+- `fit!` implements a minimal typed population loop with injected `evaluate` and `loss`.
+- For observation hooks, `fit!` supports `callback(state)` and an optional `components.init_population(...)` hook.
 - Thread-safe primitives for SR paths live in `ASTs.Contexts.EvalContext` and
   `TypeSystem.make_tyvar_factory`.
 """
@@ -31,7 +32,7 @@ import Base.Threads
 using ..Utils: Err
 using ..TypeSystem
 using ..TypeSystem: Ty, TyLike, make_tyvar_factory, get_type_ctx
-using ..ASTs.Contexts: EvalContext, ConstSymbolFactory
+using ..ASTs.Contexts: EvalContext, ConstSymbolFactory, new_constant!
 using ..ASTs.NodeASTs: AstTree, AstNode, AppNode, AbsNode, ConstNode, IndexNode, SymbolGenerator
 using ..Reduces: beta_reduce!
 using ..GenerateTree
@@ -52,6 +53,9 @@ end
 struct NonConstOutputErr end
 struct MissingConstValueErr
     name::Symbol
+end
+struct NonClosedLambdaErr
+    f::Symbol
 end
 
 """
@@ -168,6 +172,111 @@ function _apply_inputs(program::AstTree, input_slots::Vector{Symbol})::AstTree
     return AstTree(node)
 end
 
+function _is_closed(node::AstNode, depth::Int)::Bool
+    if node isa IndexNode
+        return (node::IndexNode).index < depth
+    elseif node isa AbsNode
+        return _is_closed((node::AbsNode).body, depth + 1)
+    elseif node isa AppNode
+        n = node::AppNode
+        return _is_closed(n.func, depth) && _is_closed(n.arg, depth)
+    else
+        # ConstNode is always closed; VarNode indicates a free variable in our discipline.
+        return node isa ConstNode
+    end
+end
+
+_is_closed_abs(abs::AbsNode)::Bool = _is_closed(abs.body, 1)
+
+function _capture_env(ctx::EvalContext)::Dict{Symbol,Any}
+    env = Dict{Symbol,Any}()
+    merge!(env, ctx.globals)
+    merge!(env, ctx.locals)
+    merge!(env, ctx.overlay)
+    return env
+end
+
+struct LiftedClosure
+    ast::AstTree
+    captured_env::Dict{Symbol,Any}
+    make_eval_context
+    const_symfactory_ctor
+    max_steps::Int
+    closure_lift_max_per_pass::Int
+end
+
+function _normalize_with_lift!(tree::AstTree, ctx::EvalContext, components::NamedTuple, config::NamedTuple, steps::Int)::Bool
+    for _ in 1:steps
+        normalized = beta_reduce!(tree, ctx)
+        if normalized
+            progressed = closure_lift!(tree, ctx, components, config)
+            progressed || return true
+        end
+    end
+    return false
+end
+
+function (cl::LiftedClosure)(x)
+    call_ctx = cl.make_eval_context(;
+        overlay=Dict{Symbol,Any}(),
+        locals=Dict{Symbol,Any}(),
+        globals=cl.captured_env,
+        symfactory=cl.const_symfactory_ctor(),
+    )
+    arg = new_constant!(call_ctx, x)
+    call_tree = AstTree(AppNode(deepcopy(cl.ast.root), arg))
+    ok = _normalize_with_lift!(
+        call_tree,
+        call_ctx,
+        (; make_eval_context=cl.make_eval_context, const_symfactory_ctor=cl.const_symfactory_ctor),
+        (;
+            closure_lift_max_per_pass=cl.closure_lift_max_per_pass,
+            closure_max_reduce_steps=cl.max_steps,
+            max_reduce_steps=cl.max_steps,
+        ),
+        cl.max_steps,
+    )
+    ok || throw(MaxReduceStepsErr(cl.max_steps))
+    call_tree.root isa ConstNode || throw(NonConstOutputErr())
+    name = (call_tree.root::ConstNode).name
+    haskey(call_ctx, name) || throw(MissingConstValueErr(name))
+    return call_ctx[name]
+end
+
+function closure_lift!(tree::AstTree, ctx::EvalContext, components::NamedTuple, config::NamedTuple)::Bool
+    max_per_pass = get(config, :closure_lift_max_per_pass, 64)
+    lifted = Ref(0)
+
+    function visit(node::AstNode, under_abs::Bool)
+        under_abs && return
+        node isa AbsNode && return
+        if node isa AppNode
+            app = node::AppNode
+            if app.func isa ConstNode && app.arg isa AbsNode && lifted[] < max_per_pass
+                f = (app.func::ConstNode).name
+                abs = app.arg::AbsNode
+                _is_closed_abs(abs) || throw(NonClosedLambdaErr(f))
+                cl = LiftedClosure(
+                    AstTree(deepcopy(abs)),
+                    _capture_env(ctx),
+                    components.make_eval_context,
+                    components.const_symfactory_ctor,
+                    get(config, :closure_max_reduce_steps, get(config, :max_reduce_steps, 64)),
+                    max_per_pass,
+                )
+                app.arg = new_constant!(ctx, cl)
+                lifted[] += 1
+            end
+            visit(app.func, under_abs)
+            visit(app.arg, under_abs)
+        end
+        return
+    end
+
+    visit(tree.root, false)
+    return lifted[] > 0
+end
+
 """
     evaluate_default(ind::Individual, x, components, config) -> Union{Any,Err}
 
@@ -201,7 +310,7 @@ function evaluate_default(ind::Individual, x, components::NamedTuple, config::Na
 
     tree = _apply_inputs(ind.tree, input_slots)
     steps = get(config, :max_reduce_steps, 64)
-    normalized = beta_reduce!(tree, steps, ctx)
+    normalized = _normalize_with_lift!(tree, ctx, components, config, steps)
     normalized || return Err(MaxReduceStepsErr(steps))
 
     tree.root isa ConstNode || return Err(NonConstOutputErr())
@@ -275,6 +384,8 @@ function default_config(;
     error_threshold::Float64=1e-6,
     init_mutation_rounds::Int=1,
     max_reduce_steps::Int=64,
+    closure_max_reduce_steps::Int=max_reduce_steps,
+    closure_lift_max_per_pass::Int=64,
     mutation_rate::Float64=0.7,
     crossover_rate::Float64=0.2,
     elitism::Int=1,
@@ -290,6 +401,8 @@ function default_config(;
         error_threshold,
         init_mutation_rounds,
         max_reduce_steps,
+        closure_max_reduce_steps,
+        closure_lift_max_per_pass,
         mutation_rate,
         crossover_rate,
         elitism,
@@ -397,60 +510,68 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
     global_type_ctx = merge(components.global_consts_ty, components.input_types)
 
     # --- Init population ---
-    pop = Vector{Individual}(undef, N)
-    for i in 1:N
-        rng_i = derive_rng(seed, 0, i, :init_tree)
-        tyfactory = components.tyfactory_ctor()
-        symfactory = SymbolGenerator()
-        const_symfactory = components.const_symfactory_ctor()
-        local_consts = Dict{Symbol,Any}()
-        local_consts_ty = Dict{Symbol,TyLike}()
+    pop = if haskey(components, :init_population)
+        res = components.init_population(reg, data; N=N, seed=seed, global_type_ctx=global_type_ctx)
+        res isa Err && return res
+        length(res) == N || return Err(ArgumentError("init_population must return exactly N individuals"))
+        res
+    else
+        pop0 = Vector{Individual}(undef, N)
+        for i in 1:N
+            rng_i = derive_rng(seed, 0, i, :init_tree)
+            tyfactory = components.tyfactory_ctor()
+            symfactory = SymbolGenerator()
+            const_symfactory = components.const_symfactory_ctor()
+            local_consts = Dict{Symbol,Any}()
+            local_consts_ty = Dict{Symbol,TyLike}()
 
-        tree = GenerateTree.generate_tree(
-            reg.target_ty;
-            ctors=components.gen_ctors,
-            chooser=components.gen_chooser,
-            max_depth=components.gen_max_depth,
-            max_try=components.gen_max_try,
-            tyfactory=tyfactory,
-            symfactory=symfactory,
-            rng=rng_i,
-            global_consts_ty=global_type_ctx,
-            local_consts=local_consts,
-            local_consts_ty=local_consts_ty,
-        )
-        tree isa Err && return tree
-
-        cur_tree = tree
-        for _ in 1:config.init_mutation_rounds
-            rng_m = derive_rng(seed, 0, i, :init_mutate)
-            mutated = Mutations.mutate_tree(
-                cur_tree,
+            tree = GenerateTree.generate_tree(
                 reg.target_ty;
-                rng=rng_m,
-                mutations=components.mutations,
-                chooser=components.mutation_chooser,
-                provider=components.mutation_provider,
-                max_try=components.mutation_max_try,
-                prune_consts=components.mutation_prune_consts,
-                copy_tree=true,
-                copy_ctx=true,
+                ctors=components.gen_ctors,
+                chooser=components.gen_chooser,
+                max_depth=components.gen_max_depth,
+                max_try=components.gen_max_try,
+                tyfactory=tyfactory,
+                symfactory=symfactory,
+                rng=rng_i,
                 global_consts_ty=global_type_ctx,
                 local_consts=local_consts,
                 local_consts_ty=local_consts_ty,
-                gen_ctors=components.gen_ctors,
-                gen_chooser=components.gen_chooser,
-                gen_max_depth=components.gen_max_depth,
-                gen_max_try=components.gen_max_try,
-                tyfactory=tyfactory,
-                symfactory=symfactory,
-                const_symfactory=const_symfactory,
             )
-            mutated isa Err && break
-            cur_tree = mutated
-        end
+            tree isa Err && return tree
 
-        pop[i] = Individual(cur_tree, reg.target_ty; local_consts=local_consts, local_consts_ty=local_consts_ty, fitness=nothing, meta=(;))
+            cur_tree = tree
+            for _ in 1:config.init_mutation_rounds
+                rng_m = derive_rng(seed, 0, i, :init_mutate)
+                mutated = Mutations.mutate_tree(
+                    cur_tree,
+                    reg.target_ty;
+                    rng=rng_m,
+                    mutations=components.mutations,
+                    chooser=components.mutation_chooser,
+                    provider=components.mutation_provider,
+                    max_try=components.mutation_max_try,
+                    prune_consts=components.mutation_prune_consts,
+                    copy_tree=true,
+                    copy_ctx=true,
+                    global_consts_ty=global_type_ctx,
+                    local_consts=local_consts,
+                    local_consts_ty=local_consts_ty,
+                    gen_ctors=components.gen_ctors,
+                    gen_chooser=components.gen_chooser,
+                    gen_max_depth=components.gen_max_depth,
+                    gen_max_try=components.gen_max_try,
+                    tyfactory=tyfactory,
+                    symfactory=symfactory,
+                    const_symfactory=const_symfactory,
+                )
+                mutated isa Err && break
+                cur_tree = mutated
+            end
+
+            pop0[i] = Individual(cur_tree, reg.target_ty; local_consts=local_consts, local_consts_ty=local_consts_ty, fitness=nothing, meta=(;))
+        end
+        pop0
     end
 
     history = Any[]
@@ -470,7 +591,13 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
             total = 0.0
             count = 0
             for (xj, yj) in zip(data.X, data.Y)
-                yhat = eval_fn(ind, xj, components, config)
+                yhat = try
+                    eval_fn(ind, xj, components, config)
+                catch
+                    total += error_penalty
+                    count += 1
+                    continue
+                end
                 if yhat isa Err
                     total += error_penalty
                 else
@@ -519,6 +646,26 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
                 tree_str = sprint(show, MIME"text/plain"(), pop[i].tree)
                 println(io, "  [$rank] loss=$(losses[i]) nodes=$(complexities[i])  $tree_str")
             end
+        end
+
+        if callback !== nothing
+            state = (;
+                gen=g,
+                pop=pop,
+                losses=losses,
+                fitness=fitness,
+                complexities=complexities,
+                perm=perm,
+                gen_best_loss=gen_best_loss,
+                best=best,
+                best_loss=best_loss,
+                seed=seed,
+                components=components,
+                config=config,
+            )
+            cb_res = callback(state)
+            cb_res isa Err && return cb_res
+            cb_res === :stop && return FitResult(best, :stopped, "Stopped by callback", history)
         end
 
         gen_best_loss <= threshold && return FitResult(best, :threshold, "Reached error threshold", history)
@@ -645,6 +792,168 @@ end
     cfg = default_config(max_reduce_steps=20)
     y = evaluate_default(ind, x, comps, cfg)
     @test y == x
+end
+
+@testitem "Regression closure_lift unlocks AMAP with AST lambdas" begin
+    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
+    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, get_type_ctx
+    using LambdaRegression.Regression: evaluate_default, default_components, default_config
+    using LambdaRegression.TypeSystem
+
+    x = [1.0, -2.0, 3.0]
+    A = TyArray(TyNat(length(x)), FloatTy)
+    target_ty = TyFun(A, A)
+
+    inner = AbsNode(:y, AppNode(ConstNode(:SQR), IndexNode(0)))
+    body = AppNode(AppNode(ConstNode(:AMAP), inner), IndexNode(0))
+    tree = AstTree(AbsNode(:x, body))
+    ind = Individual(tree, target_ty; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}())
+
+    global_consts = Dict{Symbol,Any}(
+        :AMAP => TypeSystem.AMAP,
+        :SQR => TypeSystem.SQR,
+    )
+    comps = default_components(
+        global_consts=global_consts,
+        global_consts_ty=get_type_ctx(global_consts),
+        input_slots=Symbol[:x],
+        input_types=Dict{Symbol,TyLike}(:x => A),
+    )
+    cfg = default_config(max_reduce_steps=200, closure_max_reduce_steps=200)
+    y = evaluate_default(ind, x, comps, cfg)
+    @test y == [v * v for v in x]
+end
+
+@testitem "Regression non-closed lambda lift throws; fit! penalizes (non-fatal)" begin
+    using Random
+    using LambdaRegression.Utils: Err
+    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
+    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, get_type_ctx
+    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, GlobalConstCtor, ApplyLeafCtor, UniformChooser
+    using LambdaRegression.Mutations
+    using LambdaRegression.Regression: Regressor, SupervisedDataset, fit!, evaluate_default, default_components, default_config
+    using LambdaRegression.TypeSystem
+
+    x = [1.0, 2.0]
+    A = TyArray(TyNat(length(x)), FloatTy)
+    target_ty = TyFun(A, A)
+
+    # λx. AMAP (λy. #2) x   (inner lambda refers to an out-of-scope binder)
+    bad_inner = AbsNode(:y, IndexNode(2))
+    bad_body = AppNode(AppNode(ConstNode(:AMAP), bad_inner), IndexNode(0))
+    bad_tree = AstTree(AbsNode(:x, bad_body))
+
+    good_tree = AstTree(AbsNode(:x, IndexNode(0)))
+
+    global_consts = Dict{Symbol,Any}(:AMAP => TypeSystem.AMAP)
+    global_consts_ty = get_type_ctx(global_consts)
+
+    base = default_components(
+        global_consts=global_consts,
+        global_consts_ty=global_consts_ty,
+        input_slots=Symbol[:x],
+        input_types=Dict{Symbol,TyLike}(:x => A),
+    )
+    comps = merge(
+        base,
+        (;
+            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplyLeafCtor()],
+            gen_chooser=UniformChooser(),
+            gen_max_depth=5,
+            gen_max_try=10,
+            mutations=[Mutations.SubtreeReplaceMutation()],
+            mutation_chooser=Mutations.WeightedPairChooser(),
+            mutation_provider=Mutations.IndexedProvider(),
+            mutation_max_try=5,
+            mutation_prune_consts=true,
+            crossover_op=nothing,
+            init_population=(reg, data; N, seed, global_type_ctx) -> begin
+                pop = Vector{Individual}(undef, N)
+                pop[1] = Individual(bad_tree, reg.target_ty; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}())
+                pop[2] = Individual(good_tree, reg.target_ty; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}())
+                return pop
+            end,
+        ),
+    )
+
+    cfg = default_config(
+        population_size=2,
+        generations=1,
+        error_threshold=0.0,
+        max_reduce_steps=80,
+        closure_max_reduce_steps=80,
+        mutation_rate=0.0,
+        crossover_rate=0.0,
+        elitism=2,
+    )
+    data = SupervisedDataset([x], [[1.0, 2.0]])
+    reg = Regressor(target_ty, comps, cfg, MersenneTwister(2000))
+
+    @test_throws LambdaRegression.Regression.NonClosedLambdaErr evaluate_default(
+        Individual(bad_tree, target_ty; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}()),
+        x,
+        base,
+        cfg,
+    )
+
+    res = fit!(reg, data)
+    @test !(res isa Err)
+end
+
+@testitem "Regression fit! penalizes host primitive errors (non-fatal)" begin
+    using Random
+    using LambdaRegression.Utils: Err
+    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
+    using LambdaRegression.TypeSystem: TyFun, FloatTy, TyLike, get_type_ctx
+    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, GlobalConstCtor, ApplyLeafCtor, UniformChooser
+    using LambdaRegression.Mutations
+    using LambdaRegression.Regression: Regressor, SupervisedDataset, fit!, default_components, default_config
+
+    BOMB(x) = error("boom")
+
+    target_ty = TyFun(FloatTy, FloatTy)
+    tree = AstTree(AbsNode(:x, AppNode(ConstNode(:BOMB), IndexNode(0))))
+
+    global_consts = Dict{Symbol,Any}(:BOMB => BOMB)
+    base = default_components(
+        global_consts=global_consts,
+        global_consts_ty=Dict{Symbol,TyLike}(:BOMB => TyFun(FloatTy, FloatTy)),
+        input_slots=Symbol[:x],
+        input_types=Dict{Symbol,TyLike}(:x => FloatTy),
+    )
+    comps = merge(
+        base,
+        (;
+            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplyLeafCtor()],
+            gen_chooser=UniformChooser(),
+            gen_max_depth=5,
+            gen_max_try=10,
+            mutations=[Mutations.SubtreeReplaceMutation()],
+            mutation_chooser=Mutations.WeightedPairChooser(),
+            mutation_provider=Mutations.IndexedProvider(),
+            mutation_max_try=5,
+            mutation_prune_consts=true,
+            crossover_op=nothing,
+            init_population=(reg, data; N, seed, global_type_ctx) -> [Individual(tree, reg.target_ty; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}()) for _ in 1:N],
+        ),
+    )
+    cfg = default_config(
+        population_size=2,
+        generations=1,
+        error_threshold=0.0,
+        max_reduce_steps=40,
+        closure_max_reduce_steps=40,
+        mutation_rate=0.0,
+        crossover_rate=0.0,
+        elitism=2,
+    )
+    data = SupervisedDataset([1.0], [1.0])
+    reg = Regressor(target_ty, comps, cfg, MersenneTwister(2000))
+    res = fit!(reg, data)
+    @test !(res isa Err)
 end
 
 end # module Regression

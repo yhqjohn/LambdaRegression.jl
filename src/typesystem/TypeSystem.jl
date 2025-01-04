@@ -149,10 +149,15 @@ end
 
 """
     TyArray(len, elem)
-Fixed-length array type  `Array[len, elem]`, where `len` is a `TyNat` and `elem` is element type.
+Array type `Array[len, elem]`, where `elem` is the element type and `len` is either:
+- a concrete `TyNat(n)` (fixed length), or
+- a `TyVar` (length-polymorphic, to be unified/instantiated via `TyScheme`).
+
+This enables **length-polymorphic primitives** (e.g. `MAP :: ∀n. Array[n,a] → Array[n,b]`)
+while keeping datasets/tasks free to use concrete shapes like `TyArray(TyNat(n), ...)`.
 """
 struct TyArray <: Ty
-    len::TyNat
+    len::Ty
     elem::Ty
 end
 
@@ -283,7 +288,7 @@ function prune(t::Ty)::Ty
         elseif t isa TySum
             return TySum(_prune(t.left), _prune(t.right))
         elseif t isa TyArray
-            return TyArray(t.len, _prune(t.elem))
+            return TyArray(_prune(t.len), _prune(t.elem))
         elseif t isa TyNat
             return t
         elseif t isa TyList
@@ -331,7 +336,9 @@ function occurs(var::TyVar, ty::Ty, depth::Int=0)::Tuple{Bool,Bool}
         occ2, con2 = occurs(var, ty.right, depth + 1)
         return (occ1 || occ2, con1 || con2)
     elseif ty isa TyArray
-        return occurs(var, ty.elem, depth + 1)
+        occ1, con1 = occurs(var, ty.len, depth + 1)
+        occ2, con2 = occurs(var, ty.elem, depth + 1)
+        return (occ1 || occ2, con1 || con2)
     elseif ty isa TyNat
         return (false, false)
     elseif ty isa TyMu
@@ -413,9 +420,7 @@ function _unify!(t1::Ty, t2::Ty, seen::Set{Tuple{Ty,Ty}})
         @✓ _unify!(a.left, b.left, seen)
         @✓ _unify!(a.right, b.right, seen)
     elseif a isa TyArray && b isa TyArray
-        if a.len.value != b.len.value
-            return Err(MismatchError(a, b))
-        end
+        @✓ _unify!(a.len, b.len, seen)
         @✓ _unify!(a.elem, b.elem, seen)
     elseif a isa TyNat && b isa TyNat && a.value == b.value
         return nothing
@@ -460,7 +465,7 @@ function _inst(t::Ty, mapvar)
     elseif t isa TyList
         return TyList(_inst(t.elem, mapvar))
     elseif t isa TyArray
-        return TyArray(t.len, _inst(t.elem, mapvar))
+        return TyArray(_inst(t.len, mapvar), _inst(t.elem, mapvar))
     else
         return t
     end
@@ -516,6 +521,7 @@ function collect_free_vars(t::Ty)::Set{TyVar}
         elseif t isa TyList
             _collect_free_vars(t.elem)
         elseif t isa TyArray
+            _collect_free_vars(t.len)
             _collect_free_vars(t.elem)
         end
         return vars
@@ -845,6 +851,40 @@ LENGTH(xs) = length(xs)
 CASENILERR(f) = g -> (x ->(x isa _NilErr ? g(x) : f(x)))
 TOLIST(xs) = collect(xs)
 
+"""
+    AMAP(f) -> (xs -> ys)
+
+Curried array `map` primitive for fixed-length arrays (`TyArray`).
+
+This is intended as a **length-preserving** eliminator/builder for static-length
+arrays:
+
+- it does not require any type-level nat arithmetic (no `n-1`),
+- it keeps the length index `n` unchanged.
+"""
+AMAP(f) = xs -> map(f, xs)
+
+"""
+    AFOLDL(op) -> (init -> (xs -> acc))
+
+Curried left fold over fixed-length arrays (`TyArray`).
+
+`op` is expected to be curried: `op(acc)(x)`.
+"""
+AFOLDL(op) = init -> xs -> foldl((acc, x) -> op(acc)(x), xs; init=init)
+
+"""
+    LENF(xs) -> Float64
+
+Float length of an array. This is intentionally `Float`-typed to avoid requiring
+an `Int -> Float` conversion primitive.
+"""
+LENF(xs) = float(length(xs))
+
+FSIN(x) = sin(x)
+FSQRT(x) = sqrt(x)
+SQR(x) = x * x
+
 # Int and Float basic functions
 IEQ(x) = y -> x == y
 ILE(x) = y -> x <= y
@@ -885,6 +925,14 @@ get_type(::typeof(TAIL)) = ∀([_α], TyList(_α) → TyList(_α) + NilErr)
 get_type(::typeof(LENGTH)) = ∀([_α], TyList(_α) → IntTy)
 get_type(::typeof(CASENILERR)) = ∀([_α, _β], (_α → _β) → (NilErr → _β) → (_α + NilErr) → _β)
 get_type(::typeof(TOLIST)) = ∀([_α, _β], TyArray(_α, _β) → TyList(_β))
+
+get_type(::typeof(AMAP)) = ∀([_α, _β, _γ], (_β → _γ) → TyArray(_α, _β) → TyArray(_α, _γ))
+get_type(::typeof(AFOLDL)) = ∀([_α, _β, _γ], (_γ → _β → _γ) → _γ → TyArray(_α, _β) → _γ)
+get_type(::typeof(LENF)) = ∀([_α, _β], TyArray(_α, _β) → FloatTy)
+
+get_type(::typeof(FSIN)) = FloatTy → FloatTy
+get_type(::typeof(FSQRT)) = FloatTy → FloatTy
+get_type(::typeof(SQR)) = FloatTy → FloatTy
 
 get_type(::typeof(IEQ)) = IntDiscr
 get_type(::typeof(ILE)) = IntDiscr
@@ -1206,6 +1254,40 @@ end
     @test ty === BoolTy
 end
 
+@testitem "TyArray length polymorphism unify" begin
+    using LambdaRegression.TypeSystem
+    using LambdaRegression.TypeSystem: newtyvar, unify!, prune, get_type, TOLIST
+    using LambdaRegression.Utils: Err
+
+    # Length variable can unify with a concrete TyNat.
+    n = newtyvar(0)
+    t1 = TyArray(n, TypeSystem.FloatTy)
+    t2 = TyArray(TyNat(5), TypeSystem.FloatTy)
+    @test isnothing(unify!(t1, t2))
+    @test prune(n) == TyNat(5)
+
+    # Length mismatch remains a type error.
+    @test unify!(TyArray(TyNat(2), TypeSystem.FloatTy), TyArray(TyNat(3), TypeSystem.FloatTy)) isa Err
+
+    # Previously-broken polymorphic primitive is now representable.
+    @test get_type(TOLIST) isa TypeSystem.TyScheme
+end
+
+@testitem "TypeSystem Array HO primitives typing" begin
+    using LambdaRegression.TypeSystem
+    using LambdaRegression.TypeSystem: TyArray, TyNat, FloatTy, unify!, get_type
+
+    A = TyArray(TyNat(3), FloatTy)
+
+    map_ty = TypeSystem.instantiate(get_type(TypeSystem.AMAP), 0)
+    @test unify!(map_ty, (FloatTy → FloatTy) → A → A) === nothing
+
+    fold_ty = TypeSystem.instantiate(get_type(TypeSystem.AFOLDL), 0)
+    @test unify!(fold_ty, (FloatTy → FloatTy → FloatTy) → FloatTy → A → FloatTy) === nothing
+
+    lenf_ty = TypeSystem.instantiate(get_type(TypeSystem.LENF), 0)
+    @test unify!(lenf_ty, A → FloatTy) === nothing
+end
 
 # ------------------------------------------------------------
 # Advanced type invariance tests --------------------

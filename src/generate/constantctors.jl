@@ -75,7 +75,7 @@ struct FloatArrCtor <: AbstractConstCtor
 end
 FloatArrCtor() = FloatArrCtor(0.0, 1.0)
 initialize_ctx(::FloatArrCtor, ctx::NamedTuple) = _initialize_local_consts(ctx)
-isqualified(ty::Ty, ::FloatArrCtor, ctx::NamedTuple) = ty isa TyArray && ty.elem == TypeSystem.FloatTy
+isqualified(ty::Ty, ::FloatArrCtor, ctx::NamedTuple) = ty isa TyArray && ty.len isa TypeSystem.TyNat && ty.elem == TypeSystem.FloatTy
 construct_tree(ctor::FloatArrCtor, ty::TyArray, ctx::NamedTuple) = _new_typed_constant!(ctx, randn(ctx.rng, ty.len.value) .* ctor.std .+ ctor.mean, ty)
 
 struct IntArrCtor <: AbstractConstCtor
@@ -83,10 +83,10 @@ struct IntArrCtor <: AbstractConstCtor
 end
 IntArrCtor() = IntArrCtor(1:100)
 initialize_ctx(::IntArrCtor, ctx::NamedTuple) = _initialize_local_consts(ctx)
-isqualified(ty::Ty, ::IntArrCtor, ctx::NamedTuple) = ty isa TyArray && ty.elem == TypeSystem.IntTy
+isqualified(ty::Ty, ::IntArrCtor, ctx::NamedTuple) = ty isa TyArray && ty.len isa TypeSystem.TyNat && ty.elem == TypeSystem.IntTy
 construct_tree(ctor::IntArrCtor, ty::TyArray, ctx::NamedTuple) = _new_typed_constant!(ctx, rand(ctx.rng, ctor.range, ty.len.value), ty)
 
 struct BoolArrCtor <: AbstractConstCtor end
 initialize_ctx(::BoolArrCtor, ctx::NamedTuple) = _initialize_local_consts(ctx)
-isqualified(ty::Ty, ::BoolArrCtor, ctx::NamedTuple) = ty isa TyArray && ty.elem == TypeSystem.BoolTy
+isqualified(ty::Ty, ::BoolArrCtor, ctx::NamedTuple) = ty isa TyArray && ty.len isa TypeSystem.TyNat && ty.elem == TypeSystem.BoolTy
 construct_tree(::BoolArrCtor, ty::TyArray, ctx::NamedTuple) = _new_typed_constant!(ctx, rand(ctx.rng, ty.len.value) .< 0.5, ty)
