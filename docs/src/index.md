@@ -1,6 +1,6 @@
 # LambdaRegression.jl Documentation
 
-> **📖 Documentation Status**: This project is under active development. The primary documentation is provided through **module docstrings**, which contain comprehensive tutorials, design rationale, and usage examples.
+> **📚 Documentation Status**: This project is under active development. The primary documentation is provided through **module docstrings**, which contain comprehensive tutorials, design rationale, and usage examples.
 
 ## Quick Navigation
 
@@ -11,4 +11,5 @@
 ## Documentation Structure
 
 This documentation is **automatically generated from docstrings**. Each module's docstring serves as its complete tutorial and reference guide.
+
 

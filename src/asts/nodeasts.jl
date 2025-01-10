@@ -696,9 +696,26 @@ using .Parse: parse_lambda_literal, collect_constants!, parse_lambda, @terms
 # Test Items
 ########################################################
 
-@testitem "AstTree basic iteration" begin
+@testsnippet NodeASTsBaseImports begin
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, VarNode
+    using LambdaRegression.ASTs.NodeASTs: _index_to_italic
+    using LambdaRegression.ASTs.NodeASTs: AppNode, AbsNode, VarNode, setchild!
+    using LambdaRegression.ASTs.NodeASTs: AppNode, AbsNode, VarNode, ConstNode, _show_pretty
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, AncestorsState, ScopeState, AbstractionDepthState, getstate, AstNode
+    using LambdaRegression.Trees: traverse
+    using LambdaRegression.ASTs.NodeASTs: _index_to_italic, _display_var, _throw_children_boundserror, VarNode, ConstNode
+    using LambdaRegression.ASTs.NodeASTs: AppNode, AbsNode, LetNode, VarNode, setchild!
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, LetNode
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, IndexNode, eliminate_bound_variables!
+    using LambdaRegression.ASTs.NodeASTs: IndexNode, _show_pretty
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, VarNode, setroot!, root
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, eliminate_bound_variables!
+    using LambdaRegression.ASTs.Parse: parse_lambda
+    using LambdaRegression.ASTs.NodeASTs: AstTree, IndexNode, AbsNode, VarNode, shift_free_variables!
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, VarNode, IndexNode, AppNode, apply_node!
+end
 
+@testitem "AstTree basic iteration" setup=[NodeASTsBaseImports] begin
     var_x = VarNode(:x)
     var_y = VarNode(:y)
     app   = AppNode(var_x, var_y)
@@ -708,9 +725,7 @@ using .Parse: parse_lambda_literal, collect_constants!, parse_lambda, @terms
     @test result == [app, var_x, var_y]
 end
 
-@testitem "Symbol generation edge cases" begin
-    using LambdaRegression.ASTs.NodeASTs: _index_to_italic
-
+@testitem "Symbol generation edge cases" setup=[NodeASTsBaseImports] begin
     # Test edge cases for _index_to_italic (complex logic worth testing)
     @test _index_to_italic(0) == "𝑎"
     @test _index_to_italic(25) == "𝑧"
@@ -718,9 +733,7 @@ end
     @test _index_to_italic(27) == "𝑎𝑏"
 end
 
-@testitem "setchild! bounds checking" begin
-    using LambdaRegression.ASTs.NodeASTs: AppNode, AbsNode, VarNode, setchild!
-
+@testitem "setchild! bounds checking" setup=[NodeASTsBaseImports] begin
     # Test bounds errors (important error-handling logic)
     var_x = VarNode(:x)
     var_y = VarNode(:y)
@@ -736,9 +749,7 @@ end
     @test_throws BoundsError setchild!(var_x, 1, var_y)
 end
 
-@testitem "Display precedence rules" begin
-    using LambdaRegression.ASTs.NodeASTs: AppNode, AbsNode, VarNode, ConstNode, _show_pretty
-
+@testitem "Display precedence rules" setup=[NodeASTsBaseImports] begin
     # Test complex precedence handling (important logic worth testing)
     var_x = VarNode(:x)
     const_pi = ConstNode(:pi)
@@ -755,10 +766,7 @@ end
     @test _show_pretty(nested_app) == "f x y"
 end
 
-@testitem "Traversal state system functionality" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, AncestorsState, ScopeState, AbstractionDepthState, getstate, AstNode
-    using LambdaRegression.Trees: traverse
-
+@testitem "Traversal state system functionality" setup=[NodeASTsBaseImports] begin
     # === Test 1: Basic state dependency resolution ===
     # Create simple test tree: λx. x
     var_x1 = VarNode(:x)
@@ -912,9 +920,7 @@ end
     end
 end
 
-@testitem "Edge cases and error handling" begin
-    using LambdaRegression.ASTs.NodeASTs: _index_to_italic, _display_var, _throw_children_boundserror, VarNode, ConstNode
-
+@testitem "Edge cases and error handling" setup=[NodeASTsBaseImports] begin
     # Test _index_to_italic edge cases
     @test _index_to_italic(0) == "𝑎"
     @test _index_to_italic(25) == "𝑧" 
@@ -941,9 +947,7 @@ end
     @test_throws BoundsError _throw_children_boundserror(var_node, 100)
 end
 
-@testitem "Complex display precedence" begin
-    using LambdaRegression.ASTs.NodeASTs: AppNode, AbsNode, VarNode, ConstNode, _show_pretty
-
+@testitem "Complex display precedence" setup=[NodeASTsBaseImports] begin
     # Test complex precedence scenarios
     var_f = VarNode(:f)
     var_x = VarNode(:x)
@@ -969,9 +973,7 @@ end
     @test _show_pretty(outer_abs, 3) == "(λx·λy·x y)"
 end
 
-@testitem "setchild! actual modifications" begin
-    using LambdaRegression.ASTs.NodeASTs: AppNode, AbsNode, LetNode, VarNode, setchild!
-
+@testitem "setchild! actual modifications" setup=[NodeASTsBaseImports] begin
     # Test that setchild! actually modifies the fields (currently 0 coverage)
     var_x = VarNode(:x)
     var_y = VarNode(:y)
@@ -990,9 +992,7 @@ end
     @test abs_node.body === var_y
 end
 
-@testitem "Display methods and show functions" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, LetNode
-
+@testitem "Display methods and show functions" setup=[NodeASTsBaseImports] begin
     # Test Base.show methods (currently untested)
     var_x = VarNode(:x)
     const_pi = ConstNode(:pi)
@@ -1043,9 +1043,7 @@ end
     @test String(take!(io)) == "λf·x"
 end
 
-@testitem "eliminate_bound_variables! functionality" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, IndexNode, eliminate_bound_variables!
-
+@testitem "eliminate_bound_variables! functionality" setup=[NodeASTsBaseImports] begin
     # Test simple case: λx. x should become λx. #0
     var_x = VarNode(:x)
     abs_node = AbsNode(:x, var_x)
@@ -1116,9 +1114,7 @@ end
     @test inner_app.arg.index == 0   # z is at current level
 end
 
-@testitem "IndexNode display" begin
-    using LambdaRegression.ASTs.NodeASTs: IndexNode, _show_pretty
-
+@testitem "IndexNode display" setup=[NodeASTsBaseImports] begin
     # Test IndexNode pretty display (currently untested)
     index_0 = IndexNode(0)
     index_1 = IndexNode(1)
@@ -1129,9 +1125,7 @@ end
     @test _show_pretty(index_10, 0) == "#10"
 end
 
-@testitem "Tree manipulation with setroot!" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, VarNode, setroot!, root
-
+@testitem "Tree manipulation with setroot!" setup=[NodeASTsBaseImports] begin
     # Test setroot! with node
     var_x = VarNode(:x)
     var_y = VarNode(:y)
@@ -1149,10 +1143,7 @@ end
     @test root(tree) === app
 end
 
-@testitem "eliminate_bound_variables! edge cases" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, eliminate_bound_variables!
-    using LambdaRegression.ASTs.Parse: parse_lambda
-    
+@testitem "eliminate_bound_variables! edge cases" setup=[NodeASTsBaseImports] begin
     tree_free = parse_lambda("f g pie")
     new_tree = deepcopy(tree_free)
     eliminate_bound_variables!(new_tree)
@@ -1175,9 +1166,7 @@ end
     @test tree_deep == AstTree(AbsNode(:a, AbsNode(:b, AbsNode(:a, AppNode(IndexNode(0), IndexNode(1))))))
 end
 
-@testitem "shift_free_variables! functionality" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, IndexNode, AbsNode, VarNode, shift_free_variables!
-
+@testitem "shift_free_variables! functionality" setup=[NodeASTsBaseImports] begin
     # Test basic free variable shifting: #1 at depth 0 shifts to #2
     index_1 = IndexNode(1)
     tree_simple = AstTree(index_1)
@@ -1199,9 +1188,7 @@ end
     @test var_tree.root isa VarNode && var_tree.root.name == :x
 end
 
-@testitem "apply_node! functionality" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, VarNode, IndexNode, AppNode, apply_node!
-
+@testitem "apply_node! functionality" setup=[NodeASTsBaseImports] begin
     # Test simple substitution with VarNode
     abs_identity = AbsNode(:x, VarNode(:x))
     result_tree = apply_node!(AstTree(abs_identity), abs_identity, VarNode(:y))
@@ -1234,9 +1221,7 @@ end
     @test result_nested.root.body.index == 1  # #0 shifted to #1
 end
 
-@testitem "apply_node! with IndexNode substitution" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, VarNode, IndexNode, AppNode, apply_node!
-
+@testitem "apply_node! with IndexNode substitution" setup=[NodeASTsBaseImports] begin
     # Identity function represented with IndexNode
     abs_identity_idx = AbsNode(:x, IndexNode(0))  # λx. #0
     result_identity = apply_node!(AstTree(abs_identity_idx), abs_identity_idx, VarNode(:y))

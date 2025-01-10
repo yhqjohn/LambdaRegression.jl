@@ -19,8 +19,7 @@ This module models mutation as choosing a pair `(mutation, site)` and applying i
 1. **Site provider** (`AbstractSiteProvider`):
    - Computes and stores a list of mutation sites for a given tree, including
      parent pointers, scope depth, and the inferred type of each node.
-   - May be a simple on-demand scan (`OnDemandProvider`) or an indexed cache
-     (`IndexedProvider`).
+   - `IndexedProvider` builds a practical baseline index (`sites_all` + `sites_by_kind`).
 
 2. **Pair chooser** (`AbstractPairChooser`):
    - Selects a mutation operator and a compatible site.
@@ -62,7 +61,7 @@ Quickstart
 using Random
 using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
 using LambdaRegression.TypeSystem: TyFun, IntTy
-using LambdaRegression.GenerateTree: IndexCtor, UniformChooser
+using LambdaRegression.GenerateTree: IndexCtor, FocusedChooser
 using LambdaRegression.Mutations: mutate_tree, ConstMutation, PointMutation, SubtreeReplaceMutation
 using LambdaRegression.TypeSystem: TyLike
 
@@ -77,7 +76,7 @@ mutated = mutate_tree(
     local_consts_ty=Dict{Symbol,TyLike}(),
     local_consts=Dict{Symbol,Any}(),
     gen_ctors=[IndexCtor()],
-    gen_chooser=UniformChooser(),
+    gen_chooser=FocusedChooser(),
     mutations=[SubtreeReplaceMutation(), PointMutation(), ConstMutation()],
 )
 ```
@@ -94,18 +93,20 @@ using ..ASTs.NodeASTs
 using ..ASTs.CSE: canonicalize, eliminate_expression!
 import ..ASTs.NodeASTs: apply_node!, shift_free_variables!
 using ..ASTs.Contexts: new_constant!, ConstSymbolFactory
-using ..Trees: traverse, PointerState, getstate, Break, setroot!, setchild!
+using ..Trees: traverse, PointerState, StackState, getstate, Break, setroot!, setchild!, children
 using ..GenerateTree
 
 export mutate_tree
 export AbstractMutation, required_site_kinds, is_site_eligible, apply
-export AbstractSiteProvider, OnDemandProvider, IndexedProvider
+export AbstractSiteProvider, IndexedProvider
 export AbstractPairChooser, WeightedPairChooser
 export BloatPolicy, AdaptivePolicy
+export MutationAttemptRecorder, mutation_recorder_summary
 export prune_local_consts!
 export ConstMutation, ScalarConstMutation, BoolConstMutation, ArrayConstMutation
 export PointMutation, SubtreeReplaceMutation
-export BetaReduceMutation, EtaReduceMutation, CSEMutation
+export BetaReduceMutation, EtaReduceMutation, EtaExpandMutation, CSEMutation
+export CondAppPullMutation, CondAppPushMutation
 export Populations
 
 struct MaxTryReachedErr end
@@ -131,6 +132,7 @@ Mutation site metadata derived from a typed traversal of an `AstTree`.
 `Site` is the *adapter* between typing/scope information and mutation operators.
 
 # Fields
+- `path`: stable 1-based child-index path from root (`Int[]` means root)
 - `node`: current AST node
 - `parent`: parent AST node (or `nothing` for root)
 - `child_index`: 1-based child index in `parent` (from `PointerState`)
@@ -141,6 +143,7 @@ Mutation site metadata derived from a typed traversal of an `AstTree`.
 - `binder_types`: enclosing binder argument types, ordered outer → inner
 """
 struct Site
+    path::Vector{Int}
     node::AstNode
     parent::Union{Nothing,AstNode}
     child_index::Int                 # 1-based child index in `parent` (PointerState)
@@ -313,6 +316,75 @@ mutable struct MutationEnv
     bloat_policy::BloatPolicy
 end
 
+########################################################
+# Low-overhead mutation attempt recording (optional)
+########################################################
+
+const MUTATION_REASONS = (
+    :success,
+    :apply_err,
+    :infer_err,
+    :incompatible,
+    :bloat_exceeded,
+    :no_eligible_site,
+    :choose_err,
+    :prepare_err,
+    :max_try_exhausted,
+)
+
+const _MUTATION_REASON_INDEX = Dict{Symbol,Int}((r => i for (i, r) in pairs(MUTATION_REASONS))...)
+
+mutable struct MutationAttemptRecorder
+    totals::Vector{Int}
+    by_mutation::Dict{DataType,Vector{Int}}
+    by_error_type::Union{Nothing,Dict{DataType,Int}}
+end
+
+MutationAttemptRecorder(; record_error_types::Bool=false) =
+    MutationAttemptRecorder(zeros(Int, length(MUTATION_REASONS)), Dict{DataType,Vector{Int}}(), record_error_types ? Dict{DataType,Int}() : nothing)
+
+@inline function _counts!(rec::MutationAttemptRecorder, T::DataType)
+    return get!(rec.by_mutation, T) do
+        zeros(Int, length(MUTATION_REASONS))
+    end
+end
+
+@inline function record!(::Nothing, ::Union{Nothing,DataType}, ::Symbol; err_type::Union{Nothing,DataType}=nothing)
+    return nothing
+end
+
+@inline function record!(rec::MutationAttemptRecorder, mutation_type::Union{Nothing,DataType}, reason::Symbol; err_type::Union{Nothing,DataType}=nothing)
+    idx = get(_MUTATION_REASON_INDEX, reason, 0)
+    idx == 0 && return nothing
+    @inbounds rec.totals[idx] += 1
+    if mutation_type !== nothing
+        counts = _counts!(rec, mutation_type)
+        @inbounds counts[idx] += 1
+    end
+    if err_type !== nothing && rec.by_error_type !== nothing
+        rec.by_error_type[err_type] = get(rec.by_error_type, err_type, 0) + 1
+    end
+    return nothing
+end
+
+function mutation_recorder_summary(rec::MutationAttemptRecorder; topk::Int=8)
+    totals = (;
+        (r => rec.totals[i] for (i, r) in pairs(MUTATION_REASONS))...,
+    )
+    items = collect(rec.by_mutation)
+    sort!(items; by=kv -> -kv[2][_MUTATION_REASON_INDEX[:success]])
+    k = min(topk, length(items))
+    per = Any[]
+    for j in 1:k
+        (T, counts) = items[j]
+        push!(per, (;
+            mutation_type=T,
+            counts=(; (r => counts[i] for (i, r) in pairs(MUTATION_REASONS))...,),
+        ))
+    end
+    return (; totals, per_mutation=per)
+end
+
 function _stat(env::MutationEnv, m::AbstractMutation)
     T = typeof(m)
     return get!(env.stats, T) do
@@ -387,59 +459,45 @@ function _binder_types(scope, meta)::Vector{Ty}
     return tys
 end
 
+function _node_at_path(tree::AstTree, path::Vector{Int})::AstNode
+    node = tree.root
+    for idx in path
+        node = children(node)[idx]
+    end
+    return node
+end
+
+function _remap_site(tree::AstTree, site::Site)::Site
+    node = _node_at_path(tree, site.path)
+    if isempty(site.path)
+        return Site(site.path, node, nothing, 1, site.depth, site.kind, site.ty, site.binder_types)
+    end
+    parent_path = site.path[1:end-1]
+    parent = _node_at_path(tree, parent_path)
+    return Site(site.path, node, parent, site.path[end], site.depth, site.kind, site.ty, site.binder_types)
+end
+
 function _collect_sites(tree::AstTree, meta::Dict{AstNode,Tuple{TyLike,TyLike}}, ctx::NamedTuple)
     sites = Site[]
     traverse(tree, PointerState{AstNode}, ScopeState) do t, node, bag
         pointer = getstate(bag, PointerState{AstNode})
+        stack = getstate(bag, StackState{AstNode})
         scope = getstate(bag, ScopeState)
         haskey(meta, node) || return nothing
         node_ty = meta[node][1]
         binder_types = _binder_types(scope, meta)
         kind = _site_kind(node, ctx)
-        push!(sites, Site(node, pointer.parent, pointer.child_index, length(binder_types), kind, node_ty, binder_types))
+        path =
+            if length(stack.stack) <= 1
+                Int[]
+            else
+                [stack.stack[i][2] for i in 1:(length(stack.stack)-1)]
+            end
+        push!(sites, Site(path, node, pointer.parent, pointer.child_index, length(binder_types), kind, node_ty, binder_types))
         return nothing
     end
     return sites
 end
-
-"""
-    OnDemandProvider() <: AbstractSiteProvider
-
-Baseline site provider.
-
-Implementation note: despite the name, this provider currently computes the full
-site list in `prepare!` (and builds a minimal `kind` index). It exists as the
-simple, low-optimization baseline and can be expanded later if needed.
-"""
-mutable struct OnDemandProvider <: AbstractSiteProvider
-    sites_all::Vector{Site}
-    sites_kind::Dict{Symbol,Vector{Site}}
-end
-OnDemandProvider() = OnDemandProvider(Site[], Dict{Symbol,Vector{Site}}())
-
-function reset!(p::OnDemandProvider)
-    empty!(p.sites_all)
-    empty!(p.sites_kind)
-    return p
-end
-
-function prepare!(p::OnDemandProvider, tree::AstTree, type_ctx::Dict{Symbol,<:TyLike}, env::MutationEnv, ctx::NamedTuple)
-    reset!(p)
-    meta = Dict{AstNode,Tuple{TyLike,TyLike}}()
-    factory = haskey(ctx, :tyfactory) ? ctx.tyfactory : newtyvar
-    ty = infer(tree, type_ctx, factory, meta)
-    ty isa Err && return ty
-    env.meta = meta
-    p.sites_all = _collect_sites(tree, meta, ctx)
-    for s in p.sites_all
-        push!(get!(p.sites_kind, :any, Site[]), s)
-        s.kind === :any || push!(get!(p.sites_kind, s.kind, Site[]), s)
-    end
-    return nothing
-end
-
-sites(p::OnDemandProvider) = p.sites_all
-sites_by_kind(p::OnDemandProvider, kind::Symbol) = get(p.sites_kind, kind, Site[])
 
 """
     IndexedProvider() <: AbstractSiteProvider
@@ -506,9 +564,10 @@ Selection model:
   - `BoolConstMutation => 0.05`
   - `SubtreeReplaceMutation => 0.20`
   - `PointMutation => 0.10`
-  - `CSEMutation => 0.08`
-  - `BetaReduceMutation => 0.04`
-  - `EtaReduceMutation => 0.03`
+- `CSEMutation => 0.08`
+- `BetaReduceMutation => 0.04`
+- `EtaExpandMutation => 0.03`
+- `EtaReduceMutation => 0.03`
 - `cache_eligibility::Bool=false`: cache eligible site lists per mutation within
   one `mutate_tree` call (Milestone C).
 
@@ -522,22 +581,23 @@ struct WeightedPairChooser <: AbstractPairChooser
 end
 
 function WeightedPairChooser(; weights::Union{Nothing,Dict{DataType,Float64}}=nothing, cache_eligibility::Bool=false)
-    default = Dict{DataType,Float64}(
-        # Split constant operators (preferred).
-        ScalarConstMutation => 0.25,
-        ArrayConstMutation => 0.25,
-        BoolConstMutation => 0.05,
+	    default = Dict{DataType,Float64}(
+	        # Split constant operators (preferred).
+	        ScalarConstMutation => 0.25,
+	        ArrayConstMutation => 0.25,
+	        BoolConstMutation => 0.05,
         # Backwards-compatible wrapper.
         ConstMutation => 0.55,
 
         SubtreeReplaceMutation => 0.20,
         PointMutation => 0.10,
-        CSEMutation => 0.08,
-        BetaReduceMutation => 0.04,
-        EtaReduceMutation => 0.03,
-    )
-    return WeightedPairChooser(weights === nothing ? default : weights, cache_eligibility)
-end
+	        CSEMutation => 0.08,
+	        BetaReduceMutation => 0.04,
+	        EtaExpandMutation => 0.03,
+	        EtaReduceMutation => 0.03,
+	    )
+	    return WeightedPairChooser(weights === nothing ? default : weights, cache_eligibility)
+	end
 
 function _eligible_sites(m::AbstractMutation, provider::AbstractSiteProvider, env::MutationEnv, ctx::NamedTuple)
     if env.cache_eligibility && haskey(env.eligibility_cache, m)
@@ -570,7 +630,6 @@ function choose_pair(chooser::WeightedPairChooser,
     ctx::NamedTuple,
 )
     env.cache_eligibility = chooser.cache_eligibility
-    env.eligibility_cache = IdDict{Any,Any}()
 
     masses = Float64[]
     payloads = Any[]
@@ -843,99 +902,6 @@ function apply(m::ConstMutation, tree::AstTree, site::Site, env::MutationEnv, ct
     return apply(_const_delegate(m, value), tree, site, env, ctx)
 end
 
-# Legacy constant mutation implementation (disabled).
-if false
-
-_is_float_ty(t::Ty) = t == FloatTy
-_is_int_ty(t::Ty) = t == IntTy
-_is_bool_ty(t::Ty) = t == BoolTy
-
-"""
-    ConstMutation(; σ=0.1) <: AbstractMutation
-
-Mutate a *single* local constant node by creating a fresh constant symbol/value
-and replacing the node (单点常数变异).
-
-This avoids the “same name appears in multiple places → all change together”
-pitfall. Combine with `prune_local_consts!` (enabled by default in `mutate_tree`)
-to control container growth.
-
-Currently supported local constant types:
-- `FloatTy`: add noise or scale with Gaussian noise
-- `IntTy`: ±1 offset
-- `TyArray(_, FloatTy)` / `TyArray(_, IntTy)`: element-wise noise/offset
-- `TyArray(_, TyArray(_, FloatTy))`: matrix-like (array-of-array) element-wise noise
-"""
-struct ConstMutation <: AbstractMutation
-    σ::Float64
-end
-ConstMutation(; σ::Float64=0.1) = ConstMutation(σ)
-required_site_kinds(::ConstMutation) = Symbol[:const_local]
-
-function _mutate_value(rng::AbstractRNG, value, ty::Ty, σ::Float64)
-    if _is_float_ty(ty)
-        v = value
-        mode = rand(rng, 1:2)
-        if mode == 1
-            noise = convert(typeof(v), randn(rng) * σ)
-            return v + noise
-        else
-            noise = convert(typeof(v), randn(rng) * σ)
-            return v * (one(typeof(v)) + noise)
-        end
-    elseif _is_int_ty(ty)
-        return value + rand(rng, (-1, 1))
-    elseif ty isa TyArray && _is_float_ty(ty.elem)
-        a = value
-        a2 = copy(a)
-        for i in eachindex(a2)
-            a2[i] = a2[i] + convert(typeof(a2[i]), randn(rng) * σ)
-        end
-        return a2
-    elseif ty isa TyArray && _is_int_ty(ty.elem)
-        a = value
-        a2 = copy(a)
-        for i in eachindex(a2)
-            a2[i] = a2[i] + rand(rng, (-1, 1))
-        end
-        return a2
-    elseif ty isa TyArray && ty.elem isa TyArray && _is_float_ty((ty.elem::TyArray).elem)
-        a = value
-        a2 = [copy(row) for row in a]
-        for row in a2
-            for i in eachindex(row)
-                row[i] = row[i] + convert(typeof(row[i]), randn(rng) * σ)
-            end
-        end
-        return a2
-    else
-        return Err(UnsupportedConstTyErr(ty))
-    end
-end
-
-function is_site_eligible(m::ConstMutation, site::Site, env::MutationEnv, ctx::NamedTuple)
-    site.node isa ConstNode || return false
-    _is_local_const(site.node.name, ctx) || return false
-    return true
-end
-
-function apply(m::ConstMutation, tree::AstTree, site::Site, env::MutationEnv, ctx::NamedTuple)
-    node = site.node::ConstNode
-    name = node.name
-    _is_local_const(name, ctx) || return Err(NoEligibleSiteErr())
-    value = ctx.local_consts[name]
-    ty = site.ty
-    new_value = _mutate_value(env.rng, value, ty, m.σ)
-    new_value isa Err && return new_value
-    factory = haskey(ctx, :const_symfactory) ? ctx.const_symfactory : ConstSymbolFactory()
-    new_node = new_constant!(ctx.local_consts, new_value, factory)
-    ctx.local_consts_ty[new_node.name] = ty
-    _replace_site!(tree, site, AstTree(new_node))
-    return tree
-end
-
-end # if false
-
 """
     PointMutation() <: AbstractMutation
 
@@ -1094,6 +1060,137 @@ function apply(::EtaReduceMutation, tree::AstTree, site::Site, env::MutationEnv,
 end
 
 """
+    EtaExpandMutation() <: AbstractMutation
+
+Safe eta expansion (η-expansion) at a function-typed site.
+
+Rewrites `f` to `λx. f #0`, preserving the inferred type (up to `iscompatible`),
+while increasing structural depth for later CSE/beta moves.
+
+Eligibility: `site.ty` must be (prune-)function-shaped and `site.node` must not be
+an `AbsNode` (to avoid introducing an immediate beta-redex).
+"""
+struct EtaExpandMutation <: AbstractMutation end
+required_site_kinds(::EtaExpandMutation) = Symbol[:any]
+
+function is_site_eligible(::EtaExpandMutation, site::Site, ::MutationEnv, ::NamedTuple)
+    TypeSystem.prune(site.ty) isa TyFun || return false
+    site.node isa AbsNode && return false
+    return true
+end
+
+function apply(::EtaExpandMutation, tree::AstTree, site::Site, env::MutationEnv, ctx::NamedTuple)
+    is_site_eligible(EtaExpandMutation(), site, env, ctx) || return Err(NoEligibleSiteErr())
+    f_tree = AstTree(deepcopy(site.node))
+    shift_free_variables!(f_tree, 1, 0)
+    name = haskey(ctx, :symfactory) ? ctx.symfactory() : SymbolGenerator()()
+    new_subtree = AbsNode(name, AppNode(f_tree.root, IndexNode(0)))
+    _replace_site!(tree, site, AstTree(new_subtree))
+    return tree
+end
+
+"""
+    CondAppPullMutation() <: AbstractMutation
+
+Semantics-preserving commuting conversion for `COND` (pull application out):
+
+`COND b (f x) (g x)`  ↦  `(COND b f g) x`
+
+This is useful when `COND` is polymorphic (so it can be instantiated at a function type),
+allowing later `EtaReduceMutation` to turn `λx. COND b (f x) (g x)` into `COND b f g`.
+
+Eligibility: matches the literal application spine `((COND b) (f x)) (g x)` with the
+same argument `x` in both branches.
+"""
+struct CondAppPullMutation <: AbstractMutation end
+required_site_kinds(::CondAppPullMutation) = Symbol[:app]
+
+function is_site_eligible(::CondAppPullMutation, site::Site, ::MutationEnv, ::NamedTuple)
+    site.node isa AppNode || return false
+    outer = site.node::AppNode # ((COND b then) else)
+    outer.func isa AppNode || return false
+    mid = outer.func::AppNode  # (COND b then)
+    mid.func isa AppNode || return false
+    head = mid.func::AppNode   # (COND b)
+    head.func isa ConstNode || return false
+    (head.func::ConstNode).name == :COND || return false
+
+    then_branch = mid.arg
+    else_branch = outer.arg
+    then_branch isa AppNode || return false
+    else_branch isa AppNode || return false
+    (then_branch::AppNode).arg == (else_branch::AppNode).arg || return false
+    return true
+end
+
+function apply(::CondAppPullMutation, tree::AstTree, site::Site, env::MutationEnv, ctx::NamedTuple)
+    is_site_eligible(CondAppPullMutation(), site, env, ctx) || return Err(NoEligibleSiteErr())
+    outer = site.node::AppNode
+    mid = outer.func::AppNode
+    head = mid.func::AppNode
+    then_branch = mid.arg::AppNode
+    else_branch = outer.arg::AppNode
+
+    b = deepcopy(head.arg)
+    f = deepcopy(then_branch.func)
+    g = deepcopy(else_branch.func)
+    x = deepcopy(then_branch.arg)
+    new_subtree = AppNode(AppNode(AppNode(AppNode(ConstNode(:COND), b), f), g), x)
+    _replace_site!(tree, site, AstTree(new_subtree))
+    return tree
+end
+
+"""
+    CondAppPushMutation() <: AbstractMutation
+
+Inverse commuting conversion for `COND` (push application into both branches):
+
+`(COND b f g) x`  ↦  `COND b (f x) (g x)`
+
+This can increase tree size; it is *not* enabled by default in `_default_mutations()`.
+
+Eligibility: matches the literal application spine `(((COND b) f) g) x`.
+"""
+struct CondAppPushMutation <: AbstractMutation end
+required_site_kinds(::CondAppPushMutation) = Symbol[:app]
+
+function is_site_eligible(::CondAppPushMutation, site::Site, ::MutationEnv, ::NamedTuple)
+    site.node isa AppNode || return false
+    outer = site.node::AppNode # (cond3 x)
+    outer.func isa AppNode || return false
+    cond3 = outer.func::AppNode # ((COND b f) g)
+    cond3.func isa AppNode || return false
+    cond2 = cond3.func::AppNode # (COND b f)
+    cond2.func isa AppNode || return false
+    head = cond2.func::AppNode  # (COND b)
+    head.func isa ConstNode || return false
+    (head.func::ConstNode).name == :COND || return false
+    return true
+end
+
+function apply(::CondAppPushMutation, tree::AstTree, site::Site, env::MutationEnv, ctx::NamedTuple)
+    is_site_eligible(CondAppPushMutation(), site, env, ctx) || return Err(NoEligibleSiteErr())
+    outer = site.node::AppNode
+    x = deepcopy(outer.arg)
+    cond3 = outer.func::AppNode
+    cond2 = cond3.func::AppNode
+    head = cond2.func::AppNode
+
+    b = deepcopy(head.arg)
+    f = deepcopy(cond2.arg)
+    g = deepcopy(cond3.arg)
+    new_subtree = AppNode(
+        AppNode(
+            AppNode(ConstNode(:COND), b),
+            AppNode(f, deepcopy(x)),
+        ),
+        AppNode(g, x),
+    )
+    _replace_site!(tree, site, AstTree(new_subtree))
+    return tree
+end
+
+"""
     CSEMutation(; min_count=1) <: AbstractMutation
 
 Semantics-preserving common subexpression extraction.
@@ -1200,6 +1297,7 @@ function _default_mutations()
         PointMutation(),
         CSEMutation(),
         BetaReduceMutation(),
+        EtaExpandMutation(),
         EtaReduceMutation(),
     ]
 end
@@ -1247,7 +1345,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     local_consts_ty::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     local_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
     gen_ctors::Vector{<:GenerateTree.AbstractCtor}=GenerateTree.AbstractCtor[],
-    gen_chooser::GenerateTree.AbstractChooser=GenerateTree.UniformChooser(),
+    gen_chooser::GenerateTree.AbstractChooser=GenerateTree.FocusedChooser(),
     gen_max_depth::Int=4,
     gen_max_try::Int=8,
     tyfactory=newtyvar,
@@ -1255,6 +1353,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     const_symfactory::ConstSymbolFactory=ConstSymbolFactory(),
     bloat_policy::BloatPolicy=BloatPolicy(),
     adaptive_policy::AdaptivePolicy=AdaptivePolicy(),
+    recorder::Union{Nothing,MutationAttemptRecorder}=nothing,
 )
     current_tree = copy_tree ? deepcopy(tree) : tree
     # Transactional: always search with scratch dicts; on success, commit to caller dicts.
@@ -1263,11 +1362,45 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     current_local_consts = copy(caller_local_consts)
     current_local_consts_ty = copy(caller_local_consts_ty)
 
+    # Prepare sites once (the retry loop works on copies of the same input).
+    base_type_ctx = merge(global_consts_ty, current_local_consts_ty)
+    base_ctx = (;
+        rng=rng,
+        global_consts_ty=global_consts_ty,
+        local_consts_ty=current_local_consts_ty,
+        local_consts=current_local_consts,
+        gen_ctors=gen_ctors,
+        gen_chooser=gen_chooser,
+        gen_max_depth=gen_max_depth,
+        gen_max_try=gen_max_try,
+        tyfactory=tyfactory,
+        symfactory=symfactory,
+        const_symfactory=const_symfactory,
+    )
+    env = MutationEnv(
+        rng,
+        target_ty,
+        base_type_ctx,
+        nothing,
+        chooser isa WeightedPairChooser ? (chooser::WeightedPairChooser).cache_eligibility : false,
+        IdDict{Any,Any}(),
+        adaptive_policy,
+        IdDict{DataType,MutationStat}(),
+        bloat_policy,
+    )
+
+    reset!(provider)
+    prep = prepare!(provider, current_tree, base_type_ctx, env, base_ctx)
+    if prep isa Err
+        record!(recorder, nothing, :prepare_err; err_type=typeof(prep.value))
+        return prep
+    end
+
     for _ in 1:max_try
         attempt_tree = deepcopy(current_tree)
         attempt_local_consts = copy(current_local_consts)
         attempt_local_consts_ty = copy(current_local_consts_ty)
-        type_ctx = merge(global_consts_ty, attempt_local_consts_ty)
+        attempt_type_ctx = merge(global_consts_ty, attempt_local_consts_ty)
         attempt_ctx = (;
             rng=rng,
             global_consts_ty=global_consts_ty,
@@ -1282,31 +1415,24 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
             const_symfactory=const_symfactory,
         )
 
-        env = MutationEnv(
-            rng,
-            target_ty,
-            type_ctx,
-            nothing,
-            false,
-            IdDict{Any,Any}(),
-            adaptive_policy,
-            IdDict{DataType,MutationStat}(),
-            bloat_policy,
-        )
-
-        reset!(provider)
-        prep = prepare!(provider, attempt_tree, type_ctx, env, attempt_ctx)
-        prep isa Err && return prep
-
-        choice = choose_pair(chooser, mutations, provider, attempt_tree, type_ctx, env, attempt_ctx)
+        choice = choose_pair(chooser, mutations, provider, current_tree, base_type_ctx, env, base_ctx)
         if choice isa Err
+            record!(recorder, nothing, :choose_err; err_type=typeof(choice.value))
             return choice
         end
 
         m = choice.mutation::AbstractMutation
-        mutated = apply(m, attempt_tree, choice.site, env, attempt_ctx)
+        attempt_site = _remap_site(attempt_tree, choice.site)
+        mutated = apply(m, attempt_tree, attempt_site, env, attempt_ctx)
         if mutated isa Err
             _update_stat!(env, m, false)
+            if mutated.value isa NoEligibleSiteErr
+                record!(recorder, typeof(m), :no_eligible_site; err_type=typeof(mutated.value))
+            elseif mutated.value isa BloatExceededErr
+                record!(recorder, typeof(m), :bloat_exceeded; err_type=typeof(mutated.value))
+            else
+                record!(recorder, typeof(m), :apply_err; err_type=typeof(mutated.value))
+            end
             continue
         end
 
@@ -1315,14 +1441,17 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         inferred = infer(attempt_tree, attempt_type_ctx, tyfactory)
         if inferred isa Err
             _update_stat!(env, m, false)
+            record!(recorder, typeof(m), :infer_err; err_type=typeof(inferred.value))
             continue
         end
         if !iscompatible(inferred, target_ty)
             _update_stat!(env, m, false)
+            record!(recorder, typeof(m), :incompatible)
             continue
         end
 
         _update_stat!(env, m, true)
+        record!(recorder, typeof(m), :success)
         current_tree = attempt_tree
         current_local_consts = attempt_local_consts
         current_local_consts_ty = attempt_local_consts_ty
@@ -1341,6 +1470,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         end
         return current_tree
     end
+    record!(recorder, nothing, :max_try_exhausted)
     return Err(MaxTryReachedErr())
 end
 
@@ -1350,11 +1480,47 @@ include("Population.jl")
 # Test Items
 ########################################################
 
-@testitem "Mutations prune_local_consts! keeps only referenced" begin
+@testsnippet MutBaseImports begin
     using LambdaRegression.Mutations: prune_local_consts!
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, ConstNode
     using LambdaRegression.TypeSystem: FloatTy, TyLike
+    using Random
+    using LambdaRegression.Mutations: mutate_tree, ScalarConstMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.GenerateTree
+    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
+    using LambdaRegression.Mutations: mutate_tree, BoolConstMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.TypeSystem: BoolTy, TyLike
+    using LambdaRegression.Mutations: mutate_tree, ArrayConstMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.TypeSystem: TyArray, TyNat, FloatTy, TyLike
+    using LambdaRegression.Mutations: mutate_tree, PointMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
+    using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike
+    using LambdaRegression.GenerateTree: IndexCtor, FocusedChooser
+    using LambdaRegression.Utils: Err
+    using LambdaRegression.Mutations: WeightedPairChooser, IndexedProvider, ScalarConstMutation
+    using LambdaRegression.TypeSystem: FloatTy, TyLike, newtyvar
+    using LambdaRegression.Mutations: IndexedProvider
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
+    using LambdaRegression.TypeSystem: TyLike, FloatTy, TyFun, newtyvar
+    using LambdaRegression.Mutations: mutate_tree, WeightedPairChooser
+    using LambdaRegression.Mutations: mutate_tree, BetaReduceMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, IndexNode, ConstNode
+    using LambdaRegression.TypeSystem: IntTy, TyLike
+    using LambdaRegression.Mutations: mutate_tree, EtaReduceMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, IndexNode, ConstNode
+    using LambdaRegression.Mutations: mutate_tree, EtaExpandMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.Mutations: mutate_tree, CSEMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike, infer, iscompatible
+    using LambdaRegression.Mutations: mutate_tree, SubtreeReplaceMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, FocusedChooser
+    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, infer, iscompatible
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, ConstNode
+    using LambdaRegression.GenerateTree: FocusedChooser
+    using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
+    using LambdaRegression.Mutations: mutate_tree, BoolConstMutation, WeightedPairChooser, IndexedProvider, MutationAttemptRecorder, mutation_recorder_summary
+end
 
+@testitem "Mutations prune_local_consts! keeps only referenced" setup=[MutBaseImports] begin
     local_consts = Dict{Symbol,Any}(:a => 1.0, :b => 2.0, :c => 3.0)
     local_consts_ty = Dict{Symbol,TyLike}(:a => FloatTy, :b => FloatTy, :c => FloatTy)
     tree = AstTree(AppNode(ConstNode(:a), ConstNode(:a))) # references only :a
@@ -1367,13 +1533,7 @@ include("Population.jl")
     @test !haskey(local_consts_ty, :c)
 end
 
-@testitem "Mutations ScalarConstMutation FloatTy single-node replace + type stable" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, ScalarConstMutation, WeightedPairChooser, OnDemandProvider
-    using LambdaRegression.GenerateTree
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.TypeSystem: FloatTy, TyLike
-
+@testitem "Mutations ScalarConstMutation FloatTy single-node replace + type stable" setup=[MutBaseImports] begin
     rng = MersenneTwister(1)
     name = :k
     local_consts = Dict{Symbol,Any}(name => 1.25)
@@ -1389,7 +1549,7 @@ end
         gen_ctors=GenerateTree.AbstractCtor[],
         mutations=[ScalarConstMutation(σ=0.2)],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ScalarConstMutation=>1.0), cache_eligibility=false),
-        provider=OnDemandProvider(),
+        provider=IndexedProvider(),
         max_try=10,
         prune_consts=true,
     )
@@ -1401,13 +1561,7 @@ end
     @test local_consts[mutated.root.name] isa AbstractFloat
 end
 
-@testitem "Mutations BoolConstMutation flip + type stable" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, BoolConstMutation, WeightedPairChooser, OnDemandProvider
-    using LambdaRegression.GenerateTree
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.TypeSystem: BoolTy, TyLike
-
+@testitem "Mutations BoolConstMutation flip + type stable" setup=[MutBaseImports] begin
     rng = MersenneTwister(1)
     name = :b
     local_consts = Dict{Symbol,Any}(name => true)
@@ -1423,7 +1577,7 @@ end
         gen_ctors=GenerateTree.AbstractCtor[],
         mutations=[BoolConstMutation()],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(BoolConstMutation=>1.0)),
-        provider=OnDemandProvider(),
+        provider=IndexedProvider(),
         max_try=10,
         prune_consts=true,
     )
@@ -1435,13 +1589,7 @@ end
     @test local_consts[mutated.root.name] isa Bool
 end
 
-@testitem "Mutations ArrayConstMutation nested float array preserves shape" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, ArrayConstMutation, WeightedPairChooser, OnDemandProvider
-    using LambdaRegression.GenerateTree
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.TypeSystem: TyArray, TyNat, FloatTy, TyLike
-
+@testitem "Mutations ArrayConstMutation nested float array preserves shape" setup=[MutBaseImports] begin
     rng = MersenneTwister(1111)
     name = :A
     value = [rand(rng, Float64, 4) for _ in 1:3] # vector-of-vector "matrix"
@@ -1459,7 +1607,7 @@ end
         gen_ctors=GenerateTree.AbstractCtor[],
         mutations=[ArrayConstMutation(σ=0.1)],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ArrayConstMutation=>1.0)),
-        provider=OnDemandProvider(),
+        provider=IndexedProvider(),
         max_try=10,
         prune_consts=true,
     )
@@ -1472,13 +1620,7 @@ end
     @test all(length.(new_val) .== length.(value))
 end
 
-@testitem "Mutations PointMutation Index swap respects binder types" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, PointMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
-    using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike
-    using LambdaRegression.GenerateTree: IndexCtor, UniformChooser
-
+@testitem "Mutations PointMutation Index swap respects binder types" setup=[MutBaseImports] begin
     rng = MersenneTwister(1111)
     # λx. λy. #0  (two Int binders so swap is allowed)
     tree = AstTree(AbsNode(:x, AbsNode(:y, IndexNode(0))))
@@ -1491,7 +1633,7 @@ end
         local_consts=Dict{Symbol,Any}(),
         local_consts_ty=Dict{Symbol,TyLike}(),
         gen_ctors=[IndexCtor()],
-        gen_chooser=UniformChooser(),
+        gen_chooser=FocusedChooser(),
         mutations=[PointMutation()],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(PointMutation=>1.0), cache_eligibility=true),
         provider=IndexedProvider(),
@@ -1502,12 +1644,121 @@ end
     @test mutated.root.body.body.index in (0, 1)
 end
 
-@testitem "Mutations BetaReduceMutation reduces redex + preserves type" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, BetaReduceMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, IndexNode, ConstNode
-    using LambdaRegression.TypeSystem: IntTy, TyLike
+@testitem "Mutations choose_pair eligibility_cache is not reset" setup=[MutBaseImports] begin
+    rng = MersenneTwister(1)
+    local_consts = Dict{Symbol,Any}(:k => 1.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy)
+    global_consts_ty = Dict{Symbol,TyLike}()
+    type_ctx = merge(global_consts_ty, local_consts_ty)
+    tree = AstTree(ConstNode(:k))
 
+    env = LambdaRegression.Mutations.MutationEnv(
+        rng,
+        FloatTy,
+        type_ctx,
+        nothing,
+        true,
+        IdDict{Any,Any}(),
+        LambdaRegression.Mutations.AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(),
+        LambdaRegression.Mutations.BloatPolicy(),
+    )
+    ctx = (; local_consts=local_consts, local_consts_ty=local_consts_ty, tyfactory=newtyvar)
+
+    provider = IndexedProvider()
+    LambdaRegression.Mutations.reset!(provider)
+    prep = LambdaRegression.Mutations.prepare!(provider, tree, type_ctx, env, ctx)
+    @test !(prep isa Err)
+
+    chooser = WeightedPairChooser(weights=Dict{DataType,Float64}(ScalarConstMutation => 1.0), cache_eligibility=true)
+    cache0 = env.eligibility_cache
+    choice1 = LambdaRegression.Mutations.choose_pair(chooser, [ScalarConstMutation(σ=0.2)], provider, tree, type_ctx, env, ctx)
+    @test !(choice1 isa Err)
+    @test env.eligibility_cache === cache0
+
+    choice2 = LambdaRegression.Mutations.choose_pair(chooser, [ScalarConstMutation(σ=0.2)], provider, tree, type_ctx, env, ctx)
+    @test !(choice2 isa Err)
+    @test env.eligibility_cache === cache0
+end
+
+@testitem "Mutations _remap_site preserves path semantics" setup=[MutBaseImports] begin
+    # (λx. (k x)) : Float -> Float
+    local_consts = Dict{Symbol,Any}(:k => (x -> x))
+    local_consts_ty = Dict{Symbol,TyLike}(:k => TyFun(FloatTy, FloatTy))
+    global_consts_ty = Dict{Symbol,TyLike}()
+    type_ctx = merge(global_consts_ty, local_consts_ty)
+    tree = AstTree(AbsNode(:x, AppNode(ConstNode(:k), IndexNode(0))))
+
+    env = LambdaRegression.Mutations.MutationEnv(
+        MersenneTwister(1111),
+        TyFun(FloatTy, FloatTy),
+        type_ctx,
+        nothing,
+        false,
+        IdDict{Any,Any}(),
+        LambdaRegression.Mutations.AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(),
+        LambdaRegression.Mutations.BloatPolicy(),
+    )
+    ctx = (; local_consts=local_consts, local_consts_ty=local_consts_ty, tyfactory=newtyvar)
+
+    provider = IndexedProvider()
+    LambdaRegression.Mutations.reset!(provider)
+    prep = LambdaRegression.Mutations.prepare!(provider, tree, type_ctx, env, ctx)
+    @test !(prep isa LambdaRegression.Utils.Err)
+
+    sites = LambdaRegression.Mutations.sites(provider)
+    s0 = first(filter(s -> s.node isa IndexNode, sites))
+    attempt_tree = deepcopy(tree)
+    remapped = LambdaRegression.Mutations._remap_site(attempt_tree, s0)
+    expected = LambdaRegression.Mutations._node_at_path(attempt_tree, s0.path)
+    @test remapped.node == expected
+end
+
+@testitem "Mutations prepare! runs once per mutate_tree call" setup=[MutBaseImports] begin
+    struct AlwaysFailMutation <: LambdaRegression.Mutations.AbstractMutation end
+    LambdaRegression.Mutations.apply(::AlwaysFailMutation, ::AstTree, ::LambdaRegression.Mutations.Site, ::Any, ::NamedTuple) =
+        Err(LambdaRegression.Mutations.NoEligibleSiteErr())
+
+    mutable struct CountingProvider <: LambdaRegression.Mutations.AbstractSiteProvider
+        inner::LambdaRegression.Mutations.IndexedProvider
+        prepare_calls::Int
+    end
+    CountingProvider() = CountingProvider(LambdaRegression.Mutations.IndexedProvider(), 0)
+    LambdaRegression.Mutations.reset!(p::CountingProvider) = (p.prepare_calls = 0; LambdaRegression.Mutations.reset!(p.inner))
+    function LambdaRegression.Mutations.prepare!(p::CountingProvider, tree::AstTree, type_ctx::Dict{Symbol,<:TyLike}, env::Any, ctx::NamedTuple)
+        p.prepare_calls += 1
+        return LambdaRegression.Mutations.prepare!(p.inner, tree, type_ctx, env, ctx)
+    end
+    LambdaRegression.Mutations.sites(p::CountingProvider) = LambdaRegression.Mutations.sites(p.inner)
+    LambdaRegression.Mutations.sites_by_kind(p::CountingProvider, kind::Symbol) = LambdaRegression.Mutations.sites_by_kind(p.inner, kind)
+
+    rng = MersenneTwister(1234)
+    local_consts = Dict{Symbol,Any}(:k => 1.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy)
+    provider = CountingProvider()
+
+    out = mutate_tree(
+        AstTree(ConstNode(:k)),
+        FloatTy;
+        rng=rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts=local_consts,
+        local_consts_ty=local_consts_ty,
+        gen_ctors=LambdaRegression.GenerateTree.AbstractCtor[],
+        mutations=[AlwaysFailMutation()],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(AlwaysFailMutation => 1.0), cache_eligibility=true),
+        provider=provider,
+        max_try=5,
+        prune_consts=false,
+    )
+
+    @test out isa Err
+    @test out.value isa LambdaRegression.Mutations.MaxTryReachedErr
+    @test provider.prepare_calls == 1
+end
+
+@testitem "Mutations BetaReduceMutation reduces redex + preserves type" setup=[MutBaseImports] begin
     rng = MersenneTwister(8000)
     local_consts = Dict{Symbol,Any}(:k => 7)
     local_consts_ty = Dict{Symbol,TyLike}(:k => IntTy)
@@ -1527,12 +1778,7 @@ end
     @test mutated isa AstTree
 end
 
-@testitem "Mutations EtaReduceMutation reduces eta-redex + preserves type" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, EtaReduceMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, IndexNode, ConstNode
-    using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike
-
+@testitem "Mutations EtaReduceMutation reduces eta-redex + preserves type" setup=[MutBaseImports] begin
     rng = MersenneTwister(42)
     global_consts_ty = Dict{Symbol,TyLike}(:f => TyFun(IntTy, IntTy))
     tree = AstTree(AbsNode(:x, AppNode(ConstNode(:f), IndexNode(0)))) # λx. f #0
@@ -1552,13 +1798,7 @@ end
     @test mutated isa AstTree
 end
 
-@testitem "Mutations EtaReduceMutation rejects when binder occurs in f" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, EtaReduceMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, IndexNode, ConstNode
-    using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike
-    using LambdaRegression.Utils: Err
-
+@testitem "Mutations EtaReduceMutation rejects when binder occurs in f" setup=[MutBaseImports] begin
     rng = MersenneTwister(555)
     global_consts_ty = Dict{Symbol,TyLike}(:g => TyFun(IntTy, TyFun(IntTy, IntTy)))
     # λx. (g #0) #0  -- would match shape but binder occurs in f=(g #0)
@@ -1579,12 +1819,91 @@ end
     @test mutated isa Err
 end
 
-@testitem "Mutations CSEMutation duplicates extracted preserves type" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, CSEMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, IndexNode, ConstNode
-    using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike, infer, iscompatible
+@testitem "Mutations EtaExpandMutation expands function constant + preserves type" setup=[MutBaseImports] begin
+    rng = MersenneTwister(1111)
+    global_consts_ty = Dict{Symbol,TyLike}(:f => TyFun(IntTy, IntTy))
+    tree = AstTree(ConstNode(:f))
+    target_ty = TyFun(IntTy, IntTy)
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng=rng,
+        global_consts_ty=global_consts_ty,
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        mutations=[EtaExpandMutation()],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(EtaExpandMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+    )
+    @test mutated isa AstTree
+    abs = (mutated::AstTree).root
+    @test abs isa AbsNode
+    app = (abs::AbsNode).body
+    @test app isa AppNode
+    @test (app::AppNode).func == ConstNode(:f)
+    @test (app::AppNode).arg == IndexNode(0)
+    inferred = infer(mutated, global_consts_ty)
+    @test iscompatible(inferred, target_ty)
+end
 
+@testitem "Mutations CondAppPullMutation pulls application through COND + preserves type" setup=[MutBaseImports] begin
+    using LambdaRegression.ASTs.Contexts: COND
+    using LambdaRegression.Mutations: CondAppPullMutation
+    using LambdaRegression.TypeSystem: get_type_ctx
+
+    rng = MersenneTwister(2000)
+    global_consts_ty = merge(
+        get_type_ctx(Dict{Symbol,Any}(:COND => COND, :b => true, :x0 => 1.0)),
+        Dict{Symbol,TyLike}(
+            :f => TyFun(FloatTy, FloatTy),
+            :g => TyFun(FloatTy, FloatTy),
+        ),
+    )
+
+    # COND b (f x0) (g x0)
+    tree = AstTree(
+        AppNode(
+            AppNode(
+                AppNode(ConstNode(:COND), ConstNode(:b)),
+                AppNode(ConstNode(:f), ConstNode(:x0)),
+            ),
+            AppNode(ConstNode(:g), ConstNode(:x0)),
+        ),
+    )
+    target_ty = FloatTy
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng=rng,
+        global_consts_ty=global_consts_ty,
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        mutations=[CondAppPullMutation()],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(CondAppPullMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+    )
+    @test mutated isa AstTree
+
+    expected = AstTree(
+        AppNode(
+            AppNode(
+                AppNode(
+                    AppNode(ConstNode(:COND), ConstNode(:b)),
+                    ConstNode(:f),
+                ),
+                ConstNode(:g),
+            ),
+            ConstNode(:x0),
+        ),
+    )
+    @test (mutated::AstTree).root == expected.root
+    inferred = infer(mutated, global_consts_ty)
+    @test iscompatible(inferred, target_ty)
+end
+
+@testitem "Mutations CSEMutation duplicates extracted preserves type" setup=[MutBaseImports] begin
     rng = MersenneTwister(2000)
     global_consts_ty = Dict{Symbol,TyLike}(
         :f => TyFun(IntTy, IntTy),
@@ -1611,13 +1930,7 @@ end
     @test iscompatible(inferred, target_ty)
 end
 
-@testitem "Mutations SubtreeReplaceMutation under lambda preserves target type" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, SubtreeReplaceMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
-    using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike
-    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, UniformChooser
-
+@testitem "Mutations SubtreeReplaceMutation under lambda preserves target type" setup=[MutBaseImports] begin
     rng = MersenneTwister(1234)
     tree = AstTree(AbsNode(:x, IndexNode(0))) # identity
     target_ty = TyFun(IntTy, IntTy)
@@ -1628,10 +1941,10 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=Dict{Symbol,Any}(),
         local_consts_ty=Dict{Symbol,TyLike}(),
-        gen_ctors=[AbsCtor(), IndexCtor()],
-        gen_chooser=UniformChooser(),
-        gen_max_depth=3,
-        gen_max_try=6,
+        gen_ctors=[IndexCtor()],
+        gen_chooser=FocusedChooser(),
+        gen_max_depth=2,
+        gen_max_try=4,
         mutations=[SubtreeReplaceMutation()],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplaceMutation=>1.0), cache_eligibility=true),
         provider=IndexedProvider(),
@@ -1640,13 +1953,7 @@ end
     @test mutated isa AstTree
 end
 
-@testitem "Mutations integration: matrix->matrix type stability" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, SubtreeReplaceMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
-    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, infer, iscompatible
-    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, UniformChooser
-
+@testitem "Mutations integration: matrix->matrix type stability" setup=[MutBaseImports] begin
     rng = MersenneTwister(8000)
     dom = TyArray(TyNat(3), TyArray(TyNat(4), FloatTy))
     target_ty = TyFun(dom, dom)
@@ -1658,8 +1965,10 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=Dict{Symbol,Any}(),
         local_consts_ty=Dict{Symbol,TyLike}(),
-        gen_ctors=[AbsCtor(), IndexCtor()],
-        gen_chooser=UniformChooser(),
+        gen_ctors=[IndexCtor()],
+        gen_chooser=FocusedChooser(),
+        gen_max_depth=2,
+        gen_max_try=4,
         mutations=[SubtreeReplaceMutation()],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplaceMutation=>1.0), cache_eligibility=true),
         provider=IndexedProvider(),
@@ -1669,14 +1978,7 @@ end
     @test iscompatible(inferred, target_ty)
 end
 
-@testitem "Mutations integration: matrix->float type stability" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, ScalarConstMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.GenerateTree
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, ConstNode
-    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, infer, iscompatible
-    using LambdaRegression.GenerateTree: UniformChooser
-
+@testitem "Mutations integration: matrix->float type stability" setup=[MutBaseImports] begin
     rng = MersenneTwister(42)
     dom = TyArray(TyNat(3), TyArray(TyNat(4), FloatTy))
     target_ty = TyFun(dom, FloatTy)
@@ -1691,7 +1993,7 @@ end
         local_consts=local_consts,
         local_consts_ty=local_consts_ty,
         gen_ctors=GenerateTree.AbstractCtor[],
-        gen_chooser=UniformChooser(),
+        gen_chooser=FocusedChooser(),
         mutations=[ScalarConstMutation(σ=0.3)],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ScalarConstMutation=>1.0), cache_eligibility=true),
         provider=IndexedProvider(),
@@ -1703,14 +2005,7 @@ end
     @test iscompatible(inferred, target_ty)
 end
 
-@testitem "Mutations uses const_symfactory (no gensym-style names) in SR path" begin
-    using Random
-    using LambdaRegression.Mutations: mutate_tree, ScalarConstMutation, WeightedPairChooser, OnDemandProvider
-    using LambdaRegression.GenerateTree
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
-    using LambdaRegression.TypeSystem: FloatTy, TyLike
-
+@testitem "Mutations uses const_symfactory (no gensym-style names) in SR path" setup=[MutBaseImports] begin
     rng = MersenneTwister(1111)
     local_consts = Dict{Symbol,Any}(:k => 1.0)
     local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy)
@@ -1726,7 +2021,7 @@ end
         gen_ctors=GenerateTree.AbstractCtor[],
         mutations=[ScalarConstMutation(σ=0.2)],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ScalarConstMutation=>1.0)),
-        provider=OnDemandProvider(),
+        provider=IndexedProvider(),
         max_try=10,
         prune_consts=true,
         const_symfactory=ConstSymbolFactory(prefix=:c),
@@ -1737,6 +2032,43 @@ end
     s = String((mutated.root::ConstNode).name)
     @test startswith(s, "c")
     @test !occursin("#", s)
+end
+
+@testitem "Mutations mutate_tree recorder counts apply_err + max_try_exhausted" setup=[MutBaseImports] begin
+    # Intentionally inconsistent local const: value is Bool but typed as FloatTy.
+    # This makes BoolConstMutation eligible, but its value-level mutation returns UnsupportedConstTyErr(FloatTy),
+    # forcing apply() to fail deterministically.
+    rng = MersenneTwister(1)
+    name = :b
+    local_consts = Dict{Symbol,Any}(name => true)
+    local_consts_ty = Dict{Symbol,TyLike}(name => FloatTy)
+    tree = AstTree(ConstNode(name))
+
+    rec = MutationAttemptRecorder()
+    mutated = mutate_tree(
+        tree,
+        FloatTy;
+        rng=rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts=local_consts,
+        local_consts_ty=local_consts_ty,
+        gen_ctors=GenerateTree.AbstractCtor[],
+        mutations=[BoolConstMutation()],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(BoolConstMutation => 1.0), cache_eligibility=false),
+        provider=IndexedProvider(),
+        max_try=7,
+        prune_consts=true,
+        recorder=rec,
+    )
+
+    @test mutated isa LambdaRegression.Utils.Err
+    s = mutation_recorder_summary(rec; topk=4)
+    @test s.totals.success == 0
+    @test s.totals.apply_err == 7
+    @test s.totals.max_try_exhausted == 1
+    @test length(s.per_mutation) >= 1
+    @test s.per_mutation[1].mutation_type == BoolConstMutation
+    @test s.per_mutation[1].counts.apply_err == 7
 end
 
 end # module Mutations

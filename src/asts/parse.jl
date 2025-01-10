@@ -276,10 +276,20 @@ macro terms(args...)
 end
 
 
-@testitem "parse_lambda_literal basic cases" begin
+@testsnippet ParseBaseImports begin
     using LambdaRegression.ASTs.Parse: parse_lambda_literal
     using LambdaRegression.ASTs.NodeASTs: AbsNode, VarNode, AppNode, IndexNode
+    using LambdaRegression.ASTs.Parse: parse_lambda
+    using LambdaRegression.ASTs.NodeASTs: VarNode, IndexNode, AbsNode, AppNode
+    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
+    using LambdaRegression.ASTs.NodeASTs: VarNode, IndexNode, AbsNode, AppNode, ConstNode
+    using LambdaRegression.ASTs.Parse: @terms
+    using LambdaRegression.ASTs.NodeASTs: AstTree, VarNode, ConstNode
+    using LambdaRegression.ASTs.Parse: @terms, parse_lambda
+    using LambdaRegression.ASTs.NodeASTs: AstTree
+end
 
+@testitem "parse_lambda_literal basic cases" setup=[ParseBaseImports] begin
     # λx. x
     tree1 = parse_lambda_literal("λx. x")
     @test tree1.root isa AbsNode
@@ -311,10 +321,7 @@ end
     @test app.arg isa IndexNode && app.arg.index == 0
 end
 
-@testitem "parse_lambda basic parsing" begin
-    using LambdaRegression.ASTs.Parse: parse_lambda
-    using LambdaRegression.ASTs.NodeASTs: VarNode, IndexNode, AbsNode, AppNode
-
+@testitem "parse_lambda basic parsing" setup=[ParseBaseImports] begin
     tree = parse_lambda("x")
     @test tree.root isa VarNode
 
@@ -328,10 +335,7 @@ end
     @test tree.root isa AppNode
 end
 
-@testitem "parse_lambda constant collection" begin
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.ASTs.NodeASTs: VarNode, IndexNode, AbsNode, AppNode, ConstNode
-
+@testitem "parse_lambda constant collection" setup=[ParseBaseImports] begin
     # Numeric literals
     ctx = @terms 42
     tree = parse_lambda("λx. 42", ctx)
@@ -357,10 +361,7 @@ end
     @test haskey(ctx, Symbol("1.45"))
 end
 
-@testitem "parse_lambda with user context" begin
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.ASTs.NodeASTs: VarNode, IndexNode, AbsNode, AppNode, ConstNode
-
+@testitem "parse_lambda with user context" setup=[ParseBaseImports] begin
     ctx = @terms(foo=123, bar="hello")
     tree = parse_lambda("λx. foo bar", ctx)
     @test ctx[:foo] == 123
@@ -382,10 +383,7 @@ end
     @test tree.root.body.arg isa VarNode
 end
 
-@testitem "terms macro basics" begin
-    using LambdaRegression.ASTs.Parse: @terms
-    using LambdaRegression.ASTs.NodeASTs: AstTree, VarNode, ConstNode
-
+@testitem "terms macro basics" setup=[ParseBaseImports] begin
     IADD = :add_impl
     IMUL = :mul_impl
     ctx = @terms(IADD, IMUL, 12, n=11)
@@ -396,10 +394,7 @@ end
     @test ctx[:n] == 11
 end
 
-@testitem "terms macro supports rhs expressions" begin
-    using LambdaRegression.ASTs.Parse: @terms, parse_lambda
-    using LambdaRegression.ASTs.NodeASTs: AstTree
-
+@testitem "terms macro supports rhs expressions" setup=[ParseBaseImports] begin
     base_ctx = @terms(0, 1)
     ctx = merge(base_ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", base_ctx)))
     @test haskey(ctx, :Y)

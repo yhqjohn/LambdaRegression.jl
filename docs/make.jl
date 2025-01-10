@@ -18,7 +18,7 @@ makedocs(
         "Home" => "index.md",
         "Trees Module" => "trees.md",
         "DfsTrees Submodule" => "dfstrees.md",
-        "NodeASTs Module" => "nodeasts.md"
+        "NodeASTs Module" => "nodeasts.md",
     ],
     format=Documenter.HTML(
         prettyurls=false,
@@ -27,3 +27,4 @@ makedocs(
     checkdocs=:none,
     warnonly=[:docs_block, :cross_references, :missing_docs]
 )
+

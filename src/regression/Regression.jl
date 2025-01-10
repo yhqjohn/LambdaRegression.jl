@@ -42,6 +42,7 @@ using ..Mutations.Populations: Individual
 
 export Regressor, SupervisedDataset, FitResult, fit!
 export default_config, default_components, default_regressor
+export batch_generate_population
 
 struct NotImplementedErr end
 struct MissingComponentErr
@@ -237,10 +238,26 @@ function (cl::LiftedClosure)(x)
         cl.max_steps,
     )
     ok || throw(MaxReduceStepsErr(cl.max_steps))
-    call_tree.root isa ConstNode || throw(NonConstOutputErr())
-    name = (call_tree.root::ConstNode).name
-    haskey(call_ctx, name) || throw(MissingConstValueErr(name))
-    return call_ctx[name]
+    if call_tree.root isa ConstNode
+        name = (call_tree.root::ConstNode).name
+        haskey(call_ctx, name) || throw(MissingConstValueErr(name))
+        return call_ctx[name]
+    elseif call_tree.root isa AbsNode
+        # Higher-order case (partial application): return a callable closure constant.
+        #
+        # This is critical for curried lambdas, e.g. op(acc) returning (v -> ...),
+        # so that host primitives like AFOLDL can call op(acc)(v).
+        return LiftedClosure(
+            AstTree(deepcopy(call_tree.root)),
+            _capture_env(call_ctx),
+            cl.make_eval_context,
+            cl.const_symfactory_ctor,
+            cl.max_steps,
+            cl.closure_lift_max_per_pass,
+        )
+    else
+        throw(NonConstOutputErr())
+    end
 end
 
 function closure_lift!(tree::AstTree, ctx::EvalContext, components::NamedTuple, config::NamedTuple)::Bool
@@ -391,6 +408,24 @@ function default_config(;
     elitism::Int=1,
     tournament_size::Int=7,
     error_penalty::Float64=1e12,
+    repro=(;
+        require_change=true,
+        max_resample=10,
+        on_fail=:immigrant,              # :immigrant or :clone
+        immigrant_mutation_rounds=init_mutation_rounds,
+        immigrant_max_try=3,
+        immigrant_gen_max_depth=nothing,
+        immigrant_gen_max_try=nothing,
+        immigrants_per_gen=0,
+    ),
+    stats=(;
+        enabled=false,
+        mutation=false,
+        reproduction=false,
+        print=false,
+        every=1,
+        topk_types=8,
+    ),
     log=(; enabled=false, every=1, topk=5, io=stdout),
     parallel=(; enabled=true, mode=:individual, schedule=:dynamic),
     kwargs...
@@ -408,6 +443,8 @@ function default_config(;
         elitism,
         tournament_size,
         error_penalty,
+        repro,
+        stats,
         log,
         parallel,
     )
@@ -429,6 +466,31 @@ function default_components(;
     input_types::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     tyfactory_ctor=make_tyvar_factory,
     const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
+    # --- Tier1 defaults (can be overridden via merge/kwargs) ---
+    gen_ctors::Vector{<:GenerateTree.AbstractCtor}=[
+        GenerateTree.AbsCtor(),
+        GenerateTree.IndexCtor(),
+        GenerateTree.GlobalConstCtor(),
+        GenerateTree.ApplySpineCtor(max_spine_args=3),
+    ],
+    gen_chooser::GenerateTree.AbstractChooser=GenerateTree.FocusedChooser(max_spine_args=3),
+    gen_max_depth::Int=9,
+    gen_max_try::Int=80,
+    mutations::Vector{<:Mutations.AbstractMutation}=[
+        Mutations.ScalarConstMutation(),
+        Mutations.BoolConstMutation(),
+        Mutations.ArrayConstMutation(),
+        Mutations.SubtreeReplaceMutation(),
+        Mutations.PointMutation(),
+        Mutations.CSEMutation(),
+        Mutations.BetaReduceMutation(),
+        Mutations.EtaReduceMutation(),
+    ],
+    mutation_chooser::Mutations.AbstractPairChooser=Mutations.WeightedPairChooser(),
+    mutation_provider::Mutations.AbstractSiteProvider=Mutations.IndexedProvider(),
+    mutation_max_try::Int=25,
+    mutation_prune_consts::Bool=true,
+    crossover_op=Populations.TypedSubtreeSwapCrossover(),
     kwargs...
 )
     global_consts_ty === nothing && (global_consts_ty = get_type_ctx(global_consts))
@@ -450,6 +512,16 @@ function default_components(;
         tyfactory_ctor,
         const_symfactory_ctor,
         make_eval_context,
+        gen_ctors,
+        gen_chooser,
+        gen_max_depth,
+        gen_max_try,
+        mutations,
+        mutation_chooser,
+        mutation_provider,
+        mutation_max_try,
+        mutation_prune_consts,
+        crossover_op,
     )
     return merge(base, (;kwargs...))
 end
@@ -467,6 +539,88 @@ function default_regressor(target_ty::Ty;
 )
     reg = Regressor(target_ty, components, config, rng)
     return reg
+end
+
+"""
+    batch_generate_population(reg, data; N, seed, global_type_ctx, mutate_rounds, purpose=:init, recorder=nothing) -> Union{Vector{Individual},Err}
+
+Generate a population of `N` individuals by:
+1) generating trees via injected `components.generate_tree` (default: `GenerateTree.generate_tree`),
+2) applying `mutate_rounds` mutation rounds in-place (default: `Mutations.mutate_tree`).
+
+This is a utility intended for initialization and immigrant injection.
+"""
+function batch_generate_population(reg::Regressor, data::SupervisedDataset;
+    N::Int,
+    seed::UInt64,
+    global_type_ctx::Dict{Symbol,TyLike},
+    mutate_rounds::Int,
+    purpose::Symbol=:init,
+    recorder=nothing,
+    gen_max_depth_override::Union{Nothing,Int}=nothing,
+    gen_max_try_override::Union{Nothing,Int}=nothing,
+)
+    components = reg.components
+    gen_fn = haskey(components, :generate_tree) ? components.generate_tree : GenerateTree.generate_tree
+    mut_fn = haskey(components, :mutate_tree) ? components.mutate_tree : Mutations.mutate_tree
+
+    pop = Vector{Individual}(undef, N)
+    for i in 1:N
+        rng_i = derive_rng(seed, 0, i, Symbol(purpose, :_tree))
+        tyfactory = components.tyfactory_ctor()
+        symfactory = SymbolGenerator()
+        const_symfactory = components.const_symfactory_ctor()
+        local_consts = Dict{Symbol,Any}()
+        local_consts_ty = Dict{Symbol,TyLike}()
+
+        tree = gen_fn(
+            reg.target_ty;
+            ctors=components.gen_ctors,
+            chooser=components.gen_chooser,
+            max_depth=(gen_max_depth_override === nothing ? components.gen_max_depth : gen_max_depth_override),
+            max_try=(gen_max_try_override === nothing ? components.gen_max_try : gen_max_try_override),
+            tyfactory=tyfactory,
+            symfactory=symfactory,
+            rng=rng_i,
+            global_consts_ty=global_type_ctx,
+            local_consts=local_consts,
+            local_consts_ty=local_consts_ty,
+        )
+        tree isa Err && return tree
+
+        cur_tree = tree
+        for r in 1:mutate_rounds
+            rng_m = derive_rng(seed, 0, (i << 8) + r, Symbol(purpose, :_mutate))
+            mutated = mut_fn(
+                cur_tree,
+                reg.target_ty;
+                rng=rng_m,
+                mutations=components.mutations,
+                chooser=components.mutation_chooser,
+                provider=components.mutation_provider,
+                max_try=components.mutation_max_try,
+                prune_consts=components.mutation_prune_consts,
+                copy_tree=true,
+                copy_ctx=true,
+                global_consts_ty=global_type_ctx,
+                local_consts=local_consts,
+                local_consts_ty=local_consts_ty,
+                gen_ctors=components.gen_ctors,
+                gen_chooser=components.gen_chooser,
+                gen_max_depth=components.gen_max_depth,
+                gen_max_try=components.gen_max_try,
+                tyfactory=tyfactory,
+                symfactory=symfactory,
+                const_symfactory=const_symfactory,
+                recorder=recorder,
+            )
+            mutated isa Err && break
+            cur_tree = mutated
+        end
+
+        pop[i] = Individual(cur_tree, reg.target_ty; local_consts=local_consts, local_consts_ty=local_consts_ty, fitness=nothing, meta=(;))
+    end
+    return pop
 end
 
 """
@@ -516,62 +670,23 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
         length(res) == N || return Err(ArgumentError("init_population must return exactly N individuals"))
         res
     else
-        pop0 = Vector{Individual}(undef, N)
-        for i in 1:N
-            rng_i = derive_rng(seed, 0, i, :init_tree)
-            tyfactory = components.tyfactory_ctor()
-            symfactory = SymbolGenerator()
-            const_symfactory = components.const_symfactory_ctor()
-            local_consts = Dict{Symbol,Any}()
-            local_consts_ty = Dict{Symbol,TyLike}()
-
-            tree = GenerateTree.generate_tree(
-                reg.target_ty;
-                ctors=components.gen_ctors,
-                chooser=components.gen_chooser,
-                max_depth=components.gen_max_depth,
-                max_try=components.gen_max_try,
-                tyfactory=tyfactory,
-                symfactory=symfactory,
-                rng=rng_i,
-                global_consts_ty=global_type_ctx,
-                local_consts=local_consts,
-                local_consts_ty=local_consts_ty,
-            )
-            tree isa Err && return tree
-
-            cur_tree = tree
-            for _ in 1:config.init_mutation_rounds
-                rng_m = derive_rng(seed, 0, i, :init_mutate)
-                mutated = Mutations.mutate_tree(
-                    cur_tree,
-                    reg.target_ty;
-                    rng=rng_m,
-                    mutations=components.mutations,
-                    chooser=components.mutation_chooser,
-                    provider=components.mutation_provider,
-                    max_try=components.mutation_max_try,
-                    prune_consts=components.mutation_prune_consts,
-                    copy_tree=true,
-                    copy_ctx=true,
-                    global_consts_ty=global_type_ctx,
-                    local_consts=local_consts,
-                    local_consts_ty=local_consts_ty,
-                    gen_ctors=components.gen_ctors,
-                    gen_chooser=components.gen_chooser,
-                    gen_max_depth=components.gen_max_depth,
-                    gen_max_try=components.gen_max_try,
-                    tyfactory=tyfactory,
-                    symfactory=symfactory,
-                    const_symfactory=const_symfactory,
-                )
-                mutated isa Err && break
-                cur_tree = mutated
-            end
-
-            pop0[i] = Individual(cur_tree, reg.target_ty; local_consts=local_consts, local_consts_ty=local_consts_ty, fitness=nothing, meta=(;))
+        init_recorder = nothing
+        cfg_stats = get(config, :stats, (; enabled=false))
+        if get(cfg_stats, :enabled, false) && get(cfg_stats, :mutation, false)
+            init_recorder = Mutations.MutationAttemptRecorder()
         end
-        pop0
+        res = batch_generate_population(
+            reg,
+            data;
+            N=N,
+            seed=seed,
+            global_type_ctx=global_type_ctx,
+            mutate_rounds=config.init_mutation_rounds,
+            purpose=:init,
+            recorder=init_recorder,
+        )
+        res isa Err && return res
+        res
     end
 
     history = Any[]
@@ -582,9 +697,23 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
         losses = fill(error_penalty, N)
         fitness = fill(error_penalty, N)
         complexities = fill(0, N)
+        eval_err_counts = zeros(Int, N)
+        eval_exception_counts = zeros(Int, N)
+        max_reduce_steps_counts = zeros(Int, N)
+        non_const_output_counts = zeros(Int, N)
+        missing_const_value_counts = zeros(Int, N)
+        non_closed_lambda_counts = zeros(Int, N)
 
         parallel = get(config, :parallel, (; enabled=false))
         do_parallel = get(parallel, :enabled, false) && Threads.nthreads() > 1
+
+        function _classify_eval_issue!(i::Int, issue)
+            issue isa MaxReduceStepsErr && (max_reduce_steps_counts[i] += 1; return nothing)
+            issue isa NonConstOutputErr && (non_const_output_counts[i] += 1; return nothing)
+            issue isa MissingConstValueErr && (missing_const_value_counts[i] += 1; return nothing)
+            issue isa NonClosedLambdaErr && (non_closed_lambda_counts[i] += 1; return nothing)
+            return nothing
+        end
 
         function _eval_ind!(i::Int)
             ind = pop[i]
@@ -593,12 +722,16 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
             for (xj, yj) in zip(data.X, data.Y)
                 yhat = try
                     eval_fn(ind, xj, components, config)
-                catch
+                catch e
+                    eval_exception_counts[i] += 1
+                    _classify_eval_issue!(i, e)
                     total += error_penalty
                     count += 1
                     continue
                 end
                 if yhat isa Err
+                    eval_err_counts[i] += 1
+                    _classify_eval_issue!(i, yhat.value)
                     total += error_penalty
                 else
                     try
@@ -633,7 +766,22 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
             best_loss = gen_best_loss
             best = pop[best_idx]
         end
-        push!(history, (; gen=g, best_loss=gen_best_loss))
+        eval_stats = (;
+            n_eval_err=sum(eval_err_counts),
+            n_eval_exception=sum(eval_exception_counts),
+            n_max_reduce_steps=sum(max_reduce_steps_counts),
+            n_non_const_output=sum(non_const_output_counts),
+            n_missing_const_value=sum(missing_const_value_counts),
+            n_non_closed_lambda=sum(non_closed_lambda_counts),
+            per_individual=(;
+                eval_err=copy(eval_err_counts),
+                eval_exception=copy(eval_exception_counts),
+                max_reduce_steps=copy(max_reduce_steps_counts),
+                non_const_output=copy(non_const_output_counts),
+                missing_const_value=copy(missing_const_value_counts),
+                non_closed_lambda=copy(non_closed_lambda_counts),
+            ),
+        )
 
         # Logging: main thread only.
         logcfg = get(config, :log, (; enabled=false))
@@ -645,6 +793,10 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
                 i = perm[rank]
                 tree_str = sprint(show, MIME"text/plain"(), pop[i].tree)
                 println(io, "  [$rank] loss=$(losses[i]) nodes=$(complexities[i])  $tree_str")
+            end
+            try
+                flush(io)
+            catch
             end
         end
 
@@ -659,18 +811,51 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
                 gen_best_loss=gen_best_loss,
                 best=best,
                 best_loss=best_loss,
+                eval_stats=eval_stats,
                 seed=seed,
                 components=components,
                 config=config,
             )
             cb_res = callback(state)
             cb_res isa Err && return cb_res
-            cb_res === :stop && return FitResult(best, :stopped, "Stopped by callback", history)
+            if cb_res === :stop
+                push!(history, (; gen=g, best_loss=gen_best_loss, eval_stats, repro_stats=nothing, mutation_stats=nothing))
+                return FitResult(best, :stopped, "Stopped by callback", history)
+            end
         end
 
-        gen_best_loss <= threshold && return FitResult(best, :threshold, "Reached error threshold", history)
+        if gen_best_loss <= threshold
+            push!(history, (; gen=g, best_loss=gen_best_loss, eval_stats, repro_stats=nothing, mutation_stats=nothing))
+            return FitResult(best, :threshold, "Reached error threshold", history)
+        end
 
         # --- Reproduce ---
+        reprocfg = get(config, :repro, (; require_change=false, max_resample=0, on_fail=:clone, immigrant_mutation_rounds=0, immigrant_max_try=1, immigrants_per_gen=0))
+        statscfg = get(config, :stats, (; enabled=false))
+        do_stats = get(statscfg, :enabled, false)
+        rec_mut = (do_stats && get(statscfg, :mutation, false)) ? Mutations.MutationAttemptRecorder() : nothing
+        track_repro = do_stats && get(statscfg, :reproduction, false)
+        repro_stats = track_repro ? Dict{Symbol,Int}(
+            :n_resample => 0,
+            :n_immigrant => 0,
+            :n_clone_fallback => 0,
+            :n_child_total => 0,
+            :n_child_clone => 0,
+            :n_child_changed => 0,
+            :crossover_attempt => 0,
+            :crossover_ok => 0,
+            :crossover_err => 0,
+            :mutation_attempt => 0,
+            :mutation_ok => 0,
+            :mutation_err => 0,
+        ) : nothing
+
+        @inline function _inc!(st, key::Symbol, delta::Int=1)
+            st === nothing && return nothing
+            st[key] = get(st, key, 0) + delta
+            return nothing
+        end
+
         next_pop = Vector{Individual}()
         elitism = min(get(config, :elitism, 1), N)
         for j in 1:elitism
@@ -682,78 +867,247 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
         crossover_rate = get(config, :crossover_rate, 0.2)
         crossover_op = components.crossover_op
 
-        while length(next_pop) < N
-            rng_sel = derive_rng(seed, g, length(next_pop) + 1, :eval)
-            p1 = pop[_tournament_index(rng_sel, fitness, tournament_size)]
-            p2 = pop[_tournament_index(rng_sel, fitness, tournament_size)]
+        pending_children = Individual[]
+        require_change = get(reprocfg, :require_change, false)
+        max_resample = max(0, get(reprocfg, :max_resample, 0))
+        on_fail = get(reprocfg, :on_fail, :clone)
+        immigrant_rounds = max(0, get(reprocfg, :immigrant_mutation_rounds, 0))
+        immigrant_max_try = max(1, get(reprocfg, :immigrant_max_try, 1))
 
-            rng_cross = derive_rng(seed, g, length(next_pop) + 1, :crossover)
-            children = if crossover_op !== nothing && rand(rng_cross) < crossover_rate
-                res = Populations.crossover(
-                    crossover_op,
-                    p1,
-                    p2;
-                    rng=rng_cross,
-                    global_consts_ty=global_type_ctx,
-                    tyfactory_ctor=components.tyfactory_ctor,
-                    const_symfactory_ctor=components.const_symfactory_ctor,
-                    prune=true,
+        function _make_immigrant(slot_idx::Int)
+            for k in 1:immigrant_max_try
+                seed_i = seed ⊻ UInt64(g) ⊻ (UInt64(slot_idx) << 32) ⊻ UInt64(k)
+                ig_depth = get(reprocfg, :immigrant_gen_max_depth, nothing)
+                ig_try = get(reprocfg, :immigrant_gen_max_try, nothing)
+                res = batch_generate_population(
+                    reg,
+                    data;
+                    N=1,
+                    seed=seed_i,
+                    global_type_ctx=global_type_ctx,
+                    mutate_rounds=immigrant_rounds,
+                    purpose=:immigrant,
+                    recorder=rec_mut,
+                    gen_max_depth_override=ig_depth,
+                    gen_max_try_override=ig_try,
                 )
-                res isa Err ? (p1, p2) : res
-            else
-                (p1, p2)
+                res isa Err && continue
+                return res[1]
+            end
+            return Err(Mutations.MaxTryReachedErr())
+        end
+
+        immigrants_fixed = max(0, get(reprocfg, :immigrants_per_gen, 0))
+        if immigrants_fixed > 0
+            k = min(immigrants_fixed, N - length(next_pop))
+            if k > 0
+                ig_depth = get(reprocfg, :immigrant_gen_max_depth, nothing)
+                ig_try = get(reprocfg, :immigrant_gen_max_try, nothing)
+                res = batch_generate_population(
+                    reg,
+                    data;
+                    N=k,
+                    seed=seed ⊻ UInt64(g) ⊻ 0x9e3779b97f4a7c15,
+                    global_type_ctx=global_type_ctx,
+                    mutate_rounds=immigrant_rounds,
+                    purpose=:immigrant,
+                    recorder=rec_mut,
+                    gen_max_depth_override=ig_depth,
+                    gen_max_try_override=ig_try,
+                )
+                if !(res isa Err)
+                    append!(next_pop, res)
+                    _inc!(repro_stats, :n_immigrant, k)
+                end
+            end
+        end
+
+        while length(next_pop) < N
+            if !isempty(pending_children)
+                push!(next_pop, popfirst!(pending_children))
+                continue
             end
 
-            for child in children
-                rng_mut = derive_rng(seed, g, length(next_pop) + 1, :mutate)
-                if rand(rng_mut) < mutation_rate
-                    tyfactory = components.tyfactory_ctor()
-                    symfactory = SymbolGenerator()
-                    const_symfactory = components.const_symfactory_ctor()
-                    local_consts = copy(child.local_consts)
-                    local_consts_ty = copy(child.local_consts_ty)
-                    mutated = Mutations.mutate_tree(
-                        child.tree,
-                        reg.target_ty;
-                        rng=rng_mut,
-                        mutations=components.mutations,
-                        chooser=components.mutation_chooser,
-                        provider=components.mutation_provider,
-                        max_try=components.mutation_max_try,
-                        prune_consts=components.mutation_prune_consts,
-                        copy_tree=true,
-                        copy_ctx=true,
+            produced = false
+            slot_idx = length(next_pop) + 1
+            last_parent = pop[perm[1]]
+
+            for attempt in 1:max(1, max_resample)
+                attempt > 1 && _inc!(repro_stats, :n_resample, 1)
+
+                rng_sel = derive_rng(seed, g, (slot_idx << 8) + attempt, :eval)
+                p1 = pop[_tournament_index(rng_sel, fitness, tournament_size)]
+                p2 = pop[_tournament_index(rng_sel, fitness, tournament_size)]
+                last_parent = p1
+
+                base_children = (p1, p2)
+                crossed = false
+                rng_cross = derive_rng(seed, g, (slot_idx << 8) + attempt, :crossover)
+                if crossover_op !== nothing && rand(rng_cross) < crossover_rate
+                    _inc!(repro_stats, :crossover_attempt, 1)
+                    res = Populations.crossover(
+                        crossover_op,
+                        p1,
+                        p2;
+                        rng=rng_cross,
                         global_consts_ty=global_type_ctx,
-                        local_consts=local_consts,
-                        local_consts_ty=local_consts_ty,
-                        gen_ctors=components.gen_ctors,
-                        gen_chooser=components.gen_chooser,
-                        gen_max_depth=components.gen_max_depth,
-                        gen_max_try=components.gen_max_try,
-                        tyfactory=tyfactory,
-                        symfactory=symfactory,
-                        const_symfactory=const_symfactory,
+                        tyfactory_ctor=components.tyfactory_ctor,
+                        const_symfactory_ctor=components.const_symfactory_ctor,
+                        prune=true,
                     )
-                    if !(mutated isa Err)
-                        child = Individual(mutated, reg.target_ty; local_consts=local_consts, local_consts_ty=local_consts_ty, fitness=nothing, meta=(;))
+                    if res isa Err
+                        _inc!(repro_stats, :crossover_err, 1)
+                    else
+                        _inc!(repro_stats, :crossover_ok, 1)
+                        base_children = res
+                        crossed = true
                     end
                 end
-                push!(next_pop, child)
-                length(next_pop) >= N && break
+
+                new_children = Individual[]
+                ci = 0
+                for child0 in base_children
+                    ci += 1
+                    child = child0
+                    changed = crossed
+                    rng_mut = derive_rng(seed, g, (slot_idx << 10) + (attempt << 2) + ci, :mutate)
+                    if rand(rng_mut) < mutation_rate
+                        _inc!(repro_stats, :mutation_attempt, 1)
+                        tyfactory = components.tyfactory_ctor()
+                        symfactory = SymbolGenerator()
+                        const_symfactory = components.const_symfactory_ctor()
+                        local_consts = copy(child.local_consts)
+                        local_consts_ty = copy(child.local_consts_ty)
+                        mutated = Mutations.mutate_tree(
+                            child.tree,
+                            reg.target_ty;
+                            rng=rng_mut,
+                            mutations=components.mutations,
+                            chooser=components.mutation_chooser,
+                            provider=components.mutation_provider,
+                            max_try=components.mutation_max_try,
+                            prune_consts=components.mutation_prune_consts,
+                            copy_tree=true,
+                            copy_ctx=true,
+                            global_consts_ty=global_type_ctx,
+                            local_consts=local_consts,
+                            local_consts_ty=local_consts_ty,
+                            gen_ctors=components.gen_ctors,
+                            gen_chooser=components.gen_chooser,
+                            gen_max_depth=components.gen_max_depth,
+                            gen_max_try=components.gen_max_try,
+                            tyfactory=tyfactory,
+                            symfactory=symfactory,
+                            const_symfactory=const_symfactory,
+                            recorder=rec_mut,
+                        )
+                        if mutated isa Err
+                            _inc!(repro_stats, :mutation_err, 1)
+                        else
+                            _inc!(repro_stats, :mutation_ok, 1)
+                            changed = true
+                            child = Individual(mutated, reg.target_ty; local_consts=local_consts, local_consts_ty=local_consts_ty, fitness=nothing, meta=(;))
+                        end
+                    end
+
+                    if require_change && !changed
+                        continue
+                    end
+                    _inc!(repro_stats, :n_child_total, 1)
+                    if changed
+                        _inc!(repro_stats, :n_child_changed, 1)
+                    else
+                        _inc!(repro_stats, :n_child_clone, 1)
+                    end
+                    push!(new_children, child)
+                    length(next_pop) + length(new_children) >= N && break
+                end
+
+                if !isempty(new_children)
+                    append!(pending_children, new_children)
+                    produced = true
+                    break
+                end
+            end
+
+            if produced
+                continue
+            end
+
+            if on_fail == :immigrant
+                imm = _make_immigrant(slot_idx)
+                if imm isa Err
+                    _inc!(repro_stats, :n_clone_fallback, 1)
+                    push!(next_pop, last_parent)
+                else
+                    _inc!(repro_stats, :n_immigrant, 1)
+                    push!(next_pop, imm)
+                end
+            else
+                _inc!(repro_stats, :n_clone_fallback, 1)
+                push!(next_pop, last_parent)
             end
         end
 
         pop = next_pop
+
+        mutation_stats = rec_mut === nothing ? nothing : Mutations.mutation_recorder_summary(rec_mut; topk=get(statscfg, :topk_types, 8))
+        if do_stats && get(statscfg, :print, false) && (g % get(statscfg, :every, 1) == 0)
+            io = get(logcfg, :io, stdout)
+            if repro_stats !== nothing
+                println(io, "  repro: children=$(repro_stats[:n_child_total]) clone=$(repro_stats[:n_child_clone]) changed=$(repro_stats[:n_child_changed]) resample=$(repro_stats[:n_resample]) immigrant=$(repro_stats[:n_immigrant]) clone_fallback=$(repro_stats[:n_clone_fallback]) cross(ok/err)=$(repro_stats[:crossover_ok])/$(repro_stats[:crossover_err]) mut(ok/err)=$(repro_stats[:mutation_ok])/$(repro_stats[:mutation_err])")
+            end
+            if mutation_stats !== nothing
+                tot = mutation_stats.totals
+                println(io, "  mut: success=$(tot.success) apply_err=$(tot.apply_err) infer_err=$(tot.infer_err) incompatible=$(tot.incompatible) no_site=$(tot.no_eligible_site) bloat=$(tot.bloat_exceeded) max_try=$(tot.max_try_exhausted)")
+            end
+            try
+                flush(io)
+            catch
+            end
+        end
+
+        push!(history, (; gen=g, best_loss=gen_best_loss, eval_stats, repro_stats=repro_stats === nothing ? nothing : copy(repro_stats), mutation_stats))
     end
 
     return FitResult(best, :max_generations, "Reached max generations", history)
 end
 
-@testitem "Regression default_components provides non-global factories" begin
+@testsnippet RegBaseImports begin
     using LambdaRegression.Regression: default_components
     using LambdaRegression.TypeSystem: make_tyvar_factory
     using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
+    using LambdaRegression.Regression: mse
+    using Random
+    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
+    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike
+    using LambdaRegression.Regression: evaluate_default, default_components, default_config
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
+    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, get_type_ctx
+    using LambdaRegression.TypeSystem
+    using LambdaRegression.Utils: Err
+    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, GlobalConstCtor, ApplySpineCtor, FocusedChooser
+    using LambdaRegression.Mutations
+    using LambdaRegression.Regression: Regressor, SupervisedDataset, fit!, evaluate_default, default_components, default_config
+    using LambdaRegression.TypeSystem: TyFun, FloatTy, TyLike, get_type_ctx
+    using LambdaRegression.Regression: Regressor, SupervisedDataset, fit!, default_components, default_config
+    using LambdaRegression.TypeSystem: TyFun, FloatTy, TyLike
+    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, FocusedChooser
+    using LambdaRegression.Mutations: WeightedPairChooser
+    using LambdaRegression.Regression:
+        Regressor,
+        SupervisedDataset,
+        fit!,
+        default_components,
+        default_config,
+        MaxReduceStepsErr,
+        NonConstOutputErr,
+        NonClosedLambdaErr,
+        MissingConstValueErr
+end
 
+@testitem "Regression default_components provides non-global factories" setup=[RegBaseImports] begin
     c = default_components()
     @test c.tyfactory_ctor === make_tyvar_factory
     f = c.tyfactory_ctor()
@@ -762,21 +1116,13 @@ end
     @test sf isa ConstSymbolFactory
 end
 
-@testitem "Regression mse basic cases" begin
-    using LambdaRegression.Regression: mse
-
+@testitem "Regression mse basic cases" setup=[RegBaseImports] begin
     @test mse(2.0, 1.0) == 1.0
     @test mse([1.0, 2.0], [1.0, 4.0]) == 2.0
     @test mse([[1.0, 2.0], [3.0, 4.0]], [[1.0, 2.0], [3.0, 6.0]]) == 1.0
 end
 
-@testitem "Regression evaluate_default identity works for AoA matrix" begin
-    using Random
-    using LambdaRegression.Mutations.Populations: Individual
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
-    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike
-    using LambdaRegression.Regression: evaluate_default, default_components, default_config
-
+@testitem "Regression evaluate_default identity works for AoA matrix" setup=[RegBaseImports] begin
     x = [[1.0, 2.0], [3.0, 4.0]]
     A = TyArray(TyNat(2), TyArray(TyNat(2), FloatTy))
     target_ty = TyFun(A, A)
@@ -794,13 +1140,7 @@ end
     @test y == x
 end
 
-@testitem "Regression closure_lift unlocks AMAP with AST lambdas" begin
-    using LambdaRegression.Mutations.Populations: Individual
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
-    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, get_type_ctx
-    using LambdaRegression.Regression: evaluate_default, default_components, default_config
-    using LambdaRegression.TypeSystem
-
+@testitem "Regression closure_lift unlocks AMAP with AST lambdas" setup=[RegBaseImports] begin
     x = [1.0, -2.0, 3.0]
     A = TyArray(TyNat(length(x)), FloatTy)
     target_ty = TyFun(A, A)
@@ -825,17 +1165,48 @@ end
     @test y == [v * v for v in x]
 end
 
-@testitem "Regression non-closed lambda lift throws; fit! penalizes (non-fatal)" begin
-    using Random
-    using LambdaRegression.Utils: Err
-    using LambdaRegression.Mutations.Populations: Individual
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
-    using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, get_type_ctx
-    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, GlobalConstCtor, ApplyLeafCtor, UniformChooser
-    using LambdaRegression.Mutations
-    using LambdaRegression.Regression: Regressor, SupervisedDataset, fit!, evaluate_default, default_components, default_config
-    using LambdaRegression.TypeSystem
+@testitem "Regression closure_lift supports curried lambdas for AFOLDL" setup=[RegBaseImports] begin
+    x = [1.0, -2.0, 3.0]
+    A = TyArray(TyNat(length(x)), FloatTy)
+    target_ty = TyFun(A, FloatTy)
 
+    # λx. AFOLDL (λacc.λv. FADD acc (SQR v)) ZERO x
+    fold_fun = AbsNode(
+        :acc,
+        AbsNode(
+            :v,
+            AppNode(
+                AppNode(ConstNode(:FADD), IndexNode(1)),
+                AppNode(ConstNode(:SQR), IndexNode(0)),
+            ),
+        ),
+    )
+    body = AppNode(
+        AppNode(AppNode(ConstNode(:AFOLDL), fold_fun), ConstNode(:ZERO)),
+        IndexNode(0),
+    )
+    tree = AstTree(AbsNode(:x, body))
+    ind = Individual(tree, target_ty; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}())
+
+    global_consts = Dict{Symbol,Any}(
+        :AFOLDL => TypeSystem.AFOLDL,
+        :FADD => TypeSystem.FADD,
+        :SQR => TypeSystem.SQR,
+        :ZERO => 0.0,
+    )
+    comps = default_components(
+        global_consts=global_consts,
+        global_consts_ty=get_type_ctx(global_consts),
+        input_slots=Symbol[:x],
+        input_types=Dict{Symbol,TyLike}(:x => A),
+    )
+    cfg = default_config(max_reduce_steps=600, closure_max_reduce_steps=300)
+    y = evaluate_default(ind, x, comps, cfg)
+    y isa Err && error("evaluate_default returned Err: $(y.value)")
+    @test y ≈ sum(v * v for v in x)
+end
+
+@testitem "Regression non-closed lambda lift throws; fit! penalizes (non-fatal)" setup=[RegBaseImports] begin
     x = [1.0, 2.0]
     A = TyArray(TyNat(length(x)), FloatTy)
     target_ty = TyFun(A, A)
@@ -859,8 +1230,8 @@ end
     comps = merge(
         base,
         (;
-            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplyLeafCtor()],
-            gen_chooser=UniformChooser(),
+            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplySpineCtor(max_spine_args=3)],
+            gen_chooser=FocusedChooser(max_spine_args=3),
             gen_max_depth=5,
             gen_max_try=10,
             mutations=[Mutations.SubtreeReplaceMutation()],
@@ -902,16 +1273,7 @@ end
     @test !(res isa Err)
 end
 
-@testitem "Regression fit! penalizes host primitive errors (non-fatal)" begin
-    using Random
-    using LambdaRegression.Utils: Err
-    using LambdaRegression.Mutations.Populations: Individual
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
-    using LambdaRegression.TypeSystem: TyFun, FloatTy, TyLike, get_type_ctx
-    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, GlobalConstCtor, ApplyLeafCtor, UniformChooser
-    using LambdaRegression.Mutations
-    using LambdaRegression.Regression: Regressor, SupervisedDataset, fit!, default_components, default_config
-
+@testitem "Regression fit! penalizes host primitive errors (non-fatal)" setup=[RegBaseImports] begin
     BOMB(x) = error("boom")
 
     target_ty = TyFun(FloatTy, FloatTy)
@@ -927,8 +1289,8 @@ end
     comps = merge(
         base,
         (;
-            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplyLeafCtor()],
-            gen_chooser=UniformChooser(),
+            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplySpineCtor(max_spine_args=3)],
+            gen_chooser=FocusedChooser(max_spine_args=3),
             gen_max_depth=5,
             gen_max_try=10,
             mutations=[Mutations.SubtreeReplaceMutation()],
@@ -954,6 +1316,135 @@ end
     reg = Regressor(target_ty, comps, cfg, MersenneTwister(2000))
     res = fit!(reg, data)
     @test !(res isa Err)
+end
+
+@testitem "Regression fit! avoids implicit cloning via immigrant fallback when require_change=true" setup=[RegBaseImports] begin
+    target_ty = TyFun(FloatTy, FloatTy)
+    id_tree = AstTree(AbsNode(:x, IndexNode(0)))
+
+    gen_stub = (target_ty; kwargs...) -> deepcopy(id_tree)
+
+    base = default_components(
+        global_consts=Dict{Symbol,Any}(),
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        input_slots=Symbol[:x],
+        input_types=Dict{Symbol,TyLike}(:x => FloatTy),
+    )
+    comps = merge(
+        base,
+        (;
+            generate_tree=gen_stub,
+            gen_ctors=[AbsCtor(), IndexCtor()],
+            gen_chooser=FocusedChooser(),
+            gen_max_depth=3,
+            gen_max_try=3,
+            mutations=[Mutations.SubtreeReplaceMutation()],
+            mutation_chooser=WeightedPairChooser(),
+            mutation_provider=Mutations.IndexedProvider(),
+            mutation_max_try=1,
+            mutation_prune_consts=true,
+            crossover_op=nothing,
+            init_population=(reg, data; N, seed, global_type_ctx) -> [Individual(id_tree, reg.target_ty; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}()) for _ in 1:N],
+        ),
+    )
+
+    cfg = default_config(
+        population_size=6,
+        generations=1,
+        error_threshold=-1.0,
+        mutation_rate=0.0,   # forces require_change path to resample then immigrant
+        crossover_rate=0.0,
+        elitism=1,
+        tournament_size=2,
+        repro=(; require_change=true, max_resample=2, on_fail=:immigrant, immigrant_mutation_rounds=0, immigrant_max_try=2, immigrants_per_gen=0),
+        stats=(; enabled=true, mutation=true, reproduction=true, print=false, every=1, topk_types=4),
+    )
+    data = SupervisedDataset([1.0], [1.0])
+    reg = Regressor(target_ty, comps, cfg, MersenneTwister(2000))
+
+    res = fit!(reg, data)
+    @test !(res isa Err)
+    @test length(res.history) == 1
+    rs = res.history[1].repro_stats
+    @test rs[:n_immigrant] == 5
+    @test rs[:n_clone_fallback] == 0
+end
+
+@testitem "Regression fit! callback exposes eval_stats classifications" setup=[RegBaseImports] begin
+    target_ty = TyFun(FloatTy, FloatTy)
+    ind_tree = AstTree(AbsNode(:x, IndexNode(0)))
+    ind = Individual(ind_tree, target_ty; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}())
+
+    eval_fn = (ind, x, components, config) -> begin
+        if x == 1.0
+            return Err(MaxReduceStepsErr(7))
+        elseif x == 2.0
+            return Err(NonConstOutputErr())
+        elseif x == 3.0
+            throw(NonClosedLambdaErr(:f))
+        elseif x == 4.0
+            return Err(MissingConstValueErr(:z))
+        else
+            return x
+        end
+    end
+
+    base = default_components(
+        global_consts=Dict{Symbol,Any}(),
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        input_slots=Symbol[:x],
+        input_types=Dict{Symbol,TyLike}(:x => FloatTy),
+    )
+    comps = merge(
+        base,
+        (;
+            evaluate=eval_fn,
+            gen_ctors=[AbsCtor(), IndexCtor()],
+            gen_chooser=FocusedChooser(),
+            gen_max_depth=3,
+            gen_max_try=3,
+            mutations=[Mutations.SubtreeReplaceMutation()],
+            mutation_chooser=Mutations.WeightedPairChooser(),
+            mutation_provider=Mutations.IndexedProvider(),
+            mutation_max_try=1,
+            mutation_prune_consts=true,
+            crossover_op=nothing,
+            init_population=(reg, data; N, seed, global_type_ctx) -> [ind for _ in 1:N],
+        ),
+    )
+
+    cfg = default_config(
+        population_size=1,
+        generations=1,
+        error_threshold=-1.0,
+        mutation_rate=0.0,
+        crossover_rate=0.0,
+        elitism=1,
+    )
+    data = SupervisedDataset([1.0, 2.0, 3.0, 4.0, 5.0], [1.0, 2.0, 3.0, 4.0, 5.0])
+    reg = Regressor(target_ty, comps, cfg, MersenneTwister(2000))
+
+    state_ref = Ref{Any}(nothing)
+    res = fit!(reg, data; callback=(state -> (state_ref[] = state; nothing)))
+    @test !(res isa Err)
+    @test state_ref[] !== nothing
+    @test length(res.history) == 1
+
+    stats = state_ref[].eval_stats
+    @test stats.n_eval_err == 3
+    @test stats.n_eval_exception == 1
+    @test stats.n_max_reduce_steps == 1
+    @test stats.n_non_const_output == 1
+    @test stats.n_missing_const_value == 1
+    @test stats.n_non_closed_lambda == 1
+
+    @test sum(stats.per_individual.eval_err) == stats.n_eval_err
+    @test sum(stats.per_individual.eval_exception) == stats.n_eval_exception
+    @test sum(stats.per_individual.max_reduce_steps) == stats.n_max_reduce_steps
+    @test sum(stats.per_individual.non_const_output) == stats.n_non_const_output
+    @test sum(stats.per_individual.missing_const_value) == stats.n_missing_const_value
+    @test sum(stats.per_individual.non_closed_lambda) == stats.n_non_closed_lambda
+    @test res.history[1].eval_stats.n_eval_err == stats.n_eval_err
 end
 
 end # module Regression

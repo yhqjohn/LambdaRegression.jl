@@ -98,10 +98,22 @@ end
 
 export beta_reduce!, prepare
 
-@testitem "beta_reduce! single step functionality" begin
+@testsnippet ReduceBaseImports begin
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, VarNode, AppNode, IndexNode
     using LambdaRegression.Reduces: beta_reduce!, isapplicable
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, VarNode, AppNode
+    using LambdaRegression.Reduces: beta_reduce!
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, VarNode, AppNode, ConstNode
+    using LambdaRegression.Reduces: isapplicable
+    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode, AppNode
+    using LambdaRegression.ASTs.Contexts: new_constant!
+    using LambdaRegression.ASTs.NodeASTs: AstTree
+    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
+    using LambdaRegression.Reduces: beta_reduce!, prepare
+    using LambdaRegression.ASTs.Contexts
+end
 
+@testitem "beta_reduce! single step functionality" setup=[ReduceBaseImports] begin
     # Test 1: Basic β-reduction (λx.x) y → y
     identity_abs = AbsNode(:x, VarNode(:x))
     app = AppNode(identity_abs, VarNode(:y))
@@ -143,10 +155,7 @@ export beta_reduce!, prepare
     @test nested_tree.root.arg.name == :z
 end
 
-@testitem "beta_reduce! multi-step functionality" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, VarNode, AppNode
-    using LambdaRegression.Reduces: beta_reduce!
-
+@testitem "beta_reduce! multi-step functionality" setup=[ReduceBaseImports] begin
     # Test 1: Multi-step reduction
     # (λx.x) ((λy.y) z) → (λy.y) z → z
     inner_abs = AbsNode(:y, VarNode(:y))
@@ -184,10 +193,7 @@ end
     @test_throws ArgumentError beta_reduce!(tree, -1)
 end
 
-@testitem "isapplicable interface functionality" begin
-    using LambdaRegression.ASTs.NodeASTs: AbsNode, VarNode, AppNode, ConstNode
-    using LambdaRegression.Reduces: isapplicable
-
+@testitem "isapplicable interface functionality" setup=[ReduceBaseImports] begin
     # Test default cases
     @test isapplicable(AbsNode(:x, VarNode(:x)), VarNode(:y)) == true
     @test isapplicable(AbsNode(:x, VarNode(:x)), ConstNode(:pi)) == true
@@ -196,11 +202,7 @@ end
     @test isapplicable(AppNode(VarNode(:f), VarNode(:x)), VarNode(:y)) == false
 end
 
-@testitem "Context-aware ConstNode evaluation" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode, AppNode
-    using LambdaRegression.ASTs.Contexts: new_constant!
-    using LambdaRegression.Reduces: beta_reduce!, isapplicable
-
+@testitem "Context-aware ConstNode evaluation" setup=[ReduceBaseImports] begin
     # Create a context with some simple functions and values
     ctx = Dict{Symbol,Any}()
     ctx[:double] = x -> 2x  # A simple function that doubles its argument
@@ -251,12 +253,7 @@ end
     @test lambda_app.root.name == :three
 end
 
-@testitem "Y Combinator with Complex Computations" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.Reduces: beta_reduce!, prepare
-    using LambdaRegression.ASTs.Contexts
-
+@testitem "Y Combinator with Complex Computations" setup=[ReduceBaseImports] begin
     # Define basic arithmetic and logical operations for our lambda calculus
     add = x -> y -> x + y  # Curried addition
     mul = x -> y -> x * y  # Curried multiplication  
@@ -289,11 +286,7 @@ end
     @test final_value == 8  # fib(6) = 8
 end
 
-@testitem "Apply Operator with List Operations for Square Sum" begin
-    using LambdaRegression.ASTs.NodeASTs: AstTree
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.Reduces: beta_reduce!, prepare
-    using LambdaRegression.ASTs.Contexts
+@testitem "Apply Operator with List Operations for Square Sum" setup=[ReduceBaseImports] begin
     # Define list operations using Julia arrays as lists
     cons = x -> xs -> [x, xs...]  # Curried cons
     car = xs -> length(xs) > 0 ? xs[1] : 0  # Head/first element, return 0 for empty lists
@@ -338,12 +331,7 @@ end
     @test final_value == 55
 end
 
-@testitem "Step Limit Comparison Tests" begin
-    using LambdaRegression.ASTs.Contexts
-    using LambdaRegression.ASTs.NodeASTs: AstTree
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.Reduces: beta_reduce!
-
+@testitem "Step Limit Comparison Tests" setup=[ReduceBaseImports] begin
     # Define arithmetic functions
     add = x -> y -> x + y
     mul = x -> y -> x * y

@@ -146,12 +146,23 @@ end
 # Test Items
 ########################################################
 
-@testitem "canonicalize alpha equivalence" begin
+@testsnippet CSEBaseImports begin
     using LambdaRegression.ASTs.NodeASTs: eliminate_bound_variables!
     using LambdaRegression.ASTs.Parse: parse_lambda, @terms
     using LambdaRegression.ASTs.CSE: canonicalize
     using LambdaRegression.Utils: Err
+    using LambdaRegression.ASTs.CSE: canonical_set, CanonicalIndex, CanonicalConst, CanonicalApp
+    using LambdaRegression.ASTs.NodeASTs: eliminate_bound_variables!, AstTree, AbsNode, VarNode, AppNode, IndexNode, AstNode
+    using LambdaRegression.ASTs.Parse: parse_lambda
+    using LambdaRegression.ASTs.CSE: elimniate_expression!, canonical_set, CanonicalApp, CanonicalIndex
+    using LambdaRegression.ASTs.NodeASTs: eliminate_bound_variables!, AstTree, AbsNode, VarNode, AppNode, ConstNode, AstNode
+    using LambdaRegression.ASTs.CSE: elimniate_expression!, canonical_set, CanonicalApp, CanonicalIndex, CanonicalConst
+    using LambdaRegression.ASTs.CSE: elimniate_expression!, canonical_set, CanonicalIndex
+    using LambdaRegression.ASTs.NodeASTs: eliminate_bound_variables!, AstTree, AstNode
+    using LambdaRegression.ASTs.CSE: eliminate_expression!, canonicalize
+end
 
+@testitem "canonicalize alpha equivalence" setup=[CSEBaseImports] begin
     # Two alpha-equivalent lambdas should have identical canonical form
     tree1 = parse_lambda("λx. x")
     tree2 = parse_lambda("λy. y")
@@ -182,11 +193,7 @@ end
     @test canon1 == canon2
 end
 
-@testitem "canonical_set counts duplicates" begin
-    using LambdaRegression.ASTs.NodeASTs: eliminate_bound_variables!
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.ASTs.CSE: canonical_set, CanonicalIndex, CanonicalConst, CanonicalApp
-
+@testitem "canonical_set counts duplicates" setup=[CSEBaseImports] begin
     # The body x x contains two identical sub-expressions (#0) so the
     # frequency accumulator should report a count of 2 for that canonical VarNode as they are externally bound.
     tree = parse_lambda("λx. x x") # x is externally bound in x
@@ -208,11 +215,7 @@ end
     @test acc[CanonicalApp(CanonicalIndex(0), CanonicalConst(:c1))] == 2
 end
 
-@testitem "elimniate_expression! complex expression" begin
-    using LambdaRegression.ASTs.NodeASTs: eliminate_bound_variables!, AstTree, AbsNode, VarNode, AppNode, IndexNode, AstNode
-    using LambdaRegression.ASTs.Parse: parse_lambda
-    using LambdaRegression.ASTs.CSE: elimniate_expression!, canonical_set, CanonicalApp, CanonicalIndex
-
+@testitem "elimniate_expression! complex expression" setup=[CSEBaseImports] begin
     # Test more complex case: λf. λg. (f g) (f g)
     # The expression (f g) appears twice and should be eliminated
     tree = parse_lambda("λf. λg. (f g) (f g)")
@@ -233,11 +236,7 @@ end
     @test result_tree.root isa AstNode
 end
 
-@testitem "elimniate_expression! with constants" begin
-    using LambdaRegression.ASTs.NodeASTs: eliminate_bound_variables!, AstTree, AbsNode, VarNode, AppNode, ConstNode, AstNode
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.ASTs.CSE: elimniate_expression!, canonical_set, CanonicalApp, CanonicalIndex, CanonicalConst
-
+@testitem "elimniate_expression! with constants" setup=[CSEBaseImports] begin
     # Test with constants: λf. (f c1) (f c1)
     ctx = @terms c1=1
     tree = parse_lambda("λf. (f c1) (f c1)", ctx)
@@ -258,11 +257,7 @@ end
     @test result_tree.root isa AstNode
 end
 
-@testitem "elimniate_expression! preserves bound variables correctly" begin
-    using LambdaRegression.ASTs.NodeASTs: eliminate_bound_variables!, AstTree, AbsNode, VarNode, AppNode, IndexNode, AstNode
-    using LambdaRegression.ASTs.Parse: parse_lambda
-    using LambdaRegression.ASTs.CSE: elimniate_expression!, canonical_set, CanonicalIndex
-
+@testitem "elimniate_expression! preserves bound variables correctly" setup=[CSEBaseImports] begin
     # Test that bound variables are handled correctly during elimination
     # λx. λy. x x should eliminate x and preserve proper binding
     tree = parse_lambda("λx. λy. x x")
@@ -283,12 +278,7 @@ end
     @test result_tree.root isa AstNode
 end
 
-@testitem "eliminate_expression! single occurrence extraction" begin
-    using LambdaRegression.ASTs.NodeASTs: eliminate_bound_variables!, AstTree, AstNode
-    using LambdaRegression.ASTs.Parse: parse_lambda
-    using LambdaRegression.ASTs.CSE: eliminate_expression!, canonicalize
-    using LambdaRegression.Utils: Err
-
+@testitem "eliminate_expression! single occurrence extraction" setup=[CSEBaseImports] begin
     tree = parse_lambda("λx. x")
     eliminate_bound_variables!(tree)
     form = canonicalize(tree, tree.root.body)

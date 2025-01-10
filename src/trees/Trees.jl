@@ -764,9 +764,39 @@ include("utils.jl")
 # 7. Test Items
 ########################################################
 
-@testitem "NodeIndex and basic interface" begin
+@testsnippet TreesBaseImports begin
     using LambdaRegression.Trees: NodeTree, Node, NodeIndex, root, subtree, children
-    
+    using LambdaRegression.Trees: NodeTree, Node, setchild!, children, root
+    using LambdaRegression.Trees: NodeTree, Node, root
+    using LambdaRegression.Trees: NodeTree, Node, setroot!, root
+    using LambdaRegression.Trees: NodeTree, AbstractTraverseState, StateBag, getstate, build_state_bag, requires, init, enter!, leave!
+    import LambdaRegression.Trees: init, requires, enter!, leave!
+    using LambdaRegression.Trees: NodeTree, Node, AbstractTraverseState, traverse, getstate, init, enter!, leave!
+    import LambdaRegression.Trees: init, enter!, leave!
+    using LambdaRegression.Trees: NodeTree, Node, AbstractTraverseState, traverse, getstate, Leave, init, enter!, leave!
+    using LambdaRegression.Trees: NodeTree, Node, AbstractTraverseState, traverse, getstate, requires, init, enter!, leave!
+    using LambdaRegression.Trees: NodeTree, Node, DepthState, traverse, getstate
+    using LambdaRegression.Trees: NodeTree, Node, StackState, traverse, getstate
+    using LambdaRegression.Trees: NodeTree, Node, AncestorsState, StackState, traverse, getstate
+    using LambdaRegression.Trees: NodeTree, Node, traverse, Leave, StateBag
+    using LambdaRegression.Trees: NodeTree, Node, PointerState, StackState, traverse, getstate
+    using LambdaRegression.Trees: NodeTree, Node, PointerState, traverse, getstate
+    using LambdaRegression.Trees: NodeTree, Node, PointerState, traverse, getstate, setchild!
+    using LambdaRegression.Trees: NodeTree, Node, AbstractTraverseState, traverse, getstate, Break, init, enter!, leave!
+    using LambdaRegression.Trees: NodeTree, Node, lca, root
+    using LambdaRegression.Trees: NodeTree, Node, setindex!, root
+end
+
+@testsnippet TreesCountStateSetup begin
+    mutable struct CountState <: AbstractTraverseState
+        count::Int
+    end
+    init(::Type{CountState}, _, _) = CountState(0)
+    enter!(state::CountState, _, _) = (state.count += 1)
+    leave!(::CountState, _, _) = nothing
+end
+
+@testitem "NodeIndex and basic interface" setup=[TreesBaseImports] begin
     tree = NodeTree(1)  # Test NodeIndex
     @test NodeIndex(typeof(tree)) == Node{Int}
     
@@ -787,9 +817,7 @@ include("utils.jl")
     @test length(tree_children) == 2
 end
 
-@testitem "setchild! function" begin
-    using LambdaRegression.Trees: NodeTree, Node, setchild!, children, root
-    
+@testitem "setchild! function" setup=[TreesBaseImports] begin
     child1 = Node(2)  # Test valid replacement
     child2 = Node(3)
     root_node = Node(1)
@@ -810,9 +838,7 @@ end
     @test_throws BoundsError setchild!(leaf, root(leaf), 1, new_child)
 end
 
-@testitem "Direct tree iteration" begin
-    using LambdaRegression.Trees: NodeTree, Node, root
-    
+@testitem "Direct tree iteration" setup=[TreesBaseImports] begin
     single = NodeTree(1)  # Test single node
     result = collect(single)
     @test length(result) == 1
@@ -845,9 +871,7 @@ end
     @test result[4] === child2
 end
 
-@testitem "setroot! function" begin
-    using LambdaRegression.Trees: NodeTree, Node, setroot!, root
-    
+@testitem "setroot! function" setup=[TreesBaseImports] begin
     original_tree = NodeTree(1)  # Test basic root replacement
     new_tree = NodeTree(10)
     
@@ -869,10 +893,7 @@ end
     @test root(result).children[2].value == 3
 end
 
-@testitem "StateBag construction and lookup" begin
-    using LambdaRegression.Trees: NodeTree, AbstractTraverseState, StateBag, getstate, build_state_bag, requires, init, enter!, leave!
-    import LambdaRegression.Trees: init, requires, enter!, leave!
-    
+@testitem "StateBag construction and lookup" setup=[TreesBaseImports] begin
     struct StateA <: AbstractTraverseState; value::Int; end
     struct StateB <: AbstractTraverseState; value::String; end  
     struct StateC <: AbstractTraverseState; value::Float64; end
@@ -907,17 +928,7 @@ end
     @test getstate(bag, StateC).value == 3.14
 end
 
-@testitem "traverse basic functionality" begin
-    using LambdaRegression.Trees: NodeTree, Node, AbstractTraverseState, traverse, getstate, init, enter!, leave!
-    import LambdaRegression.Trees: init, enter!, leave!
-    
-    mutable struct CountState <: AbstractTraverseState
-        count::Int
-    end
-    init(::Type{CountState}, _, _) = CountState(0)
-    enter!(state::CountState, _, _) = (state.count += 1)
-    leave!(::CountState, _, _) = nothing
-    
+@testitem "traverse basic functionality" setup=[TreesBaseImports, TreesCountStateSetup] begin
     # Create test tree: 1 -> [2, 3]
     child1, child2 = Node(2), Node(3)
     root_node = Node(1)
@@ -929,17 +940,7 @@ end
     @test getstate(bag, CountState).count == 3
 end
 
-@testitem "traverse with Leave() return" begin
-    using LambdaRegression.Trees: NodeTree, Node, AbstractTraverseState, traverse, getstate, Leave, init, enter!, leave!
-    import LambdaRegression.Trees: init, enter!, leave!
-    
-    mutable struct CountState <: AbstractTraverseState
-        count::Int
-    end
-    init(::Type{CountState}, _, _) = CountState(0)
-    enter!(state::CountState, _, _) = (state.count += 1)
-    leave!(::CountState, _, _) = nothing
-    
+@testitem "traverse with Leave() return" setup=[TreesBaseImports, TreesCountStateSetup] begin
     # Create tree: 1 -> [2 -> [4], 3]
     grandchild = Node(4)
     child_with_child = Node(2)
@@ -955,24 +956,15 @@ end
     @test getstate(bag, CountState).count == 3  # Skip grandchild(4)
 end
 
-@testitem "traverse with state dependencies" begin
-    using LambdaRegression.Trees: NodeTree, Node, AbstractTraverseState, traverse, getstate, requires, init, enter!, leave!
-    import LambdaRegression.Trees: init, requires, enter!, leave!
-    
+@testitem "traverse with state dependencies" setup=[TreesBaseImports, TreesCountStateSetup] begin
     mutable struct SumState <: AbstractTraverseState
         total::Int
     end
     init(::Type{SumState}, _, _) = SumState(0)
     enter!(state::SumState, _, node) = (state.total += node.value)
     leave!(::SumState, _, _) = nothing
-    
-    mutable struct CountState <: AbstractTraverseState
-        count::Int
-    end
     requires(::Type{CountState}, tree::LambdaRegression.Trees.AbstractTree) = (CountState, SumState)
-    init(::Type{CountState}, _, _) = CountState(0)
-    enter!(state::CountState, _, _) = (state.count += 1)
-    leave!(::CountState, _, _) = nothing
+    
     
     # Create test tree: 1 -> [2, 3]
     child1, child2 = Node(2), Node(3)
@@ -994,9 +986,7 @@ end
     @test sum_idx < count_idx
 end
 
-@testitem "DepthState functionality" begin
-    using LambdaRegression.Trees: NodeTree, Node, DepthState, traverse, getstate
-    
+@testitem "DepthState functionality" setup=[TreesBaseImports] begin
     # Create tree: 1 -> [2 -> [4], 3]
     grandchild = Node(4)
     child_with_child = Node(2)
@@ -1020,9 +1010,7 @@ end
     @test getstate(bag, DepthState).depth == 0  # Back to 0 after all leaves
 end
 
-@testitem "StackState functionality" begin
-    using LambdaRegression.Trees: NodeTree, Node, StackState, traverse, getstate
-    
+@testitem "StackState functionality" setup=[TreesBaseImports] begin
     # Create tree: 1 -> [2 -> [4], 3]
     grandchild = Node(4)
     child_with_child = Node(2)
@@ -1075,9 +1063,7 @@ end
     @test isempty(getstate(bag, StackState{Node{Int}}).stack)
 end
 
-@testitem "AncestorsState functionality" begin
-    using LambdaRegression.Trees: NodeTree, Node, AncestorsState, StackState, traverse, getstate
-    
+@testitem "AncestorsState functionality" setup=[TreesBaseImports] begin
     # Create test tree: (1 -> [2 -> [3], 4])
     var_3 = Node(3)
     var_2 = Node(2)
@@ -1118,9 +1104,7 @@ end
     @test haskey(bag.lookup, StackState{Node{Int}})  # StackState should be included automatically
 end
 
-@testitem "AncestorsState lazy evaluation" begin
-    using LambdaRegression.Trees: NodeTree, Node, AncestorsState, StackState, traverse, getstate
-    
+@testitem "AncestorsState lazy evaluation" setup=[TreesBaseImports] begin
     # Create simple tree: 1 -> [2, 3]
     child1 = Node(2)
     child2 = Node(3)
@@ -1150,9 +1134,7 @@ end
     @test verification_count[] == 3  # Verified for all 3 nodes
 end
 
-@testitem "traverse stateless" begin
-    using LambdaRegression.Trees: NodeTree, Node, traverse, Leave, StateBag
-    
+@testitem "traverse stateless" setup=[TreesBaseImports] begin
     # Create tree: 1 -> [2, 3]
     child1, child2 = Node(2), Node(3)
     root_node = Node(1)
@@ -1178,9 +1160,7 @@ end
     @test visited_with_leave == [1, 2, 3]  # Skipped grandchild(4)
 end
 
-@testitem "PointerState functionality" begin
-    using LambdaRegression.Trees: NodeTree, Node, PointerState, StackState, traverse, getstate
-    
+@testitem "PointerState functionality" setup=[TreesBaseImports] begin
     # Create test tree: 1 -> [2 -> [4], 3]
     grandchild = Node(4)
     child_with_child = Node(2)
@@ -1222,9 +1202,7 @@ end
     @test haskey(bag.lookup, StackState{Node{Int}})  # StackState should be included automatically
 end
 
-@testitem "PointerState edge cases" begin
-    using LambdaRegression.Trees: NodeTree, Node, PointerState, traverse, getstate
-    
+@testitem "PointerState edge cases" setup=[TreesBaseImports] begin
     # Test single node tree (root only)
     single_tree = NodeTree(42)
     
@@ -1271,9 +1249,7 @@ end
     @test multi_pointer_info[5] == (5, 1, 4)        # Fourth child
 end
 
-@testitem "PointerState for tree modification" begin
-    using LambdaRegression.Trees: NodeTree, Node, PointerState, traverse, getstate, setchild!
-    
+@testitem "PointerState for tree modification" setup=[TreesBaseImports] begin
     # Create test tree: 1 -> [2, 3]
     child1 = Node(2)
     child2 = Node(3)
@@ -1304,17 +1280,7 @@ end
     @test tree.root.children[2].value == 3   # Node 3 should remain unchanged
 end
 
-@testitem "traverse with Break() return" begin
-    using LambdaRegression.Trees: NodeTree, Node, AbstractTraverseState, traverse, getstate, Break, init, enter!, leave!
-    import LambdaRegression.Trees: init, enter!, leave!
-
-    mutable struct CountState <: AbstractTraverseState
-        count::Int
-    end
-    init(::Type{CountState}, _, _) = CountState(0)
-    enter!(state::CountState, _, _) = (state.count += 1)
-    leave!(::CountState, _, _) = nothing
-
+@testitem "traverse with Break() return" setup=[TreesBaseImports, TreesCountStateSetup] begin
     # Create tree: 1 -> [2 -> [4], 3]
     grandchild = Node(4)
     child_with_child = Node(2)
@@ -1338,9 +1304,7 @@ end
     @test getstate(bag, CountState).count == 2
 end
 
-@testitem "lca function basic functionality" begin
-    using LambdaRegression.Trees: NodeTree, Node, lca, root
-
+@testitem "lca function basic functionality" setup=[TreesBaseImports] begin
     # Test 1: Single node matches query
     tree = NodeTree(1)
     result = lca((tree, node) -> node.value == 1, tree, root(tree))
@@ -1379,9 +1343,7 @@ end
     @test result === root_node_dup
 end
 
-@testitem "lca function complex tree scenarios" begin
-    using LambdaRegression.Trees: NodeTree, Node, lca, root
-
+@testitem "lca function complex tree scenarios" setup=[TreesBaseImports] begin
     # Test complex tree:
     #       1
     #      / \
@@ -1425,9 +1387,7 @@ end
     @test result === root_node
 end
 
-@testitem "setindex! function functionality" begin
-    using LambdaRegression.Trees: NodeTree, Node, setindex!, root
-
+@testitem "setindex! function functionality" setup=[TreesBaseImports] begin
     # Test basic replacement
     #   1
     #  / \

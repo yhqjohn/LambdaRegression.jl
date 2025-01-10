@@ -325,10 +325,29 @@ end
 # Test Items
 ########################################################
 
-@testitem "DfsTree AbstractTree interface - basic setup" begin
+@testsnippet DfsBaseImports begin
     using LambdaRegression.Trees.DfsTrees: DfsTree, BinaryItem, BinaryItemType, arity, isleaf, leaf, binary, unary
     using LambdaRegression.Trees: NodeIndex, root, subtree, children, setchild!
-    
+    using LambdaRegression.Trees: children, setchild!
+    using LambdaRegression.Trees.DfsTrees: DfsTree, AbstractNodeItem, arity, isleaf
+    using LambdaRegression.Trees: subtree, children
+    import LambdaRegression.Trees.DfsTrees: arity as dfs_arity
+    using LambdaRegression.Trees.DfsTrees: DfsTree, AbstractNodeItem, arity
+    using LambdaRegression.Trees.DfsTrees: DfsTree, BinaryItem, BinaryItemType, setroot!, leaf, binary
+    using LambdaRegression.Trees: root
+    using LambdaRegression.Trees.DfsTrees: DfsTree, BinaryItem, BinaryItemType, leaf, binary, unary
+    using LambdaRegression.Trees: traverse, getstate, Leave, StackState
+end
+
+@testsnippet DfsTestNodeSetup begin
+    struct TestNode <: AbstractNodeItem
+        value::Int
+        child_count::Int
+    end
+    dfs_arity(node::TestNode) = node.child_count
+end
+
+@testitem "DfsTree AbstractTree interface - basic setup" setup=[DfsBaseImports] begin
     @test BinaryItem{Int} <: LambdaRegression.Trees.DfsTrees.AbstractNodeItem  # Test basic construction and interface compliance
     @test DfsTree{BinaryItem{Int}} <: LambdaRegression.Trees.AbstractTree
     
@@ -352,10 +371,7 @@ end
     @test root(empty_tree) === nothing
 end
 
-@testitem "DfsTree AbstractTree interface - children method" begin
-    using LambdaRegression.Trees.DfsTrees: DfsTree, BinaryItem, BinaryItemType, arity, isleaf, leaf, binary, unary
-    using LambdaRegression.Trees: children, setchild!
-    
+@testitem "DfsTree AbstractTree interface - children method" setup=[DfsBaseImports] begin
     leaf_tree = DfsTree([BinaryItem(leaf, 1)])  # Test leaf node (no children)
     @test arity(leaf_tree, 1) == 0
     @test isleaf(leaf_tree, 1) == true
@@ -381,10 +397,7 @@ end
     @test isleaf(tree, tree_children[2]) == true
 end
 
-@testitem "DfsTree AbstractTree interface - complex tree children" begin
-    using LambdaRegression.Trees.DfsTrees: DfsTree, BinaryItem, BinaryItemType, arity, isleaf, leaf, binary, unary
-    using LambdaRegression.Trees: children, setchild!
-    
+@testitem "DfsTree AbstractTree interface - complex tree children" setup=[DfsBaseImports] begin
     nodes = [  # Test more complex tree structure: 1 -> [2 -> [3 -> [4]], 5]
         BinaryItem(binary, 1),  # Root with 2 children
         BinaryItem(unary, 2),   # First child with 1 child
@@ -420,17 +433,7 @@ end
     @test isleaf(tree, grandchild_children[1]) == true
 end
 
-@testitem "DfsTree AbstractTree interface - subtree method" begin
-    using LambdaRegression.Trees.DfsTrees: DfsTree, AbstractNodeItem, arity, isleaf
-    using LambdaRegression.Trees: subtree, children
-    import LambdaRegression.Trees.DfsTrees: arity as dfs_arity
-    
-    struct TestNode <: AbstractNodeItem  # Define test node type
-        value::Int
-        child_count::Int
-    end
-    dfs_arity(node::TestNode) = node.child_count
-    
+@testitem "DfsTree AbstractTree interface - subtree method" setup=[DfsBaseImports, DfsTestNodeSetup] begin
     nodes = [  # Test subtree extraction from complex tree
         TestNode(1, 2),  # Root with 2 children
         TestNode(2, 1),  # First child with 1 child
@@ -456,16 +459,7 @@ end
     @test_throws BoundsError subtree(tree, 5)
 end
 
-@testitem "DfsTree optimized iteration - basic functionality" begin
-    using LambdaRegression.Trees.DfsTrees: DfsTree, AbstractNodeItem, arity
-    import LambdaRegression.Trees.DfsTrees: arity as dfs_arity
-    
-    struct TestNode <: AbstractNodeItem  # Define test node type
-        value::Int
-        child_count::Int
-    end
-    dfs_arity(node::TestNode) = node.child_count
-    
+@testitem "DfsTree optimized iteration - basic functionality" setup=[DfsBaseImports, DfsTestNodeSetup] begin
     single_tree = DfsTree([TestNode(1, 0)])  # Test single node iteration
     result = collect(single_tree)
     @test length(result) == 1
@@ -487,16 +481,7 @@ end
     end
 end
 
-@testitem "DfsTree optimized iteration - complex tree" begin
-    using LambdaRegression.Trees.DfsTrees: DfsTree, AbstractNodeItem, arity
-    import LambdaRegression.Trees.DfsTrees: arity as dfs_arity
-    
-    struct TestNode <: AbstractNodeItem  # Define test node type
-        value::Int
-        child_count::Int
-    end
-    dfs_arity(node::TestNode) = node.child_count
-    
+@testitem "DfsTree optimized iteration - complex tree" setup=[DfsBaseImports, DfsTestNodeSetup] begin
     complex_nodes = [  # Test complex tree structure: 1 -> [2 -> [3 -> [4]], 5]
         TestNode(1, 2),  # Root
         TestNode(2, 1),  # First child
@@ -522,10 +507,7 @@ end
     end
 end
 
-@testitem "DfsTree setroot! function" begin
-    using LambdaRegression.Trees.DfsTrees: DfsTree, BinaryItem, BinaryItemType, setroot!, leaf, binary
-    using LambdaRegression.Trees: root
-    
+@testitem "DfsTree setroot! function" setup=[DfsBaseImports] begin
     original_tree = DfsTree([BinaryItem(leaf, 1)])  # Test basic root replacement
     new_tree = DfsTree([BinaryItem(leaf, 10)])
     
@@ -554,10 +536,7 @@ end
     @test result[1].value == 42
 end
 
-@testitem "DfsTree sequential traverse with StackState" begin
-    using LambdaRegression.Trees.DfsTrees: DfsTree, BinaryItem, BinaryItemType, leaf, binary, unary
-    using LambdaRegression.Trees: traverse, getstate, Leave, StackState
-    
+@testitem "DfsTree sequential traverse with StackState" setup=[DfsBaseImports] begin
     nodes = [  # Create test tree structure: 1 -> [2 -> [3], 5]
         BinaryItem(binary, 1),  # Root
         BinaryItem(unary, 2),   # First child
@@ -583,10 +562,7 @@ end
     @test haskey(bag.lookup, StackState{Int})  # Verify StackState was automatically included
 end
 
-@testitem "DfsTree traverse with Leave() using sequential implementation" begin
-    using LambdaRegression.Trees.DfsTrees: DfsTree, BinaryItem, BinaryItemType, leaf, binary, unary
-    using LambdaRegression.Trees: traverse, getstate, Leave, StackState
-    
+@testitem "DfsTree traverse with Leave() using sequential implementation" setup=[DfsBaseImports] begin
     nodes = [  # Create test tree structure: 1 -> [2 -> [3], 5]
         BinaryItem(binary, 1),  # Root
         BinaryItem(unary, 2),   # First child

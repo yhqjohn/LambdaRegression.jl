@@ -3,7 +3,7 @@ using Random
 
 using LambdaRegression
 using LambdaRegression.TypeSystem
-using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, GlobalConstCtor, ApplyLeafCtor, FloatCtor, UniformChooser
+using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, GlobalConstCtor, ApplySpineCtor, FloatCtor, FocusedChooser
 using LambdaRegression.Mutations
 using LambdaRegression.Mutations.Populations: TypedSubtreeSwapCrossover
 using LambdaRegression.Regression
@@ -49,7 +49,7 @@ end
         input_slots=Symbol[:x],
         input_types=Dict{Symbol,TyLike}(:x => A),
         gen_ctors=[AbsCtor(), IndexCtor()],
-        gen_chooser=UniformChooser(),
+        gen_chooser=FocusedChooser(),
         gen_max_depth=6,
         gen_max_try=30,
         mutations=Mutations.AbstractMutation[],
@@ -95,7 +95,7 @@ end
         input_slots=Symbol[:x],
         input_types=Dict{Symbol,TyLike}(:x => A),
         gen_ctors=[AbsCtor(), GlobalConstCtor()],
-        gen_chooser=UniformChooser(),
+        gen_chooser=FocusedChooser(),
         gen_max_depth=4,
         gen_max_try=20,
         mutations=Mutations.AbstractMutation[],
@@ -154,8 +154,8 @@ end
             input_types=Dict{Symbol,TyLike}(:x => Xty),
         ),
         (;
-            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplyLeafCtor(), FloatCtor(0.0, 1.0)],
-            gen_chooser=UniformChooser(),
+            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplySpineCtor(max_spine_args=3), FloatCtor(0.0, 1.0)],
+            gen_chooser=FocusedChooser(max_spine_args=3),
             gen_max_depth=5,
             gen_max_try=15,
             mutations=Mutations.AbstractMutation[

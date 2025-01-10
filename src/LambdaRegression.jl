@@ -21,13 +21,19 @@ using .TypeSystem
 export TypeSystem
 
 include("generate/GenerateTree.jl")
-using .GenerateTree
+using .GenerateTree: generate_tree
+export generate_tree
 
 include("mutate/Mutations.jl")
 using .Mutations
-
+export Mutations
+using .Mutations: mutate_tree
+export mutate_tree
+#
 include("regression/Regression.jl")
 using .Regression
 export Regression
+using .Regression: Regressor, SupervisedDataset, FitResult, fit!, default_config, default_components, default_regressor, batch_generate_population
+export Regressor, SupervisedDataset, FitResult, fit!, default_config, default_components, default_regressor, batch_generate_population
 
 end # module LambdaRegression

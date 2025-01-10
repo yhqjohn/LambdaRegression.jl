@@ -44,9 +44,12 @@ Alias for [`@check`](@ref).
 """
 const var"@✓" = var"@check"
 
-@testitem "check" begin
+@testsnippet UtilsBaseImports begin
     using LambdaRegression.Utils
     using Test
+end
+
+@testitem "check" setup=[UtilsBaseImports] begin
     function foo(x)
         if x > 0
             return x

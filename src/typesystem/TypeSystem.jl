@@ -358,9 +358,36 @@ end
 # ------------------------------------------------------------
 # Binding TyVar with contractiveness & μ-fold
 # ------------------------------------------------------------
-function _bind!(var::TyVar, ty::Ty)
+
+"""
+    TyTrail()
+
+Undo-log for transactional unification.
+
+When passed to [`unify!`](@ref), every `TyVar.instance` mutation is recorded so callers can rollback a failed
+generation/mutation attempt without leaking partial bindings.
+"""
+mutable struct TyTrail
+    stack::Vector{Tuple{TyVar,Union{Ty,Nothing}}}
+end
+TyTrail() = TyTrail(Tuple{TyVar,Union{Ty,Nothing}}[])
+
+mark(trail::TyTrail)::Int = length(trail.stack)
+
+function rollback!(trail::TyTrail, m::Int)
+    @assert 0 <= m <= length(trail.stack)
+    for i in length(trail.stack):-1:(m + 1)
+        v, old = trail.stack[i]
+        v.instance = old
+    end
+    resize!(trail.stack, m)
+    return nothing
+end
+
+function _bind!(var::TyVar, ty::Ty, trail::Union{Nothing,TyTrail}=nothing)
     occ, contractive = occurs(var, ty, 0)
     if !occ
+        trail === nothing || push!(trail.stack, (var, var.instance))
         var.instance = ty
         return nothing
     elseif !contractive
@@ -369,6 +396,7 @@ function _bind!(var::TyVar, ty::Ty)
     else
         # Safe recursive occurrence - fold into μ-type.
         folded = TyMu(var, ty)
+        trail === nothing || push!(trail.stack, (var, var.instance))
         var.instance = folded
         return nothing
     end
@@ -378,7 +406,7 @@ end
 # Unification (equi-recursive, memoised)
 # ------------------------------------------------------------
 """
-    unify!(t1::Ty, t2::Ty) -> Union{Nothing,Err}
+    unify!(t1::Ty, t2::Ty; trail=nothing) -> Union{Nothing,Err}
 
 Equi-recursive unification. The algorithm first tries to bind a type
 variable appearing in the *first* argument. Only when the first argument
@@ -386,12 +414,12 @@ is not a free `TyVar` does it attempt to bind one from the second
 argument. Calling order therefore determines which side is treated as
 flexible (can be instantiated) and which side is considered rigid.
 """
-function unify!(t1::Ty, t2::Ty)
+function unify!(t1::Ty, t2::Ty; trail::Union{Nothing,TyTrail}=nothing)
     seen = Set{Tuple{Ty,Ty}}()
-    return _unify!(t1, t2, seen)
+    return _unify!(t1, t2, seen, trail)
 end
 
-function _unify!(t1::Ty, t2::Ty, seen::Set{Tuple{Ty,Ty}})
+function _unify!(t1::Ty, t2::Ty, seen::Set{Tuple{Ty,Ty}}, trail::Union{Nothing,TyTrail})
     a = prune(t1)
     b = prune(t2)
     if a === b
@@ -405,31 +433,31 @@ function _unify!(t1::Ty, t2::Ty, seen::Set{Tuple{Ty,Ty}})
     push!(seen, (a, b))
 
     if a isa TyVar
-        return _bind!(a, b)
+        return _bind!(a, b, trail)
     elseif b isa TyVar
-        return _bind!(b, a)
+        return _bind!(b, a, trail)
     elseif a isa TyConst && b isa TyConst && a.name == b.name
         return nothing
     elseif a isa TyFun && b isa TyFun
-        @✓ _unify!(a.arg, b.arg, seen)
-        @✓ _unify!(a.res, b.res, seen)
+        @✓ _unify!(a.arg, b.arg, seen, trail)
+        @✓ _unify!(a.res, b.res, seen, trail)
     elseif a isa TyProd && b isa TyProd
-        @✓ _unify!(a.left, b.left, seen)
-        @✓ _unify!(a.right, b.right, seen)
+        @✓ _unify!(a.left, b.left, seen, trail)
+        @✓ _unify!(a.right, b.right, seen, trail)
     elseif a isa TySum && b isa TySum
-        @✓ _unify!(a.left, b.left, seen)
-        @✓ _unify!(a.right, b.right, seen)
+        @✓ _unify!(a.left, b.left, seen, trail)
+        @✓ _unify!(a.right, b.right, seen, trail)
     elseif a isa TyArray && b isa TyArray
-        @✓ _unify!(a.len, b.len, seen)
-        @✓ _unify!(a.elem, b.elem, seen)
+        @✓ _unify!(a.len, b.len, seen, trail)
+        @✓ _unify!(a.elem, b.elem, seen, trail)
     elseif a isa TyNat && b isa TyNat && a.value == b.value
         return nothing
     elseif a isa TyMu
-        @✓ _unify!(a.body, b, seen)
+        @✓ _unify!(a.body, b, seen, trail)
     elseif b isa TyMu
-        @✓ _unify!(a, b.body, seen)
+        @✓ _unify!(a, b.body, seen, trail)
     elseif a isa TyList && b isa TyList
-        @✓ _unify!(a.elem, b.elem, seen)
+        @✓ _unify!(a.elem, b.elem, seen, trail)
     else
         return Err(MismatchError(a, b))
     end
@@ -471,7 +499,152 @@ function _inst(t::Ty, mapvar)
     end
 end
 
-iscompatible(t1::TyLike, t2::TyLike) = isnothing(unify!(instantiate(t1, 0), instantiate(t2, 0)))
+"""
+    iscompatible(a::TyLike, b::TyLike) -> Bool
+
+Return `true` iff `a` and `b` can be unified (up to instantiation).
+
+Implementation note:
+- `unify!` binds `TyVar.instance`. For compatibility checks used by generation/mutation/crossover,
+  we treat this as a *pure* predicate by unifying **fresh copies** of instantiated types.
+"""
+function iscompatible(a::TyLike, b::TyLike)::Bool
+    function _has_tyvar(t::Ty)::Bool
+        seen = IdDict{Ty,Nothing}()
+        function _walk(t::Ty)::Bool
+            t isa TyVar && return true
+            haskey(seen, t) && return false
+            seen[t] = nothing
+            if t isa TyFun
+                return _walk((t::TyFun).arg) || _walk((t::TyFun).res)
+            elseif t isa TyProd
+                return _walk((t::TyProd).left) || _walk((t::TyProd).right)
+            elseif t isa TySum
+                return _walk((t::TySum).left) || _walk((t::TySum).right)
+            elseif t isa TyMu
+                return true # binder is a TyVar even if the body doesn't reference it
+            elseif t isa TyList
+                return _walk((t::TyList).elem)
+            elseif t isa TyArray
+                arr = t::TyArray
+                return _walk(arr.len) || _walk(arr.elem)
+            else
+                return false
+            end
+        end
+        return _walk(t)
+    end
+
+    t1 = instantiate(a, 0)
+    t2 = instantiate(b, 0)
+    # Instantiating a TyScheme already produces fresh TyVars; monotypes may be shared (e.g. from meta caches),
+    # so only copy when the instantiated type contains TyVar.
+    (a isa Ty) && _has_tyvar(t1) && (t1 = deepcopy(t1))
+    (b isa Ty) && _has_tyvar(t2) && (t2 = deepcopy(t2))
+    return isnothing(unify!(t1, t2))
+end
+
+"""
+    typekey(t::TyLike) -> Any
+
+Canonical, α-invariant structural key for `Ty`/`TyScheme`.
+
+This is intended for **indexing and caching**, not for user-facing printing:
+- Free type variables are numbered by first occurrence order (`(:v, 0)`, `(:v, 1)`, ...).
+- Equi-recursive μ-types are represented using De Bruijn-style references (`(:mu_ref, depth)`).
+
+The returned value is a nested tuple/tree built from symbols, integers, and sub-keys and is safe to use
+as a dictionary key.
+"""
+function typekey(t::TyLike)
+    if t isa TyScheme
+        # Canonicalise bound vars (α-equivalence) before keying.
+        return typekey(_canonical_body(t))
+    else
+        return _typekey(t)
+    end
+end
+
+function _typekey(t::Ty)
+    # We intentionally do not call `prune` here: we want to control how μ-binders and instances are handled.
+    free_ids = IdDict{TyVar,Int}()
+    mu_stack = TyVar[]
+    seen = IdDict{Ty,Nothing}() # cycle breaker (should be rare outside μ-types)
+    return _typekey_walk(t, free_ids, mu_stack, seen)
+end
+
+function _typekey_walk(t::Ty, free_ids::IdDict{TyVar,Int}, mu_stack::Vector{TyVar}, seen::IdDict{Ty,Nothing})
+    if t isa TyVar
+        v = t::TyVar
+        # μ-binder reference has priority over instance-following to avoid loops like v.instance == μv. ...
+        if !isempty(mu_stack)
+            j = findlast(x -> x === v, mu_stack)
+            if j !== nothing
+                depth = length(mu_stack) - j # top binder => 0
+                return (:mu_ref, depth)
+            end
+        end
+        if v.instance !== nothing
+            return _typekey_walk(v.instance, free_ids, mu_stack, seen)
+        end
+        idx = get!(free_ids, v) do
+            length(free_ids)
+        end
+        return (:v, idx)
+    end
+
+    # Cycle breaker (defensive): outside μ-types we do not expect cyclic graphs.
+    if haskey(seen, t)
+        return (:cycle,)
+    end
+    seen[t] = nothing
+
+    if t isa TyConst
+        return (:const, (t::TyConst).name)
+    elseif t isa TyNat
+        return (:nat, (t::TyNat).value)
+    elseif t isa TyFun
+        f = t::TyFun
+        return (:fun, _typekey_walk(f.arg, free_ids, mu_stack, seen), _typekey_walk(f.res, free_ids, mu_stack, seen))
+    elseif t isa TyProd
+        p = t::TyProd
+        return (:prod, _typekey_walk(p.left, free_ids, mu_stack, seen), _typekey_walk(p.right, free_ids, mu_stack, seen))
+    elseif t isa TySum
+        s = t::TySum
+        return (:sum, _typekey_walk(s.left, free_ids, mu_stack, seen), _typekey_walk(s.right, free_ids, mu_stack, seen))
+    elseif t isa TyList
+        l = t::TyList
+        return (:list, _typekey_walk(l.elem, free_ids, mu_stack, seen))
+    elseif t isa TyArray
+        a = t::TyArray
+        return (:array, _typekey_walk(a.len, free_ids, mu_stack, seen), _typekey_walk(a.elem, free_ids, mu_stack, seen))
+    elseif t isa TyMu
+        m = t::TyMu
+        push!(mu_stack, m.var)
+        body_k = _typekey_walk(m.body, free_ids, mu_stack, seen)
+        pop!(mu_stack)
+        return (:mu, body_k)
+    else
+        return (:unknown, Symbol(string(typeof(t))))
+    end
+end
+
+"""
+    typectx_fingerprint(ctx::AbstractDict{Symbol,<:TyLike}) -> UInt
+
+Order-independent fingerprint for a typing context (by symbol key).
+
+This is suitable for cache keys (e.g. typed site caches) where we need a stable identifier that changes
+when any entry’s type changes.
+"""
+function typectx_fingerprint(ctx::AbstractDict{Symbol,<:TyLike})::UInt
+    ks = sort!(collect(keys(ctx)))
+    h = hash(:typectx, UInt(0))
+    for k in ks
+        h = hash(k, hash(typekey(ctx[k]), h))
+    end
+    return h
+end
 """
     islesseq(a::TyLike, b::TyLike) -> Bool
 
@@ -624,15 +797,15 @@ function _infer(node::AstNode,
                 meta::Union{Nothing,Dict{AstNode,Tuple{TyLike,TyLike}}})
     if node isa ConstNode
         entry = ctx[node.name]
-        ty = instantiate(entry, level)
+        ty = instantiate(entry, level, factory)
         return _record_meta(meta, node, ty, level, entry)
     elseif node isa VarNode
         sch = @✓ lookup(env, node.name)
-        ty = instantiate(sch, level)
+        ty = instantiate(sch, level, factory)
         return _record_meta(meta, node, ty, level)
     elseif node isa IndexNode
         sch = @✓ lookup(env, node.index)
-        ty = instantiate(sch, level)
+        ty = instantiate(sch, level, factory)
         return _record_meta(meta, node, ty, level)
     elseif node isa AbsNode
         tv = factory(level+1)
@@ -950,23 +1123,48 @@ get_type(::typeof(FDIV)) = FloatOp
 # ------------------------------------------------------------
 # Test items (basic sanity)
 # ------------------------------------------------------------
-@testitem "infix operators" begin
+@testsnippet TSBaseImports begin
+    using LambdaRegression.TypeSystem: TyConst, TyFun, TyProd, TySum, →, ×
+    using LambdaRegression.TypeSystem: IntTy, TyFun
     using LambdaRegression.TypeSystem
-    
-    IntTy = TyConst(:Int)
-    BoolTy = TyConst(:Bool)
-    fun_ty = IntTy → BoolTy
-    @test fun_ty isa TyFun && fun_ty.arg === IntTy && fun_ty.res === BoolTy
-    prod_ty = IntTy × BoolTy
-    @test prod_ty isa TyProd && prod_ty.left === IntTy && prod_ty.right === BoolTy
-    sum_ty = IntTy + BoolTy
-    @test sum_ty isa TySum && sum_ty.left === IntTy && sum_ty.right === BoolTy
+    using LambdaRegression.ASTs.NodeASTs
+    using LambdaRegression.TypeSystem: make_tyvar_factory
+    using Test
+    using LambdaRegression.Utils: Err
+    using LambdaRegression.TypeSystem: infer, infer_scheme, get_type_ctx, get_ast_type_ctx, TyLike, TyScheme
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, VarNode, IndexNode
+    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
+    using LambdaRegression.TypeSystem: TyLike
+    using LambdaRegression.TypeSystem: newtyvar, unify!
+    using LambdaRegression.TypeSystem: IntTy, IEQ, ISUB, IMUL, COND, get_type_ctx
+    using LambdaRegression.TypeSystem: collect_free_vars, prune
+    using LambdaRegression.Reduces: prepare
+    using LambdaRegression.TypeSystem: IntTy, IMUL, ISUB, IEQ, COND, get_type_ctx
+    using LambdaRegression.TypeSystem: COND, IntTy, get_type_ctx
+    using LambdaRegression.TypeSystem: FST, PAIR, IntTy, get_type_ctx
+    using LambdaRegression.TypeSystem: INL, INR, IntTy, BoolTy, get_type_ctx
+    using LambdaRegression.TypeSystem: newtyvar, unify!, prune, get_type, TOLIST
+    using LambdaRegression.TypeSystem: TyArray, TyNat, FloatTy, unify!, get_type
+    using LambdaRegression.Reduces: prepare, beta_reduce!
+    using LambdaRegression.TypeSystem: newtyvar, TyLike, IntTy, NilErr, TyList, CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND, get_type_ctx
+    using LambdaRegression.TypeSystem: IntTy, get_type_ctx
+    using LambdaRegression.TypeSystem: newtyvar, TyFun, iscompatible, IntTy
+    using LambdaRegression.TypeSystem: newtyvar, TyFun, typekey, unify!, prune, TyMu, IntTy
+    using LambdaRegression.TypeSystem: typectx_fingerprint, TyLike, IntTy, BoolTy
 end
 
-@testitem "TypeSystem pretty print arrow precedence" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: IntTy, TyFun
+@testitem "infix operators" setup=[TSBaseImports] begin
+    int_ty = TyConst(:Int)
+    bool_ty = TyConst(:Bool)
+    fun_ty = int_ty → bool_ty
+    @test fun_ty isa TyFun && fun_ty.arg === int_ty && fun_ty.res === bool_ty
+    prod_ty = int_ty × bool_ty
+    @test prod_ty isa TyProd && prod_ty.left === int_ty && prod_ty.right === bool_ty
+    sum_ty = int_ty + bool_ty
+    @test sum_ty isa TySum && sum_ty.left === int_ty && sum_ty.right === bool_ty
+end
 
+@testitem "TypeSystem pretty print arrow precedence" setup=[TSBaseImports] begin
     # `(A→B)→C` must print with parentheses on the argument side.
     arrow = string(Char(0x2192))
     t = TyFun(TyFun(IntTy, IntTy), TyFun(IntTy, IntTy))
@@ -974,11 +1172,7 @@ end
     @test s == "(Int$(arrow)Int)$(arrow)Int$(arrow)Int"
 end
 
-@testitem "simple hashing and equality" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.TypeSystem: TyLike
-    
+@testitem "simple hashing and equality" setup=[TSBaseImports] begin
     α = newtyvar(0)
     β = newtyvar(0)
     γ = newtyvar(0)
@@ -1011,9 +1205,7 @@ end
     @test ∀([α, β], α → α) ∉ s    
 end
 
-@testitem "TypeSystem make_tyvar_factory is detached" begin
-    using LambdaRegression.TypeSystem: make_tyvar_factory
-
+@testitem "TypeSystem make_tyvar_factory is detached" setup=[TSBaseImports] begin
     f1 = make_tyvar_factory()
     f2 = make_tyvar_factory()
 
@@ -1028,10 +1220,7 @@ end
     @test b2.id == 2
 end
 
-@testitem "simple identity typing" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-
+@testitem "simple identity typing" setup=[TSBaseImports] begin
     # term: (λx. x)
     term = AbsNode(:x, IndexNode(0))
     tree = AstTree(term)
@@ -1040,13 +1229,7 @@ end
     @test ty isa TyFun && ty.arg === ty.res
 end
 
-@testitem "infer_scheme and get_ast_type_ctx" begin
-    using Test
-    using LambdaRegression.Utils: Err
-    using LambdaRegression.TypeSystem: infer, infer_scheme, get_type_ctx, get_ast_type_ctx, TyLike, TyScheme
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, VarNode, IndexNode
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-
+@testitem "infer_scheme and get_ast_type_ctx" setup=[TSBaseImports] begin
     # infer_scheme generalises free variables at level 0
     id_named = AstTree(AbsNode(:x, VarNode(:x)))
     sch = infer_scheme(id_named, Dict{Symbol,TyLike}())
@@ -1066,10 +1249,7 @@ end
     @test tyctx[:ID] isa TyScheme
 end
 
-@testitem "self-application typable via μ-type" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-
+@testitem "self-application typable via μ-type" setup=[TSBaseImports] begin
     # term: λx. x x  (needs recursive type)
     body = AppNode(IndexNode(0), IndexNode(0))
     term = AbsNode(:x, body)
@@ -1081,11 +1261,7 @@ end
     @test ty.arg isa TyMu && ty.arg.body isa TyFun
 end
 
-@testitem "application polymorphism (λx.x) id" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.TypeSystem: TyLike
-
+@testitem "application polymorphism (λx.x) id" setup=[TSBaseImports] begin
     id_fun = AbsNode(:x, IndexNode(0))         # λx. x
 
     app_expr = AppNode(id_fun, id_fun)         # (λx.x) (λx.x)
@@ -1097,10 +1273,7 @@ end
     @test ty isa TyFun && ty.arg === ty.res
 end
 
-@testitem "positive μ-type via unify" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: newtyvar, unify!
-
+@testitem "positive μ-type via unify" setup=[TSBaseImports] begin
     α = newtyvar(0)
     int_ty = TyConst(:Int)
     unify!(α, TyFun(int_ty, α))
@@ -1108,10 +1281,7 @@ end
     @test α.instance isa TyMu
 end
 
-@testitem "list occurs check contractiveness" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: newtyvar, unify!
-
+@testitem "list occurs check contractiveness" setup=[TSBaseImports] begin
     α = newtyvar(0)
     result = unify!(α, TyList(α))
     @test isnothing(result)
@@ -1120,11 +1290,7 @@ end
     @test α.instance.body.elem === α
 end
 
-@testitem "factorial via Y_int" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: IntTy, IEQ, ISUB, IMUL, COND, get_type_ctx
-    using LambdaRegression.ASTs.NodeASTs
-
+@testitem "factorial via Y_int" setup=[TSBaseImports] begin
     ctx = merge(
         get_type_ctx(Dict{Symbol,Any}(
             :zero => 0,
@@ -1155,10 +1321,7 @@ end
     @test ty isa TyFun && ty.arg === IntTy && ty.res === IntTy
 end
 
-@testitem "Linked TyVar instances" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: collect_free_vars, prune
-
+@testitem "Linked TyVar instances" setup=[TSBaseImports] begin
     α = newtyvar(0)
     β = newtyvar(0)
     mu = μ(α, β→α)
@@ -1169,13 +1332,7 @@ end
     vs = collect_free_vars(α)
 end
 
-@testitem "Y combinator" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.Reduces: prepare
-    using LambdaRegression.TypeSystem: IntTy, IMUL, ISUB, IEQ, COND, get_type_ctx
-
+@testitem "Y combinator" setup=[TSBaseImports] begin
     const_ctx = @terms(cond=COND, eq=IEQ, mul=IMUL, sub=ISUB, int0=0, int1=1, int4=4)
 
     merge!(const_ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", const_ctx)))
@@ -1188,11 +1345,7 @@ end
     @test ty == IntTy
 end
 
-@testitem "polymorphic if constant" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.TypeSystem: COND, IntTy, get_type_ctx
-
+@testitem "polymorphic if constant" setup=[TSBaseImports] begin
     ctx = get_type_ctx(Dict{Symbol,Any}(
         :COND => COND,
         :boolTrue => true,
@@ -1209,11 +1362,7 @@ end
 
 # -------------------- Product & Sum basic tests --------------------
 
-@testitem "product unify and projection" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.TypeSystem: FST, PAIR, IntTy, get_type_ctx
-
+@testitem "product unify and projection" setup=[TSBaseImports] begin
     ctx = get_type_ctx(Dict{Symbol,Any}(
         :FST => FST,
         :PAIR => PAIR,
@@ -1228,11 +1377,7 @@ end
     @test ty === IntTy
 end
 
-@testitem "sum inl inr case" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.TypeSystem: INL, INR, IntTy, BoolTy, get_type_ctx
-
+@testitem "sum inl inr case" setup=[TSBaseImports] begin
     α, β, γ = newtyvar(0), newtyvar(0), newtyvar(0)
     ctx = merge(
         get_type_ctx(Dict{Symbol,Any}(
@@ -1254,11 +1399,7 @@ end
     @test ty === BoolTy
 end
 
-@testitem "TyArray length polymorphism unify" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: newtyvar, unify!, prune, get_type, TOLIST
-    using LambdaRegression.Utils: Err
-
+@testitem "TyArray length polymorphism unify" setup=[TSBaseImports] begin
     # Length variable can unify with a concrete TyNat.
     n = newtyvar(0)
     t1 = TyArray(n, TypeSystem.FloatTy)
@@ -1273,10 +1414,7 @@ end
     @test get_type(TOLIST) isa TypeSystem.TyScheme
 end
 
-@testitem "TypeSystem Array HO primitives typing" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.TypeSystem: TyArray, TyNat, FloatTy, unify!, get_type
-
+@testitem "TypeSystem Array HO primitives typing" setup=[TSBaseImports] begin
     A = TyArray(TyNat(3), FloatTy)
 
     map_ty = TypeSystem.instantiate(get_type(TypeSystem.AMAP), 0)
@@ -1292,13 +1430,7 @@ end
 # ------------------------------------------------------------
 # Advanced type invariance tests --------------------
 
-@testitem "factorial via Y combinator - type invariance under reduction" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.Reduces: prepare, beta_reduce!
-    using LambdaRegression.TypeSystem: IntTy, IMUL, ISUB, IEQ, COND, get_type_ctx
-
+@testitem "factorial via Y combinator - type invariance under reduction" setup=[TSBaseImports] begin
     # Deterministic integer identifiers to avoid random gensym names
     ctx = @terms(cond=COND, eq=IEQ, mul=IMUL, sub=ISUB, int0=0, int1=1, int4=4)
     merge!(ctx, @terms(Y=parse_lambda("λf.(λx.f (x x)) (λx.f (x x))", ctx)))
@@ -1316,13 +1448,7 @@ end
     @test value == 24
 end
 
-@testitem "list square-sum - type invariance under reduction" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.ASTs.Parse: parse_lambda, @terms
-    using LambdaRegression.Reduces: prepare, beta_reduce!
-    using LambdaRegression.TypeSystem: newtyvar, TyLike, IntTy, NilErr, TyList, CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND, get_type_ctx
-
+@testitem "list square-sum - type invariance under reduction" setup=[TSBaseImports] begin
     β = newtyvar(0)
 
     id = x -> x
@@ -1367,53 +1493,45 @@ end
 # Meta bounds recording tests
 # ------------------------------------------------------------
 
-@testitem "islesseq subset polymorphism" begin
-    using LambdaRegression.TypeSystem
-    IntTy = TyConst(:Int)
+@testitem "islesseq subset polymorphism" setup=[TSBaseImports] begin
+    int_ty = TyConst(:Int)
     α = newtyvar(0)
     scheme_any = ∀([α], α)
-    @test islesseq(IntTy, scheme_any)
-    @test !islesseq(scheme_any, IntTy)
+    @test islesseq(int_ty, scheme_any)
+    @test !islesseq(scheme_any, int_ty)
 end
 
-@testitem "islesseq rigidity and function" begin
-    using LambdaRegression.TypeSystem
-    IntTy, β, γ = TyConst(:Int), newtyvar(0), newtyvar(0)
+@testitem "islesseq rigidity and function" setup=[TSBaseImports] begin
+    int_ty, β, γ = TyConst(:Int), newtyvar(0), newtyvar(0)
     scheme_fun = ∀([β], β → β)
-    @test islesseq(IntTy → IntTy, scheme_fun)
-    @test !islesseq(scheme_fun, IntTy → IntTy)
-    @test !islesseq(γ, IntTy)          # rigid var `γ` on subset side cannot be bound
-    @test islesseq(IntTy, γ)           # superset `γ` is flexible and can be bound
+    @test islesseq(int_ty → int_ty, scheme_fun)
+    @test !islesseq(scheme_fun, int_ty → int_ty)
+    @test !islesseq(γ, int_ty)          # rigid var `γ` on subset side cannot be bound
+    @test islesseq(int_ty, γ)           # superset `γ` is flexible and can be bound
 end
 
-@testitem "islesseq advanced subtyping" begin
-    using LambdaRegression.TypeSystem
-    IntTy, BoolTy = TyConst(:Int), TyConst(:Bool)
+@testitem "islesseq advanced subtyping" setup=[TSBaseImports] begin
+    int_ty, bool_ty = TyConst(:Int), TyConst(:Bool)
     α, β = newtyvar(0), newtyvar(0)
 
     # Scheme vs Scheme
     id_scheme1, id_scheme2 = ∀([α], α → α), ∀([β], β → β)
     @test islesseq(id_scheme1, id_scheme2) && islesseq(id_scheme2, id_scheme1)
-    int_fun_scheme = ∀([α], α → IntTy)
+    int_fun_scheme = ∀([α], α → int_ty)
     @test !islesseq(int_fun_scheme, id_scheme1) # (α→Int) ⊈ (β→β)
     @test !islesseq(id_scheme1, int_fun_scheme) # (β→β) ⊈ (α→Int)
 
     # Mu vs Mu (equi-recursive) & Mu vs Scheme
-    mu_int1, mu_int2 = μ(α, α → IntTy), μ(β, β → IntTy)
+    mu_int1, mu_int2 = μ(α, α → int_ty), μ(β, β → int_ty)
     @test islesseq(mu_int1, mu_int2) && islesseq(mu_int2, mu_int1)
-    mu_bool = μ(α, α → BoolTy)
+    mu_bool = μ(α, α → bool_ty)
     @test !islesseq(mu_int1, mu_bool)
     any_scheme = ∀([β], β)
     @test islesseq(mu_int1, any_scheme)      # (μ α. α→Int) ⊆ (∀β. β)
     @test !islesseq(any_scheme, mu_int1)     # (∀β. β) ⊈ (μ α. α→Int)
 end
 
-@testitem "meta bounds recording" begin
-    using LambdaRegression.TypeSystem
-    using LambdaRegression.ASTs.NodeASTs
-
-    using LambdaRegression.TypeSystem: IntTy, get_type_ctx
-
+@testitem "meta bounds recording" setup=[TSBaseImports] begin
     # Prepare context with a polymorphic identity constant
     α = newtyvar(0)
     ctx = merge(
@@ -1462,6 +1580,47 @@ end
     min_mu, max_mu = meta_mu[self_app]
     @test min_mu isa TyFun && min_mu.arg isa TyMu
     @test max_mu isa TyScheme
+end
+
+@testitem "iscompatible is side-effect free on input types" setup=[TSBaseImports] begin
+    α = newtyvar(0)
+    β = newtyvar(0)
+    t = TyFun(α, β)
+    @test α.instance === nothing
+    @test β.instance === nothing
+
+    @test iscompatible(t, TyFun(IntTy, IntTy))
+
+    # Must remain unbound: iscompatible unifies on fresh copies.
+    @test α.instance === nothing
+    @test β.instance === nothing
+end
+
+@testitem "typekey alpha invariance and mu termination" setup=[TSBaseImports] begin
+    # α-invariance for free vars (by first-occurrence numbering).
+    a1, b1 = newtyvar(0), newtyvar(0)
+    a2, b2 = newtyvar(0), newtyvar(0)
+    k1 = typekey(TyFun(a1, b1))
+    k2 = typekey(TyFun(a2, b2))
+    @test k1 == k2
+
+    # Repeated occurrences matter: (α→α) is not the same as (α→β).
+    a3, b3 = newtyvar(0), newtyvar(0)
+    @test typekey(TyFun(a3, a3)) != typekey(TyFun(a3, b3))
+
+    # μ-type key must terminate and be stable.
+    v = newtyvar(0)
+    @test isnothing(unify!(v, TyFun(v, IntTy)))
+    mu = prune(v)
+    @test mu isa TyMu
+    kmu = typekey(mu)
+    @test kmu[1] == :mu
+end
+
+@testitem "typectx_fingerprint is order independent" setup=[TSBaseImports] begin
+    a = Dict{Symbol,TyLike}(:x => IntTy, :y => BoolTy)
+    b = Dict{Symbol,TyLike}(:y => BoolTy, :x => IntTy)
+    @test typectx_fingerprint(a) == typectx_fingerprint(b)
 end
 
 end # module TypeSystem

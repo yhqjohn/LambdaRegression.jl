@@ -14,10 +14,10 @@ using Random
 using TestItems
 
 using ...Utils: Err
-using ...TypeSystem: Ty, TyLike, TyFun, infer, iscompatible, make_tyvar_factory
+using ...TypeSystem: Ty, TyLike, TyFun, infer, iscompatible, make_tyvar_factory, typekey
 using ...ASTs.NodeASTs: AstTree, AstNode, AbsNode, ConstNode, IndexNode, ScopeState, children
 using ...ASTs.Contexts: ConstSymbolFactory
-using ...Trees: traverse, PointerState, getstate, Break, setroot!, setchild!
+using ...Trees: traverse, PointerState, getstate, Break, Leave, setroot!, setchild!
 
 export TypedSubtreeSwapCrossover
 
@@ -66,7 +66,7 @@ function _collect_sites(tree::AstTree, type_ctx::Dict{Symbol,<:TyLike}; tyfactor
         scope = getstate(bag, ScopeState)
 
         # Root node can appear in traversal before `meta` contains it in some early-return paths.
-        haskey(meta, node) || return nothing
+        haskey(meta, node) || return Leave()
 
         path =
             if pointer.parent === nothing
@@ -94,6 +94,16 @@ function _node_at_path(tree::AstTree, path::Vector{Int})::AstNode
     return node
 end
 
+function _node_at_path_maybe(tree::AstTree, path::Vector{Int})::Union{Nothing,AstNode}
+    node = tree.root
+    for idx in path
+        kids = children(node)
+        (1 <= idx <= length(kids)) || return nothing
+        node = kids[idx]
+    end
+    return node
+end
+
 function _replace_at_path!(tree::AstTree, path::Vector{Int}, new_subtree::AstTree)
     if isempty(path)
         setroot!(tree, new_subtree)
@@ -103,6 +113,20 @@ function _replace_at_path!(tree::AstTree, path::Vector{Int}, new_subtree::AstTre
     parent = _node_at_path(tree, parent_path)
     setchild!(tree, parent, path[end], new_subtree)
     return tree
+end
+
+function _replace_at_path_maybe!(tree::AstTree, path::Vector{Int}, new_subtree::AstTree)::Bool
+    if isempty(path)
+        setroot!(tree, new_subtree)
+        return true
+    end
+    parent_path = path[1:end-1]
+    parent = _node_at_path_maybe(tree, parent_path)
+    parent === nothing && return false
+    kids = children(parent)
+    (1 <= path[end] <= length(kids)) || return false
+    setchild!(tree, parent, path[end], new_subtree)
+    return true
 end
 
 function _fresh_const_symbol!(f::ConstSymbolFactory,
@@ -164,6 +188,22 @@ function _sites_match(op, a::_XSite, b::_XSite)::Bool
         end
     end
     return true
+end
+
+_type_tag(k) = (k isa Tuple && !isempty(k)) ? k[1] : :unknown
+
+function _bucket_key_exact(op, s::_XSite)
+    ty_k = typekey(s.ty)
+    depth_k = op.require_same_depth ? s.depth : -1
+    binder_k = op.require_compatible_binders ? Tuple(typekey(t) for t in s.binder_types) : ()
+    return (ty_k, depth_k, binder_k)
+end
+
+function _bucket_key_tag(op, s::_XSite)
+    ty_tag = _type_tag(typekey(s.ty))
+    depth_k = op.require_same_depth ? s.depth : -1
+    binder_tag = op.require_compatible_binders ? Tuple(_type_tag(typekey(t)) for t in s.binder_types) : ()
+    return (ty_tag, depth_k, binder_tag)
 end
 
 """
@@ -247,12 +287,30 @@ function crossover(op::TypedSubtreeSwapCrossover,
     length(sites_a2) >= op.min_sites || return Err(NoEligibleCrossoverSiteErr())
     length(sites_b2) >= op.min_sites || return Err(NoEligibleCrossoverSiteErr())
 
+    # Build simple buckets for B to avoid O(|A|*|B|) scans on every try.
+    buckets_exact = Dict{Any,Vector{_XSite}}()
+    buckets_tag = Dict{Any,Vector{_XSite}}()
+    for s in sites_b2
+        push!(get!(buckets_exact, _bucket_key_exact(op, s), _XSite[]), s)
+        push!(get!(buckets_tag, _bucket_key_tag(op, s), _XSite[]), s)
+    end
+
     for _ in 1:op.max_try
         site_a = rand(rng, sites_a2)
+        seed = get(buckets_exact, _bucket_key_exact(op, site_a), nothing)
+        (seed === nothing || isempty(seed)) && (seed = get(buckets_tag, _bucket_key_tag(op, site_a), sites_b2))
+
         candidates_b = _XSite[]
-        for s in sites_b2
+        for s in seed
             _sites_match(op, site_a, s) || continue
             push!(candidates_b, s)
+        end
+        if isempty(candidates_b) && seed !== sites_b2
+            # Fallback: keep baseline behavior if bucketing is too strict (e.g. TyVar-ish sites).
+            for s in sites_b2
+                _sites_match(op, site_a, s) || continue
+                push!(candidates_b, s)
+            end
         end
         isempty(candidates_b) && continue
         site_b = rand(rng, candidates_b)
@@ -265,8 +323,10 @@ function crossover(op::TypedSubtreeSwapCrossover,
         local_b = copy(b.local_consts)
         local_b_ty = copy(b.local_consts_ty)
 
-        node_a = _node_at_path(tree_a, site_a.path)
-        node_b = _node_at_path(tree_b, site_b.path)
+        node_a = _node_at_path_maybe(tree_a, site_a.path)
+        node_a === nothing && continue
+        node_b = _node_at_path_maybe(tree_b, site_b.path)
+        node_b === nothing && continue
         sub_a = AstTree(deepcopy(node_a))
         sub_b = AstTree(deepcopy(node_b))
 
@@ -274,8 +334,8 @@ function crossover(op::TypedSubtreeSwapCrossover,
         _remap_donor_locals!(sub_b, b.local_consts, b.local_consts_ty, local_a, local_a_ty, const_symfactory_ctor())
         _remap_donor_locals!(sub_a, a.local_consts, a.local_consts_ty, local_b, local_b_ty, const_symfactory_ctor())
 
-        _replace_at_path!(tree_a, site_a.path, sub_b)
-        _replace_at_path!(tree_b, site_b.path, sub_a)
+        _replace_at_path_maybe!(tree_a, site_a.path, sub_b) || continue
+        _replace_at_path_maybe!(tree_b, site_b.path, sub_a) || continue
 
         if prune
             prune_local_consts!(tree_a, local_a, local_a_ty)
@@ -301,14 +361,22 @@ function crossover(op::TypedSubtreeSwapCrossover,
     return Err(CrossoverMaxTryReachedErr(op.max_try))
 end
 
-@testitem "Populations TypedSubtreeSwapCrossover: basic success + type stable (TyFun)" begin
+@testsnippet PopCrossBaseImports begin
     using Random
     using LambdaRegression.Mutations.Populations: Individual, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike, infer, iscompatible
     using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
     using LambdaRegression.TypeSystem: make_tyvar_factory
+    using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike
+    using LambdaRegression.Utils: Err
+    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
+    using LambdaRegression.TypeSystem: IntTy, TyLike
+    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode, AbsNode, IndexNode
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
+end
 
+@testitem "Populations TypedSubtreeSwapCrossover: basic success + type stable (TyFun)" setup=[PopCrossBaseImports] begin
     rng = MersenneTwister(1)
     target_ty = TyFun(IntTy, IntTy)
     global_consts_ty = Dict{Symbol,TyLike}(:add => TyFun(IntTy, TyFun(IntTy, IntTy)))
@@ -339,14 +407,20 @@ end
     @test iscompatible(t2, target_ty)
 end
 
-@testitem "Populations TypedSubtreeSwapCrossover: local-const conflict renamed" begin
-    using Random
-    using LambdaRegression.Mutations.Populations: Individual, TypedSubtreeSwapCrossover, crossover
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.TypeSystem: IntTy, TyLike
-    using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
-    using LambdaRegression.TypeSystem: make_tyvar_factory
+@testitem "Populations _collect_sites paths are structurally valid" setup=[PopCrossBaseImports] begin
+    # λx. add (#0) (add k #0)
+    tree = AstTree(AbsNode(:x, AppNode(AppNode(ConstNode(:add), IndexNode(0)), AppNode(AppNode(ConstNode(:add), ConstNode(:k)), IndexNode(0)))))
+    global_consts_ty = Dict{Symbol,TyLike}(:add => TyFun(IntTy, TyFun(IntTy, IntTy)))
+    local_consts_ty = Dict{Symbol,TyLike}(:k => IntTy)
+    tyf = make_tyvar_factory()
+    sites = LambdaRegression.Mutations.Populations._collect_sites(tree, merge(global_consts_ty, local_consts_ty); tyfactory=tyf)
+    @test !(sites isa Err)
+    for s in sites
+        @test LambdaRegression.Mutations.Populations._node_at_path_maybe(tree, s.path) !== nothing
+    end
+end
 
+@testitem "Populations TypedSubtreeSwapCrossover: local-const conflict renamed" setup=[PopCrossBaseImports] begin
     rng = MersenneTwister(1111)
     global_consts_ty = Dict{Symbol,TyLike}()
 
@@ -377,13 +451,7 @@ end
     @test c2.local_consts[(c2.tree.root::ConstNode).name] == 1
 end
 
-@testitem "Populations TypedSubtreeSwapCrossover: target_ty mismatch fails" begin
-    using Random
-    using LambdaRegression.Mutations.Populations: Individual, TypedSubtreeSwapCrossover, crossover
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode, AbsNode, IndexNode
-    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
-    using LambdaRegression.Utils: Err
-
+@testitem "Populations TypedSubtreeSwapCrossover: target_ty mismatch fails" setup=[PopCrossBaseImports] begin
     rng = MersenneTwister(1234)
     global_consts_ty = Dict{Symbol,TyLike}()
 

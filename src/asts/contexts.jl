@@ -217,9 +217,14 @@ COND(x) = x ? T : F
 # Test Items
 ########################################################
 
-@testitem "EvalContext overlay write isolation + deterministic new_constant!" begin
+@testsnippet ContextsBaseImports begin
     using LambdaRegression.ASTs.Contexts: EvalContext, ConstSymbolFactory, new_constant!
+    using LambdaRegression.ASTs.Contexts: EvalContext, ConstSymbolFactory
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, ConstNode
+    using LambdaRegression.Reduces: beta_reduce!
+end
 
+@testitem "EvalContext overlay write isolation + deterministic new_constant!" setup=[ContextsBaseImports] begin
     globals = Dict{Symbol,Any}(:g => 1)
     locals = Dict{Symbol,Any}(:l => 2)
     overlay = Dict{Symbol,Any}(:o => 3)
@@ -236,11 +241,7 @@ COND(x) = x ? T : F
     @test !haskey(globals, :c1)
 end
 
-@testitem "EvalContext integrates with Reduce ConstNode evaluation" begin
-    using LambdaRegression.ASTs.Contexts: EvalContext, ConstSymbolFactory
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, ConstNode
-    using LambdaRegression.Reduces: beta_reduce!
-
+@testitem "EvalContext integrates with Reduce ConstNode evaluation" setup=[ContextsBaseImports] begin
     globals = Dict{Symbol,Any}(:double => (x -> 2x))
     overlay = Dict{Symbol,Any}(:three => 3)
     ctx = EvalContext(overlay=overlay, globals=globals, symfactory=ConstSymbolFactory(prefix=:c))
