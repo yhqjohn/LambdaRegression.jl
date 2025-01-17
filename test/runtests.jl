@@ -7,6 +7,3 @@ using TestItemRunner
 )
 
 import LambdaRegression
-if get(ENV, "LAMBDAREGRESSION_RUN_INTEGRATION", "") == "1" && isdefined(LambdaRegression, :Regression)
-    include("integration/regression_smoke.jl")
-end

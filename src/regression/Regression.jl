@@ -3,10 +3,10 @@
 
 Frontier regression runner interfaces.
 
-This module defines the **top-level API** for running population-based regression
-over typed lambda-calculus programs. The implementation is intentionally staged:
-we stabilize the interfaces (components/config/context plumbing) before the
-end-to-end evolutionary loop.
+This module defines the **top-level API** for running population-based
+regression over typed lambda-calculus programs. The implementation is
+intentionally staged: callers provide the initial population while the core
+loop owns evaluation, selection, mutation, and crossover plumbing.
 
 Design goals
 - High composability: configuration is a `NamedTuple` and components are injected
@@ -18,7 +18,7 @@ Design goals
 
 Status
 - `fit!` implements a minimal typed population loop with injected `evaluate` and `loss`.
-- For observation hooks, `fit!` supports `callback(state)` and an optional `components.init_population(...)` hook.
+- For diagnostics, `fit!` supports `callback(state)` and an optional `components.init_population(...)` hook.
 - Thread-safe primitives for SR paths live in `ASTs.Contexts.EvalContext` and
   `TypeSystem.make_tyvar_factory`.
 """
@@ -35,14 +35,12 @@ using ..TypeSystem: Ty, TyLike, make_tyvar_factory, get_type_ctx
 using ..ASTs.Contexts: EvalContext, ConstSymbolFactory, new_constant!
 using ..ASTs.NodeASTs: AstTree, AstNode, AppNode, AbsNode, ConstNode, IndexNode, SymbolGenerator
 using ..Reduces: beta_reduce!
-using ..GenerateTree
 using ..Mutations
 using ..Mutations: Populations
 using ..Mutations.Populations: Individual
 
 export Regressor, SupervisedDataset, FitResult, fit!
 export default_config, default_components, default_regressor
-export batch_generate_population
 
 struct NotImplementedErr end
 struct MissingComponentErr
@@ -399,7 +397,6 @@ function default_config(;
     population_size::Int=200,
     generations::Int=50,
     error_threshold::Float64=1e-6,
-    init_mutation_rounds::Int=1,
     max_reduce_steps::Int=64,
     closure_max_reduce_steps::Int=max_reduce_steps,
     closure_lift_max_per_pass::Int=64,
@@ -412,10 +409,7 @@ function default_config(;
         require_change=true,
         max_resample=10,
         on_fail=:immigrant,              # :immigrant or :clone
-        immigrant_mutation_rounds=init_mutation_rounds,
         immigrant_max_try=3,
-        immigrant_gen_max_depth=nothing,
-        immigrant_gen_max_try=nothing,
         immigrants_per_gen=0,
     ),
     stats=(;
@@ -434,7 +428,6 @@ function default_config(;
         population_size,
         generations,
         error_threshold,
-        init_mutation_rounds,
         max_reduce_steps,
         closure_max_reduce_steps,
         closure_lift_max_per_pass,
@@ -466,21 +459,10 @@ function default_components(;
     input_types::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     tyfactory_ctor=make_tyvar_factory,
     const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
-    # --- Tier1 defaults (can be overridden via merge/kwargs) ---
-    gen_ctors::Vector{<:GenerateTree.AbstractCtor}=[
-        GenerateTree.AbsCtor(),
-        GenerateTree.IndexCtor(),
-        GenerateTree.GlobalConstCtor(),
-        GenerateTree.ApplySpineCtor(max_spine_args=3),
-    ],
-    gen_chooser::GenerateTree.AbstractChooser=GenerateTree.FocusedChooser(max_spine_args=3),
-    gen_max_depth::Int=9,
-    gen_max_try::Int=80,
     mutations::Vector{<:Mutations.AbstractMutation}=[
         Mutations.ScalarConstMutation(),
         Mutations.BoolConstMutation(),
         Mutations.ArrayConstMutation(),
-        Mutations.SubtreeReplaceMutation(),
         Mutations.PointMutation(),
         Mutations.CSEMutation(),
         Mutations.BetaReduceMutation(),
@@ -512,10 +494,6 @@ function default_components(;
         tyfactory_ctor,
         const_symfactory_ctor,
         make_eval_context,
-        gen_ctors,
-        gen_chooser,
-        gen_max_depth,
-        gen_max_try,
         mutations,
         mutation_chooser,
         mutation_provider,
@@ -542,88 +520,6 @@ function default_regressor(target_ty::Ty;
 end
 
 """
-    batch_generate_population(reg, data; N, seed, global_type_ctx, mutate_rounds, purpose=:init, recorder=nothing) -> Union{Vector{Individual},Err}
-
-Generate a population of `N` individuals by:
-1) generating trees via injected `components.generate_tree` (default: `GenerateTree.generate_tree`),
-2) applying `mutate_rounds` mutation rounds in-place (default: `Mutations.mutate_tree`).
-
-This is a utility intended for initialization and immigrant injection.
-"""
-function batch_generate_population(reg::Regressor, data::SupervisedDataset;
-    N::Int,
-    seed::UInt64,
-    global_type_ctx::Dict{Symbol,TyLike},
-    mutate_rounds::Int,
-    purpose::Symbol=:init,
-    recorder=nothing,
-    gen_max_depth_override::Union{Nothing,Int}=nothing,
-    gen_max_try_override::Union{Nothing,Int}=nothing,
-)
-    components = reg.components
-    gen_fn = haskey(components, :generate_tree) ? components.generate_tree : GenerateTree.generate_tree
-    mut_fn = haskey(components, :mutate_tree) ? components.mutate_tree : Mutations.mutate_tree
-
-    pop = Vector{Individual}(undef, N)
-    for i in 1:N
-        rng_i = derive_rng(seed, 0, i, Symbol(purpose, :_tree))
-        tyfactory = components.tyfactory_ctor()
-        symfactory = SymbolGenerator()
-        const_symfactory = components.const_symfactory_ctor()
-        local_consts = Dict{Symbol,Any}()
-        local_consts_ty = Dict{Symbol,TyLike}()
-
-        tree = gen_fn(
-            reg.target_ty;
-            ctors=components.gen_ctors,
-            chooser=components.gen_chooser,
-            max_depth=(gen_max_depth_override === nothing ? components.gen_max_depth : gen_max_depth_override),
-            max_try=(gen_max_try_override === nothing ? components.gen_max_try : gen_max_try_override),
-            tyfactory=tyfactory,
-            symfactory=symfactory,
-            rng=rng_i,
-            global_consts_ty=global_type_ctx,
-            local_consts=local_consts,
-            local_consts_ty=local_consts_ty,
-        )
-        tree isa Err && return tree
-
-        cur_tree = tree
-        for r in 1:mutate_rounds
-            rng_m = derive_rng(seed, 0, (i << 8) + r, Symbol(purpose, :_mutate))
-            mutated = mut_fn(
-                cur_tree,
-                reg.target_ty;
-                rng=rng_m,
-                mutations=components.mutations,
-                chooser=components.mutation_chooser,
-                provider=components.mutation_provider,
-                max_try=components.mutation_max_try,
-                prune_consts=components.mutation_prune_consts,
-                copy_tree=true,
-                copy_ctx=true,
-                global_consts_ty=global_type_ctx,
-                local_consts=local_consts,
-                local_consts_ty=local_consts_ty,
-                gen_ctors=components.gen_ctors,
-                gen_chooser=components.gen_chooser,
-                gen_max_depth=components.gen_max_depth,
-                gen_max_try=components.gen_max_try,
-                tyfactory=tyfactory,
-                symfactory=symfactory,
-                const_symfactory=const_symfactory,
-                recorder=recorder,
-            )
-            mutated isa Err && break
-            cur_tree = mutated
-        end
-
-        pop[i] = Individual(cur_tree, reg.target_ty; local_consts=local_consts, local_consts_ty=local_consts_ty, fitness=nothing, meta=(;))
-    end
-    return pop
-end
-
-"""
     fit!(reg::Regressor, data::SupervisedDataset; callback=nothing) -> Union{FitResult,Err}
 
 Run a minimal population-based regression loop.
@@ -638,7 +534,6 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
 
     # Required component keys.
     required = Symbol[
-        :gen_ctors, :gen_chooser, :gen_max_depth, :gen_max_try,
         :mutations, :mutation_chooser, :mutation_provider, :mutation_max_try, :mutation_prune_consts,
         :crossover_op,
         :global_consts, :global_consts_ty,
@@ -670,23 +565,7 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
         length(res) == N || return Err(ArgumentError("init_population must return exactly N individuals"))
         res
     else
-        init_recorder = nothing
-        cfg_stats = get(config, :stats, (; enabled=false))
-        if get(cfg_stats, :enabled, false) && get(cfg_stats, :mutation, false)
-            init_recorder = Mutations.MutationAttemptRecorder()
-        end
-        res = batch_generate_population(
-            reg,
-            data;
-            N=N,
-            seed=seed,
-            global_type_ctx=global_type_ctx,
-            mutate_rounds=config.init_mutation_rounds,
-            purpose=:init,
-            recorder=init_recorder,
-        )
-        res isa Err && return res
-        res
+        return Err(MissingComponentErr(:init_population))
     end
 
     history = Any[]
@@ -830,7 +709,7 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
         end
 
         # --- Reproduce ---
-        reprocfg = get(config, :repro, (; require_change=false, max_resample=0, on_fail=:clone, immigrant_mutation_rounds=0, immigrant_max_try=1, immigrants_per_gen=0))
+        reprocfg = get(config, :repro, (; require_change=false, max_resample=0, on_fail=:clone, immigrant_max_try=1, immigrants_per_gen=0))
         statscfg = get(config, :stats, (; enabled=false))
         do_stats = get(statscfg, :enabled, false)
         rec_mut = (do_stats && get(statscfg, :mutation, false)) ? Mutations.MutationAttemptRecorder() : nothing
@@ -871,53 +750,31 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
         require_change = get(reprocfg, :require_change, false)
         max_resample = max(0, get(reprocfg, :max_resample, 0))
         on_fail = get(reprocfg, :on_fail, :clone)
-        immigrant_rounds = max(0, get(reprocfg, :immigrant_mutation_rounds, 0))
         immigrant_max_try = max(1, get(reprocfg, :immigrant_max_try, 1))
+        make_immigrant = haskey(components, :make_immigrant) ? components.make_immigrant : nothing
 
         function _make_immigrant(slot_idx::Int)
+            make_immigrant === nothing && return Err(MissingComponentErr(:make_immigrant))
             for k in 1:immigrant_max_try
                 seed_i = seed ⊻ UInt64(g) ⊻ (UInt64(slot_idx) << 32) ⊻ UInt64(k)
-                ig_depth = get(reprocfg, :immigrant_gen_max_depth, nothing)
-                ig_try = get(reprocfg, :immigrant_gen_max_try, nothing)
-                res = batch_generate_population(
-                    reg,
-                    data;
-                    N=1,
-                    seed=seed_i,
-                    global_type_ctx=global_type_ctx,
-                    mutate_rounds=immigrant_rounds,
-                    purpose=:immigrant,
-                    recorder=rec_mut,
-                    gen_max_depth_override=ig_depth,
-                    gen_max_try_override=ig_try,
-                )
+                res = make_immigrant(reg, data; seed=seed_i, global_type_ctx=global_type_ctx, slot=slot_idx, attempt=k, recorder=rec_mut)
                 res isa Err && continue
-                return res[1]
+                return res
             end
             return Err(Mutations.MaxTryReachedErr())
         end
 
         immigrants_fixed = max(0, get(reprocfg, :immigrants_per_gen, 0))
-        if immigrants_fixed > 0
+        if immigrants_fixed > 0 && make_immigrant !== nothing
             k = min(immigrants_fixed, N - length(next_pop))
             if k > 0
-                ig_depth = get(reprocfg, :immigrant_gen_max_depth, nothing)
-                ig_try = get(reprocfg, :immigrant_gen_max_try, nothing)
-                res = batch_generate_population(
-                    reg,
-                    data;
-                    N=k,
-                    seed=seed ⊻ UInt64(g) ⊻ 0x9e3779b97f4a7c15,
-                    global_type_ctx=global_type_ctx,
-                    mutate_rounds=immigrant_rounds,
-                    purpose=:immigrant,
-                    recorder=rec_mut,
-                    gen_max_depth_override=ig_depth,
-                    gen_max_try_override=ig_try,
-                )
-                if !(res isa Err)
-                    append!(next_pop, res)
-                    _inc!(repro_stats, :n_immigrant, k)
+                for fixed_idx in 1:k
+                    seed_i = seed ⊻ UInt64(g) ⊻ 0x9e3779b97f4a7c15 ⊻ UInt64(fixed_idx)
+                    res = make_immigrant(reg, data; seed=seed_i, global_type_ctx=global_type_ctx, slot=fixed_idx, attempt=1, recorder=rec_mut)
+                    if !(res isa Err)
+                        push!(next_pop, res)
+                        _inc!(repro_stats, :n_immigrant, 1)
+                    end
                 end
             end
         end
@@ -992,10 +849,6 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
                             global_consts_ty=global_type_ctx,
                             local_consts=local_consts,
                             local_consts_ty=local_consts_ty,
-                            gen_ctors=components.gen_ctors,
-                            gen_chooser=components.gen_chooser,
-                            gen_max_depth=components.gen_max_depth,
-                            gen_max_try=components.gen_max_try,
                             tyfactory=tyfactory,
                             symfactory=symfactory,
                             const_symfactory=const_symfactory,
@@ -1087,13 +940,11 @@ end
     using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, get_type_ctx
     using LambdaRegression.TypeSystem
     using LambdaRegression.Utils: Err
-    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, GlobalConstCtor, ApplySpineCtor, FocusedChooser
     using LambdaRegression.Mutations
     using LambdaRegression.Regression: Regressor, SupervisedDataset, fit!, evaluate_default, default_components, default_config
     using LambdaRegression.TypeSystem: TyFun, FloatTy, TyLike, get_type_ctx
     using LambdaRegression.Regression: Regressor, SupervisedDataset, fit!, default_components, default_config
     using LambdaRegression.TypeSystem: TyFun, FloatTy, TyLike
-    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, FocusedChooser
     using LambdaRegression.Mutations: WeightedPairChooser
     using LambdaRegression.Regression:
         Regressor,
@@ -1230,11 +1081,7 @@ end
     comps = merge(
         base,
         (;
-            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplySpineCtor(max_spine_args=3)],
-            gen_chooser=FocusedChooser(max_spine_args=3),
-            gen_max_depth=5,
-            gen_max_try=10,
-            mutations=[Mutations.SubtreeReplaceMutation()],
+            mutations=Mutations.AbstractMutation[],
             mutation_chooser=Mutations.WeightedPairChooser(),
             mutation_provider=Mutations.IndexedProvider(),
             mutation_max_try=5,
@@ -1289,11 +1136,7 @@ end
     comps = merge(
         base,
         (;
-            gen_ctors=[AbsCtor(), IndexCtor(), GlobalConstCtor(), ApplySpineCtor(max_spine_args=3)],
-            gen_chooser=FocusedChooser(max_spine_args=3),
-            gen_max_depth=5,
-            gen_max_try=10,
-            mutations=[Mutations.SubtreeReplaceMutation()],
+            mutations=Mutations.AbstractMutation[],
             mutation_chooser=Mutations.WeightedPairChooser(),
             mutation_provider=Mutations.IndexedProvider(),
             mutation_max_try=5,
@@ -1318,11 +1161,9 @@ end
     @test !(res isa Err)
 end
 
-@testitem "Regression fit! avoids implicit cloning via immigrant fallback when require_change=true" setup=[RegBaseImports] begin
+@testitem "Regression fit! falls back to clone without immigrant hook" setup=[RegBaseImports] begin
     target_ty = TyFun(FloatTy, FloatTy)
     id_tree = AstTree(AbsNode(:x, IndexNode(0)))
-
-    gen_stub = (target_ty; kwargs...) -> deepcopy(id_tree)
 
     base = default_components(
         global_consts=Dict{Symbol,Any}(),
@@ -1333,12 +1174,7 @@ end
     comps = merge(
         base,
         (;
-            generate_tree=gen_stub,
-            gen_ctors=[AbsCtor(), IndexCtor()],
-            gen_chooser=FocusedChooser(),
-            gen_max_depth=3,
-            gen_max_try=3,
-            mutations=[Mutations.SubtreeReplaceMutation()],
+            mutations=Mutations.AbstractMutation[],
             mutation_chooser=WeightedPairChooser(),
             mutation_provider=Mutations.IndexedProvider(),
             mutation_max_try=1,
@@ -1352,11 +1188,11 @@ end
         population_size=6,
         generations=1,
         error_threshold=-1.0,
-        mutation_rate=0.0,   # forces require_change path to resample then immigrant
+        mutation_rate=0.0,   # forces require_change path to the missing immigrant hook, then clone fallback
         crossover_rate=0.0,
         elitism=1,
         tournament_size=2,
-        repro=(; require_change=true, max_resample=2, on_fail=:immigrant, immigrant_mutation_rounds=0, immigrant_max_try=2, immigrants_per_gen=0),
+        repro=(; require_change=true, max_resample=2, on_fail=:immigrant, immigrant_max_try=2, immigrants_per_gen=0),
         stats=(; enabled=true, mutation=true, reproduction=true, print=false, every=1, topk_types=4),
     )
     data = SupervisedDataset([1.0], [1.0])
@@ -1366,8 +1202,8 @@ end
     @test !(res isa Err)
     @test length(res.history) == 1
     rs = res.history[1].repro_stats
-    @test rs[:n_immigrant] == 5
-    @test rs[:n_clone_fallback] == 0
+    @test rs[:n_immigrant] == 0
+    @test rs[:n_clone_fallback] == 5
 end
 
 @testitem "Regression fit! callback exposes eval_stats classifications" setup=[RegBaseImports] begin
@@ -1399,11 +1235,7 @@ end
         base,
         (;
             evaluate=eval_fn,
-            gen_ctors=[AbsCtor(), IndexCtor()],
-            gen_chooser=FocusedChooser(),
-            gen_max_depth=3,
-            gen_max_try=3,
-            mutations=[Mutations.SubtreeReplaceMutation()],
+            mutations=Mutations.AbstractMutation[],
             mutation_chooser=Mutations.WeightedPairChooser(),
             mutation_provider=Mutations.IndexedProvider(),
             mutation_max_try=1,

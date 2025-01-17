@@ -61,8 +61,7 @@ Quickstart
 using Random
 using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
 using LambdaRegression.TypeSystem: TyFun, IntTy
-using LambdaRegression.GenerateTree: IndexCtor, FocusedChooser
-using LambdaRegression.Mutations: mutate_tree, ConstMutation, PointMutation, SubtreeReplaceMutation
+using LambdaRegression.Mutations: mutate_tree, ConstMutation, PointMutation
 using LambdaRegression.TypeSystem: TyLike
 
 tree = AstTree(AbsNode(:x, IndexNode(0))) # identity
@@ -75,9 +74,7 @@ mutated = mutate_tree(
     global_consts_ty=Dict{Symbol,TyLike}(),
     local_consts_ty=Dict{Symbol,TyLike}(),
     local_consts=Dict{Symbol,Any}(),
-    gen_ctors=[IndexCtor()],
-    gen_chooser=FocusedChooser(),
-    mutations=[SubtreeReplaceMutation(), PointMutation(), ConstMutation()],
+    mutations=[PointMutation(), ConstMutation()],
 )
 ```
 """
@@ -94,7 +91,6 @@ using ..ASTs.CSE: canonicalize, eliminate_expression!
 import ..ASTs.NodeASTs: apply_node!, shift_free_variables!
 using ..ASTs.Contexts: new_constant!, ConstSymbolFactory
 using ..Trees: traverse, PointerState, StackState, getstate, Break, setroot!, setchild!, children
-using ..GenerateTree
 
 export mutate_tree
 export AbstractMutation, required_site_kinds, is_site_eligible, apply
@@ -104,7 +100,7 @@ export BloatPolicy, AdaptivePolicy
 export MutationAttemptRecorder, mutation_recorder_summary
 export prune_local_consts!
 export ConstMutation, ScalarConstMutation, BoolConstMutation, ArrayConstMutation
-export PointMutation, SubtreeReplaceMutation
+export PointMutation
 export BetaReduceMutation, EtaReduceMutation, EtaExpandMutation, CSEMutation
 export CondAppPullMutation, CondAppPushMutation
 export Populations
@@ -285,7 +281,7 @@ AdaptivePolicy(; enabled::Bool=false, ewma_alpha::Float64=0.2, floor::Float64=0.
 
 Optional bloat control for structure-changing mutations.
 
-When enabled, `SubtreeReplaceMutation` rejects a replacement if:
+When enabled, structure-changing mutations can reject a replacement if:
 - the mutated tree exceeds `max_nodes`, or
 - the node-count increase exceeds `max_nodes_delta`.
 
@@ -559,11 +555,10 @@ Selection model:
 
 ## Parameters
 - `weights::Dict{DataType,Float64}`: per-mutation-type weights. Defaults:
-  - `ScalarConstMutation => 0.25`
-  - `ArrayConstMutation => 0.25`
-  - `BoolConstMutation => 0.05`
-  - `SubtreeReplaceMutation => 0.20`
-  - `PointMutation => 0.10`
+- `ScalarConstMutation => 0.25`
+- `ArrayConstMutation => 0.25`
+- `BoolConstMutation => 0.05`
+- `PointMutation => 0.10`
 - `CSEMutation => 0.08`
 - `BetaReduceMutation => 0.04`
 - `EtaExpandMutation => 0.03`
@@ -589,7 +584,6 @@ function WeightedPairChooser(; weights::Union{Nothing,Dict{DataType,Float64}}=no
         # Backwards-compatible wrapper.
         ConstMutation => 0.55,
 
-        SubtreeReplaceMutation => 0.20,
         PointMutation => 0.10,
 	        CSEMutation => 0.08,
 	        BetaReduceMutation => 0.04,
@@ -1218,35 +1212,6 @@ function apply(m::CSEMutation, tree::AstTree, site::Site, env::MutationEnv, ctx:
     return eliminate_expression!(tree, form; min_count=m.min_count, factory=ctx.symfactory)
 end
 
-"""
-    SubtreeReplaceMutation() <: AbstractMutation
-
-Subtree replacement mutation (子树替换).
-
-Select a site and replace it with a freshly generated subtree of the *same*
-inferred type, delegated to `GenerateTree.generate_tree`.
-
-This operator is the bridge between generation and mutation: it reuses the
-`GenerateTree` constructor system and supplies scope typing derived from the
-site’s binder types.
-"""
-struct SubtreeReplaceMutation <: AbstractMutation end
-required_site_kinds(::SubtreeReplaceMutation) = Symbol[:any]
-
-is_site_eligible(::SubtreeReplaceMutation, ::Site, ::MutationEnv, ::NamedTuple) = true
-
-function _mk_scope_ctx(site::Site)
-    depth = length(site.binder_types)
-    scope_stack = Symbol[]
-    var_ty = Dict{Symbol,Ty}()
-    for i in 1:depth
-        name = Symbol("b$(i)")
-        push!(scope_stack, name)
-        var_ty[name] = site.binder_types[i]
-    end
-    return (scope_stack, var_ty)
-end
-
 function _count_nodes(tree::AstTree)
     c = 0
     for _ in tree
@@ -1255,45 +1220,11 @@ function _count_nodes(tree::AstTree)
     return c
 end
 
-function apply(::SubtreeReplaceMutation, tree::AstTree, site::Site, env::MutationEnv, ctx::NamedTuple)
-    if env.bloat_policy.enabled
-        old_n = _count_nodes(tree)
-        old_n <= env.bloat_policy.max_nodes || return Err(BloatExceededErr(env.bloat_policy.max_nodes, env.bloat_policy.max_nodes_delta))
-    end
-    scope_stack, var_ty = _mk_scope_ctx(site)
-    target_ty = site.ty
-    gen = GenerateTree.generate_tree(
-        target_ty;
-        ctors=ctx.gen_ctors,
-        chooser=ctx.gen_chooser,
-        max_depth=ctx.gen_max_depth,
-        max_try=ctx.gen_max_try,
-        tyfactory=ctx.tyfactory,
-        symfactory=ctx.symfactory,
-        rng=env.rng,
-        global_consts_ty=ctx.global_consts_ty,
-        local_consts_ty=ctx.local_consts_ty,
-        local_consts=ctx.local_consts,
-        var_ty=var_ty,
-        scope_stack=scope_stack,
-    )
-    gen isa Err && return gen
-
-    old_n = env.bloat_policy.enabled ? _count_nodes(tree) : 0
-    _replace_site!(tree, site, gen)
-    if env.bloat_policy.enabled
-        new_n = _count_nodes(tree)
-        (new_n <= env.bloat_policy.max_nodes && (new_n - old_n) <= env.bloat_policy.max_nodes_delta) || return Err(BloatExceededErr(env.bloat_policy.max_nodes, env.bloat_policy.max_nodes_delta))
-    end
-    return tree
-end
-
 function _default_mutations()
     return AbstractMutation[
         ScalarConstMutation(),
         BoolConstMutation(),
         ArrayConstMutation(),
-        SubtreeReplaceMutation(),
         PointMutation(),
         CSEMutation(),
         BetaReduceMutation(),
@@ -1324,9 +1255,7 @@ Returns `Err(MaxTryReachedErr())` if no valid mutation can be found within `max_
 - `prune_consts`: call `prune_local_consts!` after a successful mutation (default: `true`)
 - `global_consts_ty`, `local_consts`, `local_consts_ty`: constant/type containers
 - `const_symfactory`: per-call deterministic local-constant symbol factory (default: `ConstSymbolFactory()`)
-
-## Generator delegation (for `SubtreeReplaceMutation`)
-- `gen_ctors`, `gen_chooser`, `gen_max_depth`, `gen_max_try`, `tyfactory`, `symfactory`
+- `tyfactory`, `symfactory`: local factories used by type inference and CSE
 
 ## Optional policies (off by default)
 - `bloat_policy::BloatPolicy`
@@ -1344,10 +1273,6 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     global_consts_ty::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     local_consts_ty::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     local_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
-    gen_ctors::Vector{<:GenerateTree.AbstractCtor}=GenerateTree.AbstractCtor[],
-    gen_chooser::GenerateTree.AbstractChooser=GenerateTree.FocusedChooser(),
-    gen_max_depth::Int=4,
-    gen_max_try::Int=8,
     tyfactory=newtyvar,
     symfactory=SymbolGenerator(),
     const_symfactory::ConstSymbolFactory=ConstSymbolFactory(),
@@ -1369,10 +1294,6 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         global_consts_ty=global_consts_ty,
         local_consts_ty=current_local_consts_ty,
         local_consts=current_local_consts,
-        gen_ctors=gen_ctors,
-        gen_chooser=gen_chooser,
-        gen_max_depth=gen_max_depth,
-        gen_max_try=gen_max_try,
         tyfactory=tyfactory,
         symfactory=symfactory,
         const_symfactory=const_symfactory,
@@ -1406,10 +1327,6 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
             global_consts_ty=global_consts_ty,
             local_consts_ty=attempt_local_consts_ty,
             local_consts=attempt_local_consts,
-            gen_ctors=gen_ctors,
-            gen_chooser=gen_chooser,
-            gen_max_depth=gen_max_depth,
-            gen_max_try=gen_max_try,
             tyfactory=tyfactory,
             symfactory=symfactory,
             const_symfactory=const_symfactory,
@@ -1486,7 +1403,6 @@ include("Population.jl")
     using LambdaRegression.TypeSystem: FloatTy, TyLike
     using Random
     using LambdaRegression.Mutations: mutate_tree, ScalarConstMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.GenerateTree
     using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
     using LambdaRegression.Mutations: mutate_tree, BoolConstMutation, WeightedPairChooser, IndexedProvider
     using LambdaRegression.TypeSystem: BoolTy, TyLike
@@ -1495,7 +1411,6 @@ include("Population.jl")
     using LambdaRegression.Mutations: mutate_tree, PointMutation, WeightedPairChooser, IndexedProvider
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
     using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike
-    using LambdaRegression.GenerateTree: IndexCtor, FocusedChooser
     using LambdaRegression.Utils: Err
     using LambdaRegression.Mutations: WeightedPairChooser, IndexedProvider, ScalarConstMutation
     using LambdaRegression.TypeSystem: FloatTy, TyLike, newtyvar
@@ -1511,11 +1426,8 @@ include("Population.jl")
     using LambdaRegression.Mutations: mutate_tree, EtaExpandMutation, WeightedPairChooser, IndexedProvider
     using LambdaRegression.Mutations: mutate_tree, CSEMutation, WeightedPairChooser, IndexedProvider
     using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike, infer, iscompatible
-    using LambdaRegression.Mutations: mutate_tree, SubtreeReplaceMutation, WeightedPairChooser, IndexedProvider
-    using LambdaRegression.GenerateTree: AbsCtor, IndexCtor, FocusedChooser
     using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, infer, iscompatible
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, ConstNode
-    using LambdaRegression.GenerateTree: FocusedChooser
     using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
     using LambdaRegression.Mutations: mutate_tree, BoolConstMutation, WeightedPairChooser, IndexedProvider, MutationAttemptRecorder, mutation_recorder_summary
 end
@@ -1546,7 +1458,6 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=local_consts,
         local_consts_ty=local_consts_ty,
-        gen_ctors=GenerateTree.AbstractCtor[],
         mutations=[ScalarConstMutation(σ=0.2)],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ScalarConstMutation=>1.0), cache_eligibility=false),
         provider=IndexedProvider(),
@@ -1574,7 +1485,6 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=local_consts,
         local_consts_ty=local_consts_ty,
-        gen_ctors=GenerateTree.AbstractCtor[],
         mutations=[BoolConstMutation()],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(BoolConstMutation=>1.0)),
         provider=IndexedProvider(),
@@ -1604,7 +1514,6 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=local_consts,
         local_consts_ty=local_consts_ty,
-        gen_ctors=GenerateTree.AbstractCtor[],
         mutations=[ArrayConstMutation(σ=0.1)],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ArrayConstMutation=>1.0)),
         provider=IndexedProvider(),
@@ -1632,8 +1541,6 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=Dict{Symbol,Any}(),
         local_consts_ty=Dict{Symbol,TyLike}(),
-        gen_ctors=[IndexCtor()],
-        gen_chooser=FocusedChooser(),
         mutations=[PointMutation()],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(PointMutation=>1.0), cache_eligibility=true),
         provider=IndexedProvider(),
@@ -1745,7 +1652,6 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=local_consts,
         local_consts_ty=local_consts_ty,
-        gen_ctors=LambdaRegression.GenerateTree.AbstractCtor[],
         mutations=[AlwaysFailMutation()],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(AlwaysFailMutation => 1.0), cache_eligibility=true),
         provider=provider,
@@ -1930,54 +1836,6 @@ end
     @test iscompatible(inferred, target_ty)
 end
 
-@testitem "Mutations SubtreeReplaceMutation under lambda preserves target type" setup=[MutBaseImports] begin
-    rng = MersenneTwister(1234)
-    tree = AstTree(AbsNode(:x, IndexNode(0))) # identity
-    target_ty = TyFun(IntTy, IntTy)
-    mutated = mutate_tree(
-        tree,
-        target_ty;
-        rng=rng,
-        global_consts_ty=Dict{Symbol,TyLike}(),
-        local_consts=Dict{Symbol,Any}(),
-        local_consts_ty=Dict{Symbol,TyLike}(),
-        gen_ctors=[IndexCtor()],
-        gen_chooser=FocusedChooser(),
-        gen_max_depth=2,
-        gen_max_try=4,
-        mutations=[SubtreeReplaceMutation()],
-        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplaceMutation=>1.0), cache_eligibility=true),
-        provider=IndexedProvider(),
-        max_try=10,
-    )
-    @test mutated isa AstTree
-end
-
-@testitem "Mutations integration: matrix->matrix type stability" setup=[MutBaseImports] begin
-    rng = MersenneTwister(8000)
-    dom = TyArray(TyNat(3), TyArray(TyNat(4), FloatTy))
-    target_ty = TyFun(dom, dom)
-    tree = AstTree(AbsNode(:x, IndexNode(0))) # identity: dom -> dom
-    mutated = mutate_tree(
-        tree,
-        target_ty;
-        rng=rng,
-        global_consts_ty=Dict{Symbol,TyLike}(),
-        local_consts=Dict{Symbol,Any}(),
-        local_consts_ty=Dict{Symbol,TyLike}(),
-        gen_ctors=[IndexCtor()],
-        gen_chooser=FocusedChooser(),
-        gen_max_depth=2,
-        gen_max_try=4,
-        mutations=[SubtreeReplaceMutation()],
-        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplaceMutation=>1.0), cache_eligibility=true),
-        provider=IndexedProvider(),
-        max_try=10,
-    )
-    inferred = infer(mutated, Dict{Symbol,TyLike}())
-    @test iscompatible(inferred, target_ty)
-end
-
 @testitem "Mutations integration: matrix->float type stability" setup=[MutBaseImports] begin
     rng = MersenneTwister(42)
     dom = TyArray(TyNat(3), TyArray(TyNat(4), FloatTy))
@@ -1992,8 +1850,6 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=local_consts,
         local_consts_ty=local_consts_ty,
-        gen_ctors=GenerateTree.AbstractCtor[],
-        gen_chooser=FocusedChooser(),
         mutations=[ScalarConstMutation(σ=0.3)],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ScalarConstMutation=>1.0), cache_eligibility=true),
         provider=IndexedProvider(),
@@ -2018,7 +1874,6 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=local_consts,
         local_consts_ty=local_consts_ty,
-        gen_ctors=GenerateTree.AbstractCtor[],
         mutations=[ScalarConstMutation(σ=0.2)],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ScalarConstMutation=>1.0)),
         provider=IndexedProvider(),
@@ -2052,7 +1907,6 @@ end
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=local_consts,
         local_consts_ty=local_consts_ty,
-        gen_ctors=GenerateTree.AbstractCtor[],
         mutations=[BoolConstMutation()],
         chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(BoolConstMutation => 1.0), cache_eligibility=false),
         provider=IndexedProvider(),

@@ -105,7 +105,7 @@ end
 
 """
     TyMu(var, body)
-Iso-recursive μ-type  `μ var . body`.
+Equi-recursive μ-type  `μ var . body`.
 The `var` field is a `TyVar` acting as the binder.
 """
 struct TyMu <: Ty
