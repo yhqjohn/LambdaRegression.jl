@@ -77,6 +77,72 @@ mutated = mutate_tree(
     mutations=[PointMutation(), ConstMutation()],
 )
 ```
+
+## Generated subtree replacement
+
+`SubtreeReplacementMutation` replaces an eligible subtree `S : A` with a fresh
+canonical term `G : A` generated under the lambda binders visible at `S`. It is
+not part of the default mutation list; opt in when a caller wants generation-
+backed edits.
+
+The public knobs are intentionally small and composable:
+
+- `site_lock`: decides which sites are never replacement roots. The default
+  `DefaultSiteLockPolicy(spine_only=true)` avoids De Bruijn leaves,
+  application function heads, and non-spine internals. Use
+  `DefaultSiteLockPolicy(spine_only=false)` or a custom `is_site_locked` method
+  to open more sites.
+- `site_selection`: assigns per-site weights. `ExponentialSiteSelectionPolicy`
+  is the default; `PathSiteSelectionPolicy(path)` is useful for fixtures. Site
+  selection does not override `site_lock`, so pass a permissive lock policy when
+  a fixture intentionally targets an otherwise locked site.
+- `replacement_generator`: owns replacement construction. The default
+  `CanonicalReplacementGenerator(include_local_consts=false)` uses
+  `generate_canonical_scoped` and treats old local constants as reserved
+  context rather than preferred source heads. Implement
+  `generate_replacement(::MyGenerator, site, env, ctx, generation_kwargs)` to
+  inject another generator.
+- `generation_kwargs`: forwarded to `generate_canonical_scoped`. Defaults are
+  deliberately small (`sampling_depth_limit=2`, `sampling_node_budget=24`,
+  `guarded_expansion_depth=0`) so repeated mutation batches stay fast; callers
+  can pass deeper budgets, custom providers, or custom weights explicitly. If
+  initialization used a non-default canonical catalog, pass its `providers` and
+  `weights` here too; the mutation core does not bake rich catalog definitions into
+  its defaults.
+
+Example:
+```julia
+mutation = SubtreeReplacementMutation(;
+    site_lock=DefaultSiteLockPolicy(spine_only=false),
+    site_selection=ExponentialSiteSelectionPolicy(scope_bias=-0.5),
+    replacement_generator=CanonicalReplacementGenerator(include_local_consts=true),
+    generation_kwargs=(; sampling_depth_limit=3, sampling_node_budget=48),
+)
+```
+
+## Constant mutation policies
+
+`ScalarConstMutation` and `ArrayConstMutation` keep the legacy `σ` constructor
+and field, and also accept a `ConstValueMutationPolicy`. The default keeps the
+old small additive/scale-like behavior, while custom policies can select
+`:bias`, `:scale`, or `:rerandomize`. Array policies can choose broadcast ranks
+over finite `TyArray` shapes whose leaf type matches the runtime array element
+type:
+
+```julia
+mutation = ArrayConstMutation(;
+    policy=ConstValueMutationPolicy(
+        modes=(:bias, :scale),
+        array_ranks=(:global, :axis, :outer, :full),
+        σ_bias=0.1,
+        σ_scale=0.05,
+    ),
+)
+```
+
+Scale uses a positive log-normal factor `exp(σ_scale * randn(rng))`. The policy
+object is deliberately small so callers can replace value-level behavior without
+changing site selection, pair choice, or mutation validation.
 """
 module Mutations
 
@@ -85,9 +151,10 @@ using TestItems
 
 using ..Utils: Err
 using ..TypeSystem
-using ..TypeSystem: Ty, TyLike, TyConst, TyFun, TyArray, TyNat, instantiate, infer, iscompatible, newtyvar, BoolTy, IntTy, FloatTy
+using ..TypeSystem: Ty, TyLike, TyConst, TyFun, TyList, TyVar, TyArray, TyNat, instantiate, infer, iscompatible, newtyvar, BoolTy, IntTy, FloatTy
 using ..ASTs.NodeASTs
-using ..ASTs.CSE: canonicalize, eliminate_expression!
+using ..ASTs.CSE: canonicalize, eliminate_expression!, eliminate_node!, repeated_nodes
+using ..CanonicalGeneration: generate_canonical_scoped, GenerationResult
 import ..ASTs.NodeASTs: apply_node!, shift_free_variables!
 using ..ASTs.Contexts: new_constant!, ConstSymbolFactory
 using ..Trees: traverse, PointerState, StackState, getstate, Break, setroot!, setchild!, children
@@ -99,8 +166,13 @@ export AbstractPairChooser, WeightedPairChooser
 export BloatPolicy, AdaptivePolicy
 export MutationAttemptRecorder, mutation_recorder_summary
 export prune_local_consts!
-export ConstMutation, ScalarConstMutation, BoolConstMutation, ArrayConstMutation
+export ConstMutation, ScalarConstMutation, BoolConstMutation, ArrayConstMutation, ConstValueMutationPolicy
 export PointMutation
+export SubtreeReplacementMutation
+export AbstractSiteLockPolicy, DefaultSiteLockPolicy
+export AbstractSiteSelectionPolicy, ExponentialSiteSelectionPolicy, PathSiteSelectionPolicy
+export AbstractReplacementGenerator, CanonicalReplacementGenerator
+export is_site_locked, site_selection_weight, generate_replacement
 export BetaReduceMutation, EtaReduceMutation, EtaExpandMutation, CSEMutation
 export CondAppPullMutation, CondAppPushMutation
 export Populations
@@ -304,6 +376,7 @@ mutable struct MutationEnv
     rng::AbstractRNG
     target_ty::Ty
     type_ctx::Dict{Symbol,TyLike}
+    tree::Union{Nothing,AstTree}
     meta::Union{Nothing,Dict{AstNode,Tuple{TyLike,TyLike}}}
     cache_eligibility::Bool
     eligibility_cache::IdDict{Any,Any}
@@ -473,15 +546,52 @@ function _remap_site(tree::AstTree, site::Site)::Site
     return Site(site.path, node, parent, site.path[end], site.depth, site.kind, site.ty, site.binder_types)
 end
 
-function _collect_sites(tree::AstTree, meta::Dict{AstNode,Tuple{TyLike,TyLike}}, ctx::NamedTuple)
+function _target_refined_binder_types(tree::AstTree, path::Vector{Int}, target_ty::Ty, fallback::Vector{Ty})
+    node = tree.root
+    expected = target_ty
+    tys = Ty[]
+    for idx in path
+        if node isa AbsNode
+            pruned = TypeSystem.prune(expected)
+            pruned isa TyFun || return fallback
+            push!(tys, pruned.arg)
+            expected = pruned.res
+        end
+        kids = children(node)
+        1 <= idx <= length(kids) || return fallback
+        node = kids[idx]
+    end
+    return tys
+end
+
+function _target_refined_site_ty(tree::AstTree, path::Vector{Int}, target_ty::Ty, fallback::Ty)
+    node = tree.root
+    expected = target_ty
+    isempty(path) && return TypeSystem.prune(expected)
+    for idx in path
+        if node isa AbsNode && idx == 1
+            pruned = TypeSystem.prune(expected)
+            pruned isa TyFun || return fallback
+            expected = pruned.res
+        else
+            return fallback
+        end
+        kids = children(node)
+        1 <= idx <= length(kids) || return fallback
+        node = kids[idx]
+    end
+    return TypeSystem.prune(expected)
+end
+
+function _collect_sites(tree::AstTree, meta::Dict{AstNode,Tuple{TyLike,TyLike}}, ctx::NamedTuple, target_ty::Ty)
     sites = Site[]
     traverse(tree, PointerState{AstNode}, ScopeState) do t, node, bag
         pointer = getstate(bag, PointerState{AstNode})
         stack = getstate(bag, StackState{AstNode})
         scope = getstate(bag, ScopeState)
         haskey(meta, node) || return nothing
-        node_ty = meta[node][1]
-        binder_types = _binder_types(scope, meta)
+        raw_node_ty = meta[node][1]
+        raw_binder_types = _binder_types(scope, meta)
         kind = _site_kind(node, ctx)
         path =
             if length(stack.stack) <= 1
@@ -489,6 +599,8 @@ function _collect_sites(tree::AstTree, meta::Dict{AstNode,Tuple{TyLike,TyLike}},
             else
                 [stack.stack[i][2] for i in 1:(length(stack.stack)-1)]
             end
+        node_ty = raw_node_ty isa Ty ? _target_refined_site_ty(tree, path, target_ty, raw_node_ty) : raw_node_ty
+        binder_types = _target_refined_binder_types(tree, path, target_ty, raw_binder_types)
         push!(sites, Site(path, node, pointer.parent, pointer.child_index, length(binder_types), kind, node_ty, binder_types))
         return nothing
     end
@@ -527,7 +639,7 @@ function prepare!(p::IndexedProvider, tree::AstTree, type_ctx::Dict{Symbol,<:TyL
     ty = infer(tree, type_ctx, factory, meta)
     ty isa Err && return ty
     env.meta = meta
-    p.sites_all = _collect_sites(tree, meta, ctx)
+    p.sites_all = _collect_sites(tree, meta, ctx, env.target_ty)
     for s in p.sites_all
         push!(get!(p.sites_kind, :any, Site[]), s)
         s.kind === :any || push!(get!(p.sites_kind, s.kind, Site[]), s)
@@ -624,6 +736,7 @@ function choose_pair(chooser::WeightedPairChooser,
     ctx::NamedTuple,
 )
     env.cache_eligibility = chooser.cache_eligibility
+    env.tree = tree
 
     masses = Float64[]
     payloads = Any[]
@@ -653,6 +766,259 @@ function _replace_site!(tree::AstTree, site::Site, new_subtree::AstTree)
     else
         setchild!(tree, site.parent, site.child_index, new_subtree)
     end
+    return tree
+end
+
+abstract type AbstractSiteLockPolicy end
+abstract type AbstractSiteSelectionPolicy end
+abstract type AbstractReplacementGenerator end
+
+"""
+    DefaultSiteLockPolicy()
+
+Conservative lock policy for generated subtree replacement.
+
+The default keeps De Bruijn variable leaves and application function positions
+out of arbitrary subtree replacement. It also defaults to `spine_only=true`,
+which admits only the root and the continuous lambda-body spine. Callers can
+disable that or replace the policy when they intentionally want deeper
+application internals to participate.
+"""
+struct DefaultSiteLockPolicy <: AbstractSiteLockPolicy
+    spine_only::Bool
+end
+DefaultSiteLockPolicy(; spine_only::Bool=true) = DefaultSiteLockPolicy(spine_only)
+
+"""
+    ExponentialSiteSelectionPolicy(; scope_bias=-0.75, path_bias=-0.04, root_weight=0.35)
+
+Default site weighting policy for subtree replacement. Sites under many
+enclosing binders are exponentially damped because scoped generation there has
+many more local variables and provider routes. Longer paths are also mildly
+damped, while the root is damped by `root_weight`.
+"""
+struct ExponentialSiteSelectionPolicy <: AbstractSiteSelectionPolicy
+    scope_bias::Float64
+    path_bias::Float64
+    root_weight::Float64
+end
+
+function ExponentialSiteSelectionPolicy(;
+    scope_bias::Real=-0.75,
+    path_bias::Real=-0.04,
+    root_weight::Real=0.35,
+    depth_bias::Union{Nothing,Real}=nothing,
+)
+    sb = Float64(depth_bias === nothing ? scope_bias : depth_bias)
+    pb = Float64(path_bias)
+    rw = Float64(root_weight)
+    isfinite(sb) || throw(ArgumentError("scope_bias must be finite"))
+    isfinite(pb) || throw(ArgumentError("path_bias must be finite"))
+    isfinite(rw) && rw >= 0 || throw(ArgumentError("root_weight must be finite and nonnegative"))
+    return ExponentialSiteSelectionPolicy(sb, pb, rw)
+end
+
+"""
+    PathSiteSelectionPolicy(path)
+
+Test and fixture policy that admits exactly one path.
+
+Selection is still combined with the mutation's site lock policy; this policy
+does not force a locked path to become eligible.
+"""
+struct PathSiteSelectionPolicy <: AbstractSiteSelectionPolicy
+    path::Vector{Int}
+end
+PathSiteSelectionPolicy(path::AbstractVector{<:Integer}) = PathSiteSelectionPolicy(Int[path...])
+
+"""
+    CanonicalReplacementGenerator()
+
+Replacement generator adapter that calls `generate_canonical_scoped` with the
+selected site's type and visible binder types.
+"""
+struct CanonicalReplacementGenerator <: AbstractReplacementGenerator
+    include_local_consts::Bool
+end
+CanonicalReplacementGenerator(; include_local_consts::Bool=false) = CanonicalReplacementGenerator(include_local_consts)
+
+is_site_locked(::AbstractSiteLockPolicy, ::Site, ::MutationEnv, ::NamedTuple) = false
+
+function is_site_locked(policy::DefaultSiteLockPolicy, site::Site, ::MutationEnv, ::NamedTuple)
+    site.node isa IndexNode && return true
+    site.parent isa AppNode && site.child_index == 1 && return true
+    policy.spine_only && length(site.path) != site.depth && return true
+    return false
+end
+
+function site_selection_weight(policy::ExponentialSiteSelectionPolicy, site::Site, ::MutationEnv, ::NamedTuple)
+    weight = exp(policy.scope_bias * site.depth + policy.path_bias * length(site.path))
+    isempty(site.path) && (weight *= policy.root_weight)
+    return weight
+end
+
+site_selection_weight(policy::PathSiteSelectionPolicy, site::Site, ::MutationEnv, ::NamedTuple) =
+    site.path == policy.path ? 1.0 : 0.0
+
+site_selection_weight(::AbstractSiteSelectionPolicy, ::Site, ::MutationEnv, ::NamedTuple) = 1.0
+
+function _global_consts(ctx::NamedTuple)
+    return haskey(ctx, :global_consts) ? ctx.global_consts : Dict{Symbol,Any}()
+end
+
+function _generation_closed_type(ty::Ty)
+    pruned = TypeSystem.prune(ty)
+    pruned isa TyVar && return false
+    pruned isa TyConst && return true
+    pruned isa TyFun && return _generation_closed_type(pruned.arg) && _generation_closed_type(pruned.res)
+    pruned isa TyList && return _generation_closed_type(pruned.elem)
+    pruned isa TyArray && return TypeSystem.prune(pruned.len) isa TyNat && _generation_closed_type(pruned.elem)
+    return false
+end
+
+function generate_replacement(
+    generator::CanonicalReplacementGenerator,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+    generation_kwargs::NamedTuple,
+)
+    defaults = (;
+        rng=env.rng,
+        scope_tys=reverse(site.binder_types),
+        global_consts=_global_consts(ctx),
+        global_consts_ty=ctx.global_consts_ty,
+        local_consts=ctx.local_consts,
+        local_consts_ty=ctx.local_consts_ty,
+        source_local_consts=generator.include_local_consts,
+    )
+    kwargs = merge(defaults, generation_kwargs)
+    return generate_canonical_scoped(site.ty; kwargs...)
+end
+
+"""
+    SubtreeReplacementMutation(; site_lock, site_selection, replacement_generator, generation_kwargs)
+
+Type-compatible subtree replacement. The selected site `S : A` is replaced by a
+fresh canonical term `G : A` generated under the binder scope visible at `S`.
+
+All deep behavior is injectable: `site_lock` controls rejected sites,
+`site_selection` controls per-site weights, and `replacement_generator` owns how
+the replacement term is sampled.
+"""
+struct SubtreeReplacementMutation <: AbstractMutation
+    site_lock::AbstractSiteLockPolicy
+    site_selection::AbstractSiteSelectionPolicy
+    replacement_generator::AbstractReplacementGenerator
+    generation_kwargs::NamedTuple
+end
+
+function SubtreeReplacementMutation(;
+    site_lock::AbstractSiteLockPolicy=DefaultSiteLockPolicy(),
+    site_selection::AbstractSiteSelectionPolicy=ExponentialSiteSelectionPolicy(),
+    replacement_generator::AbstractReplacementGenerator=CanonicalReplacementGenerator(),
+    generation_kwargs::NamedTuple=(; sampling_depth_limit=2, sampling_node_budget=24, guarded_expansion_depth=0),
+)
+    return SubtreeReplacementMutation(site_lock, site_selection, replacement_generator, generation_kwargs)
+end
+
+required_site_kinds(::SubtreeReplacementMutation) = Symbol[:any]
+
+function is_site_eligible(m::SubtreeReplacementMutation, site::Site, env::MutationEnv, ctx::NamedTuple)
+    is_site_locked(m.site_lock, site, env, ctx) && return false
+    _generation_closed_type(site.ty) || return false
+    return site_selection_weight(m.site_selection, site, env, ctx) > 0
+end
+
+site_weight(m::SubtreeReplacementMutation, site::Site, env::MutationEnv, ctx::NamedTuple) =
+    site_selection_weight(m.site_selection, site, env, ctx)
+
+function _collect_const_names!(names::Set{Symbol}, node::AstNode)
+    node isa ConstNode && push!(names, node.name)
+    for child in children(node)
+        _collect_const_names!(names, child)
+    end
+    return names
+end
+
+function _same_const_binding(
+    name::Symbol,
+    result_local_consts::Dict{Symbol,Any},
+    result_local_const_types::Dict{Symbol,TyLike},
+    current_local_consts::Dict{Symbol,Any},
+    current_local_const_types::Dict{Symbol,TyLike},
+)
+    haskey(current_local_const_types, name) || return false
+    haskey(result_local_const_types, name) || return false
+    TypeSystem.typekey(current_local_const_types[name]) == TypeSystem.typekey(result_local_const_types[name]) || return false
+    haskey(current_local_consts, name) || return false
+    haskey(result_local_consts, name) || return false
+    return try
+        isequal(current_local_consts[name], result_local_consts[name])
+    catch
+        current_local_consts[name] === result_local_consts[name]
+    end
+end
+
+function _fresh_replacement_const_name(occupied::Set{Symbol}, base::Symbol)
+    stem = String(base)
+    i = 1
+    while true
+        candidate = Symbol(stem, "_replacement", i)
+        candidate in occupied || return candidate
+        i += 1
+    end
+end
+
+function _rename_const_nodes(node::AstNode, renames::Dict{Symbol,Symbol})::AstNode
+    if node isa ConstNode
+        return ConstNode(get(renames, node.name, node.name))
+    elseif node isa AppNode
+        return AppNode(_rename_const_nodes(node.func, renames), _rename_const_nodes(node.arg, renames))
+    elseif node isa AbsNode
+        return AbsNode(node.name, _rename_const_nodes(node.body, renames))
+    elseif node isa LetNode
+        return LetNode(node.name, _rename_const_nodes(node.value, renames), _rename_const_nodes(node.body, renames))
+    end
+    return node
+end
+
+function _merge_replacement_consts!(
+    replacement::AstTree,
+    result_local_consts::Dict{Symbol,Any},
+    result_local_const_types::Dict{Symbol,TyLike},
+    current_local_consts::Dict{Symbol,Any},
+    current_local_const_types::Dict{Symbol,TyLike},
+)
+    used = _collect_const_names!(Set{Symbol}(), replacement.root)
+    occupied = union(Set(keys(current_local_const_types)), Set(keys(result_local_const_types)))
+    renames = Dict{Symbol,Symbol}()
+    for name in sort!(collect(used))
+        haskey(result_local_const_types, name) || continue
+        haskey(result_local_consts, name) || continue
+        target_name = name
+        if haskey(current_local_const_types, name) &&
+                !_same_const_binding(name, result_local_consts, result_local_const_types, current_local_consts, current_local_const_types)
+            target_name = _fresh_replacement_const_name(occupied, name)
+            push!(occupied, target_name)
+            renames[name] = target_name
+        end
+        current_local_consts[target_name] = result_local_consts[name]
+        current_local_const_types[target_name] = result_local_const_types[name]
+    end
+    isempty(renames) || (replacement.root = _rename_const_nodes(replacement.root, renames))
+    return replacement
+end
+
+function apply(m::SubtreeReplacementMutation, tree::AstTree, site::Site, env::MutationEnv, ctx::NamedTuple)
+    result = generate_replacement(m.replacement_generator, site, env, ctx, m.generation_kwargs)
+    result isa Err && return result
+    result isa GenerationResult || return Err(ArgumentError("replacement generator must return GenerationResult or Err"))
+
+    replacement = deepcopy(result.tree)
+    _merge_replacement_consts!(replacement, copy(result.local_consts), copy(result.local_const_types), ctx.local_consts, ctx.local_consts_ty)
+
+    _replace_site!(tree, site, replacement)
     return tree
 end
 
@@ -693,18 +1059,80 @@ constant categories can be added without editing a central type switch.
 """
 mutate_const_value(::AbstractRNG, value, ty::Ty, args...) = Err(UnsupportedConstTyErr(ty))
 
+"""
+    ConstValueMutationPolicy(; modes=(:bias, :scale),
+        array_ranks=(:global, :axis, :outer, :full),
+        σ_bias=0.1, σ_scale=0.1, rerandomize_scale=1.0)
+
+Composable value-level policy for scalar and array constants.
+
+`modes` may contain `:bias`, `:scale`, and `:rerandomize`. Scale uses the
+positive log-normal form `exp(σ_scale * randn(rng))`. For arrays, `array_ranks`
+selects the broadcast shape for bias/scale perturbations: `:global`, `:axis`,
+`:outer`, or `:full`.
+"""
+struct ConstValueMutationPolicy
+    modes::Tuple{Vararg{Symbol}}
+    array_ranks::Tuple{Vararg{Symbol}}
+    σ_bias::Float64
+    σ_scale::Float64
+    rerandomize_scale::Float64
+end
+
+function ConstValueMutationPolicy(;
+    modes::Tuple{Vararg{Symbol}}=(:bias, :scale),
+    array_ranks::Tuple{Vararg{Symbol}}=(:global, :axis, :outer, :full),
+    σ_bias::Real=0.1,
+    σ_scale::Real=0.1,
+    rerandomize_scale::Real=1.0,
+)
+    isempty(modes) && throw(ArgumentError("modes must be non-empty"))
+    isempty(array_ranks) && throw(ArgumentError("array_ranks must be non-empty"))
+    allowed_modes = (:bias, :scale, :rerandomize)
+    allowed_ranks = (:global, :axis, :outer, :full)
+    all(m -> m in allowed_modes, modes) || throw(ArgumentError("unsupported const mutation mode"))
+    all(r -> r in allowed_ranks, array_ranks) || throw(ArgumentError("unsupported array rank mode"))
+    σb = Float64(σ_bias)
+    σs = Float64(σ_scale)
+    rr = Float64(rerandomize_scale)
+    isfinite(σb) && σb >= 0 || throw(ArgumentError("σ_bias must be finite and nonnegative"))
+    isfinite(σs) && σs >= 0 || throw(ArgumentError("σ_scale must be finite and nonnegative"))
+    isfinite(rr) && rr >= 0 || throw(ArgumentError("rerandomize_scale must be finite and nonnegative"))
+    return ConstValueMutationPolicy(modes, array_ranks, σb, σs, rr)
+end
+
+ConstValueMutationPolicy(σ::Real) = ConstValueMutationPolicy(; σ_bias=σ, σ_scale=σ)
+
+@inline _policy_mode(rng::AbstractRNG, policy::ConstValueMutationPolicy) = rand(rng, policy.modes)
+@inline _policy_rank(rng::AbstractRNG, policy::ConstValueMutationPolicy) = rand(rng, policy.array_ranks)
+
 function mutate_const_value(rng::AbstractRNG, value::AbstractFloat, ty::Ty, σ::Float64)
     ty == FloatTy || return Err(UnsupportedConstTyErr(ty))
-    mode = rand(rng, 1:2)
-    if mode == 1
-        return value + convert(typeof(value), randn(rng) * σ)
-    else
-        return value * (one(typeof(value)) + convert(typeof(value), randn(rng) * σ))
+    return mutate_const_value(rng, value, ty, ConstValueMutationPolicy(σ))
+end
+
+function mutate_const_value(rng::AbstractRNG, value::AbstractFloat, ty::Ty, policy::ConstValueMutationPolicy)
+    ty == FloatTy || return Err(UnsupportedConstTyErr(ty))
+    T = typeof(value)
+    mode = _policy_mode(rng, policy)
+    if mode === :bias
+        return value + convert(T, randn(rng) * policy.σ_bias)
+    elseif mode === :scale
+        return value * convert(T, exp(randn(rng) * policy.σ_scale))
+    elseif mode === :rerandomize
+        return convert(T, randn(rng) * policy.rerandomize_scale)
     end
+    return Err(ArgumentError("unsupported const mutation mode: $mode"))
 end
 
 function mutate_const_value(rng::AbstractRNG, value::Integer, ty::Ty, ::Float64)
     ty == IntTy || return Err(UnsupportedConstTyErr(ty))
+    return value + convert(typeof(value), rand(rng, (-1, 1)))
+end
+
+function mutate_const_value(rng::AbstractRNG, value::Integer, ty::Ty, policy::ConstValueMutationPolicy)
+    ty == IntTy || return Err(UnsupportedConstTyErr(ty))
+    _policy_mode(rng, policy) === :rerandomize && return convert(typeof(value), round(Int, randn(rng) * policy.rerandomize_scale))
     return value + convert(typeof(value), rand(rng, (-1, 1)))
 end
 
@@ -713,52 +1141,100 @@ function mutate_const_value(::AbstractRNG, value::Bool, ty::Ty, ::Float64)
     return !value
 end
 
+mutate_const_value(rng::AbstractRNG, value::Bool, ty::Ty, ::ConstValueMutationPolicy) =
+    mutate_const_value(rng, value, ty, 0.0)
+
 function mutate_const_value(rng::AbstractRNG, value::Complex, ty::Ty, σ::Float64)
     (ty isa TyConst && (ty::TyConst).name == :Complex) || return Err(UnsupportedConstTyErr(ty))
-    T = typeof(value)
-    δre = convert(real(T), randn(rng) * σ)
-    δim = convert(real(T), randn(rng) * σ)
-    return value + complex(δre, δim)
+    return mutate_const_value(rng, value, ty, ConstValueMutationPolicy(σ))
+end
+
+function mutate_const_value(rng::AbstractRNG, value::Complex, ty::Ty, policy::ConstValueMutationPolicy)
+    (ty isa TyConst && (ty::TyConst).name == :Complex) || return Err(UnsupportedConstTyErr(ty))
+    R = real(typeof(value))
+    mode = _policy_mode(rng, policy)
+    if mode === :bias
+        return value + complex(convert(R, randn(rng) * policy.σ_bias), convert(R, randn(rng) * policy.σ_bias))
+    elseif mode === :scale
+        return value * convert(R, exp(randn(rng) * policy.σ_scale))
+    elseif mode === :rerandomize
+        return complex(convert(R, randn(rng) * policy.rerandomize_scale), convert(R, randn(rng) * policy.rerandomize_scale))
+    end
+    return Err(ArgumentError("unsupported const mutation mode: $mode"))
 end
 
 function mutate_const_value(rng::AbstractRNG, value::AbstractArray{T}, ty::Ty, σ::Float64) where {T<:AbstractFloat}
-    ty isa TyArray || return Err(UnsupportedConstTyErr(ty))
-    (ty::TyArray).elem == FloatTy || return Err(UnsupportedConstTyErr(ty))
-    noise = randn(rng, T, size(value)...)
-    return value .+ noise .* convert(T, σ)
+    _float_array_ty_supported(ty) || return Err(UnsupportedConstTyErr(ty))
+    return mutate_const_value(rng, value, ty, ConstValueMutationPolicy(σ))
 end
 
 function mutate_const_value(rng::AbstractRNG, value::AbstractMatrix{T}, ty::Ty, σ::Float64) where {T<:AbstractFloat}
-    ty isa TyArray || return Err(UnsupportedConstTyErr(ty))
-    if (ty::TyArray).elem == FloatTy
-        noise = randn(rng, T, size(value)...)
-        return value .+ noise .* convert(T, σ)
+    _float_array_ty_supported(ty) || return Err(UnsupportedConstTyErr(ty))
+    return mutate_const_value(rng, value, ty, ConstValueMutationPolicy(σ))
+end
+
+function _array_leaf_ty(ty::Ty)
+    ty isa TyArray || return nothing
+    elem = (ty::TyArray).elem
+    while elem isa TyArray
+        elem = (elem::TyArray).elem
     end
-    (ty::TyArray).elem isa TyArray || return Err(UnsupportedConstTyErr(ty))
-    inner = (ty.elem::TyArray)
-    inner.elem == FloatTy || return Err(UnsupportedConstTyErr(ty))
-    noise = randn(rng, T, size(value)...)
-    return value .+ noise .* convert(T, σ)
+    return elem
+end
+
+_float_array_ty_supported(ty::Ty) = _array_leaf_ty(ty) == FloatTy
+_int_array_ty_supported(ty::Ty) = _array_leaf_ty(ty) == IntTy
+
+function _array_rank_shape(rng::AbstractRNG, dims::Tuple, rank::Symbol)
+    if rank === :global
+        return ntuple(_ -> 1, length(dims))
+    elseif rank === :axis
+        axis = rand(rng, 1:length(dims))
+        return ntuple(i -> i == axis ? dims[i] : 1, length(dims))
+    elseif rank === :outer && length(dims) >= 2
+        return ntuple(i -> i <= 2 ? dims[i] : 1, length(dims))
+    end
+    return dims
+end
+
+function _mutate_float_array(rng::AbstractRNG, value::AbstractArray{T}, policy::ConstValueMutationPolicy) where {T<:AbstractFloat}
+    mode = _policy_mode(rng, policy)
+    rank = mode === :rerandomize ? :full : _policy_rank(rng, policy)
+    shape = _array_rank_shape(rng, size(value), rank)
+    noise = randn(rng, T, shape)
+    if mode === :bias
+        return value .+ noise .* convert(T, policy.σ_bias)
+    elseif mode === :scale
+        return value .* exp.(noise .* convert(T, policy.σ_scale))
+    elseif mode === :rerandomize
+        return randn(rng, T, size(value)...) .* convert(T, policy.rerandomize_scale)
+    end
+    return Err(ArgumentError("unsupported const mutation mode: $mode"))
+end
+
+function mutate_const_value(rng::AbstractRNG, value::AbstractArray{T}, ty::Ty, policy::ConstValueMutationPolicy) where {T<:AbstractFloat}
+    _float_array_ty_supported(ty) || return Err(UnsupportedConstTyErr(ty))
+    return _mutate_float_array(rng, value, policy)
 end
 
 function mutate_const_value(rng::AbstractRNG, value::AbstractArray{T}, ty::Ty, ::Float64) where {T<:Integer}
-    ty isa TyArray || return Err(UnsupportedConstTyErr(ty))
-    (ty::TyArray).elem == IntTy || return Err(UnsupportedConstTyErr(ty))
+    _int_array_ty_supported(ty) || return Err(UnsupportedConstTyErr(ty))
     delta = rand(rng, (-1, 1), size(value)...)
     return value .+ convert.(T, delta)
 end
 
 function mutate_const_value(rng::AbstractRNG, value::AbstractMatrix{T}, ty::Ty, ::Float64) where {T<:Integer}
-    ty isa TyArray || return Err(UnsupportedConstTyErr(ty))
-    if (ty::TyArray).elem == IntTy
-        delta = rand(rng, (-1, 1), size(value)...)
-        return value .+ convert.(T, delta)
-    end
-    (ty::TyArray).elem isa TyArray || return Err(UnsupportedConstTyErr(ty))
-    inner = (ty.elem::TyArray)
-    inner.elem == IntTy || return Err(UnsupportedConstTyErr(ty))
+    _int_array_ty_supported(ty) || return Err(UnsupportedConstTyErr(ty))
     delta = rand(rng, (-1, 1), size(value)...)
     return value .+ convert.(T, delta)
+end
+
+function mutate_const_value(rng::AbstractRNG, value::AbstractArray{T}, ty::Ty, policy::ConstValueMutationPolicy) where {T<:Integer}
+    _int_array_ty_supported(ty) || return Err(UnsupportedConstTyErr(ty))
+    if _policy_mode(rng, policy) === :rerandomize
+        return convert.(T, round.(Int, randn(rng, size(value)...) .* policy.rerandomize_scale))
+    end
+    return mutate_const_value(rng, value, ty, 0.0)
 end
 
 function mutate_const_value(rng::AbstractRNG, value::AbstractArray{A}, ty::Ty, σ::Float64) where {A<:AbstractArray}
@@ -768,6 +1244,19 @@ function mutate_const_value(rng::AbstractRNG, value::AbstractArray{A}, ty::Ty, �
     out = Vector{Any}(undef, length(value))
     for (j, v0) in enumerate(value)
         v = mutate_const_value(rng, v0, inner_ty, σ)
+        v isa Err && return v
+        out[j] = v
+    end
+    return out
+end
+
+function mutate_const_value(rng::AbstractRNG, value::AbstractArray{A}, ty::Ty, policy::ConstValueMutationPolicy) where {A<:AbstractArray}
+    ty isa TyArray || return Err(UnsupportedConstTyErr(ty))
+    (ty::TyArray).elem isa TyArray || return Err(UnsupportedConstTyErr(ty))
+    inner_ty = (ty.elem::TyArray)
+    out = Vector{Any}(undef, length(value))
+    for (j, v0) in enumerate(value)
+        v = mutate_const_value(rng, v0, inner_ty, policy)
         v isa Err && return v
         out[j] = v
     end
@@ -790,8 +1279,12 @@ Scalar local constant mutation.
 """
 struct ScalarConstMutation <: AbstractMutation
     σ::Float64
+    policy::ConstValueMutationPolicy
 end
-ScalarConstMutation(; σ::Float64=0.1) = ScalarConstMutation(σ)
+ScalarConstMutation(; σ::Real=0.1, policy::ConstValueMutationPolicy=ConstValueMutationPolicy(σ)) =
+    ScalarConstMutation(Float64(σ), policy)
+ScalarConstMutation(σ::Real) = ScalarConstMutation(; σ)
+ScalarConstMutation(policy::ConstValueMutationPolicy) = ScalarConstMutation(; policy)
 required_site_kinds(::ScalarConstMutation) = Symbol[:const_local]
 
 function is_site_eligible(::ScalarConstMutation, site::Site, ::MutationEnv, ctx::NamedTuple)
@@ -807,7 +1300,7 @@ function apply(m::ScalarConstMutation, tree::AstTree, site::Site, env::MutationE
     node = site.node::ConstNode
     _is_local_const(node.name, ctx) || return Err(NoEligibleSiteErr())
     value = ctx.local_consts[node.name]
-    new_value = mutate_const_value(env.rng, value, site.ty, m.σ)
+    new_value = mutate_const_value(env.rng, value, site.ty, m.policy)
     return _apply_local_const_mutation!(tree, site, ctx, new_value)
 end
 
@@ -844,8 +1337,12 @@ operations over scalar loops.
 """
 struct ArrayConstMutation <: AbstractMutation
     σ::Float64
+    policy::ConstValueMutationPolicy
 end
-ArrayConstMutation(; σ::Float64=0.1) = ArrayConstMutation(σ)
+ArrayConstMutation(; σ::Real=0.1, policy::ConstValueMutationPolicy=ConstValueMutationPolicy(σ)) =
+    ArrayConstMutation(Float64(σ), policy)
+ArrayConstMutation(σ::Real) = ArrayConstMutation(; σ)
+ArrayConstMutation(policy::ConstValueMutationPolicy) = ArrayConstMutation(; policy)
 required_site_kinds(::ArrayConstMutation) = Symbol[:const_local]
 
 function is_site_eligible(::ArrayConstMutation, site::Site, ::MutationEnv, ctx::NamedTuple)
@@ -858,7 +1355,7 @@ function apply(m::ArrayConstMutation, tree::AstTree, site::Site, env::MutationEn
     node = site.node::ConstNode
     _is_local_const(node.name, ctx) || return Err(NoEligibleSiteErr())
     value = ctx.local_consts[node.name]
-    new_value = mutate_const_value(env.rng, value, site.ty, m.σ)
+    new_value = mutate_const_value(env.rng, value, site.ty, m.policy)
     return _apply_local_const_mutation!(tree, site, ctx, new_value)
 end
 
@@ -1190,11 +1687,15 @@ end
 Semantics-preserving common subexpression extraction.
 
 This mutation chooses an anchor subexpression, canonicalizes it (alpha-invariant),
-and delegates to `ASTs.CSE.eliminate_expression!` which rewrites the tree by
+and delegates to the node-anchored `ASTs.CSE.eliminate_node!` path, which
+compares De Bruijn captures by binder identity before rewriting the tree by
 introducing a beta-redex around the LCA of matches.
 
 When `min_count=1`, this acts as a "zero-cost" structural move: it can extract a
 single occurrence to increase structural diversity without changing semantics.
+Single-lift mode admits non-index sites. Repeated CSE mode (`min_count>1`) keeps
+the default candidate filter to applications so it avoids low-value repeated
+variables and constants.
 """
 struct CSEMutation <: AbstractMutation
     min_count::Int
@@ -1202,14 +1703,20 @@ end
 CSEMutation(; min_count::Int=1) = CSEMutation(min_count)
 required_site_kinds(::CSEMutation) = Symbol[:any]
 
-function is_site_eligible(::CSEMutation, site::Site, ::MutationEnv, ::NamedTuple)
-    return site.node isa AppNode
+function is_site_eligible(m::CSEMutation, site::Site, env::MutationEnv, ::NamedTuple)
+    m.min_count <= 1 && return !(site.node isa IndexNode)
+    site.node isa AppNode || return false
+    env.tree === nothing && return true
+    cache_key = Symbol("cse_repeated_nodes_", m.min_count)
+    eligible = get!(env.eligibility_cache, cache_key) do
+        repeated_nodes(env.tree; min_count=m.min_count)
+    end
+    eligible isa Err && return true
+    return get(eligible, site.node, false)
 end
 
 function apply(m::CSEMutation, tree::AstTree, site::Site, env::MutationEnv, ctx::NamedTuple)
-    form = canonicalize(tree, site.node)
-    form isa Err && return form
-    return eliminate_expression!(tree, form; min_count=m.min_count, factory=ctx.symfactory)
+    return eliminate_node!(tree, site.node; min_count=m.min_count, factory=ctx.symfactory)
 end
 
 function _count_nodes(tree::AstTree)
@@ -1254,6 +1761,7 @@ Returns `Err(MaxTryReachedErr())` if no valid mutation can be found within `max_
 - `copy_ctx`: transactional mutation over constant dictionaries (default: `true`)
 - `prune_consts`: call `prune_local_consts!` after a successful mutation (default: `true`)
 - `global_consts_ty`, `local_consts`, `local_consts_ty`: constant/type containers
+- `global_consts`: optional runtime values for global constants used by generated replacements
 - `const_symfactory`: per-call deterministic local-constant symbol factory (default: `ConstSymbolFactory()`)
 - `tyfactory`, `symfactory`: local factories used by type inference and CSE
 
@@ -1270,6 +1778,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     copy_tree::Bool=true,
     copy_ctx::Bool=true,
     prune_consts::Bool=true,
+    global_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
     global_consts_ty::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     local_consts_ty::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     local_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
@@ -1291,6 +1800,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     base_type_ctx = merge(global_consts_ty, current_local_consts_ty)
     base_ctx = (;
         rng=rng,
+        global_consts=global_consts,
         global_consts_ty=global_consts_ty,
         local_consts_ty=current_local_consts_ty,
         local_consts=current_local_consts,
@@ -1302,6 +1812,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         rng,
         target_ty,
         base_type_ctx,
+        current_tree,
         nothing,
         chooser isa WeightedPairChooser ? (chooser::WeightedPairChooser).cache_eligibility : false,
         IdDict{Any,Any}(),
@@ -1324,6 +1835,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         attempt_type_ctx = merge(global_consts_ty, attempt_local_consts_ty)
         attempt_ctx = (;
             rng=rng,
+            global_consts=global_consts,
             global_consts_ty=global_consts_ty,
             local_consts_ty=attempt_local_consts_ty,
             local_consts=attempt_local_consts,
@@ -1402,7 +1914,7 @@ include("Population.jl")
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, ConstNode
     using LambdaRegression.TypeSystem: FloatTy, TyLike
     using Random
-    using LambdaRegression.Mutations: mutate_tree, ScalarConstMutation, WeightedPairChooser, IndexedProvider
+    using LambdaRegression.Mutations: mutate_tree, ScalarConstMutation, WeightedPairChooser, IndexedProvider, ConstValueMutationPolicy
     using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
     using LambdaRegression.Mutations: mutate_tree, BoolConstMutation, WeightedPairChooser, IndexedProvider
     using LambdaRegression.TypeSystem: BoolTy, TyLike
@@ -1529,6 +2041,200 @@ end
     @test all(length.(new_val) .== length.(value))
 end
 
+@testitem "Mutations ScalarConstMutation supports lognormal scale policy" setup=[MutBaseImports] begin
+    rng = MersenneTwister(42)
+    name = :k
+    local_consts = Dict{Symbol,Any}(name => 2.0)
+    local_consts_ty = Dict{Symbol,TyLike}(name => FloatTy)
+    mutation = ScalarConstMutation(;
+        policy=ConstValueMutationPolicy(modes=(:scale,), σ_scale=0.4),
+    )
+    mutated = mutate_tree(
+        AstTree(ConstNode(name)),
+        FloatTy;
+        rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts,
+        local_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ScalarConstMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+        prune_consts=true,
+    )
+
+    @test mutated isa AstTree
+    @test local_consts[(mutated.root::ConstNode).name] > 0
+    @test local_consts[(mutated.root::ConstNode).name] != 2.0
+end
+
+@testitem "Mutations ScalarConstMutation supports rerandomize policy" setup=[MutBaseImports] begin
+    rng = MersenneTwister(555)
+    name = :k
+    local_consts = Dict{Symbol,Any}(name => 2.0)
+    local_consts_ty = Dict{Symbol,TyLike}(name => FloatTy)
+    mutation = ScalarConstMutation(;
+        policy=ConstValueMutationPolicy(modes=(:rerandomize,), rerandomize_scale=1.0),
+    )
+    mutated = mutate_tree(
+        AstTree(ConstNode(name)),
+        FloatTy;
+        rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts,
+        local_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ScalarConstMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+        prune_consts=true,
+    )
+
+    @test mutated isa AstTree
+    @test local_consts[(mutated.root::ConstNode).name] != 2.0
+end
+
+@testitem "Mutations constant mutations preserve legacy sigma constructor access" setup=[MutBaseImports] begin
+    scalar = ScalarConstMutation(0.2)
+    array = ArrayConstMutation(0.3)
+
+    @test scalar.σ == 0.2
+    @test scalar.policy isa ConstValueMutationPolicy
+    @test scalar.policy.σ_bias == 0.2
+    @test scalar.policy.σ_scale == 0.2
+    @test array.σ == 0.3
+    @test array.policy isa ConstValueMutationPolicy
+    @test array.policy.σ_bias == 0.3
+    @test array.policy.σ_scale == 0.3
+end
+
+@testitem "Mutations ArrayConstMutation supports global lognormal scale policy" setup=[MutBaseImports] begin
+    rng = MersenneTwister(2000)
+    name = :A
+    value = [1.0 2.0; 3.0 4.0]
+    const_ty = TyArray(TyNat(2), TyArray(TyNat(2), FloatTy))
+    local_consts = Dict{Symbol,Any}(name => value)
+    local_consts_ty = Dict{Symbol,TyLike}(name => const_ty)
+    mutation = ArrayConstMutation(;
+        policy=ConstValueMutationPolicy(modes=(:scale,), array_ranks=(:global,), σ_scale=0.4),
+    )
+    mutated = mutate_tree(
+        AstTree(ConstNode(name)),
+        const_ty;
+        rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts,
+        local_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ArrayConstMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+        prune_consts=true,
+    )
+
+    @test mutated isa AstTree
+    out = local_consts[(mutated.root::ConstNode).name]
+    ratio = out ./ value
+    @test all(>(0), ratio)
+    @test length(unique(round.(vec(ratio); digits=10))) == 1
+end
+
+@testitem "Mutations ArrayConstMutation supports full-rank bias policy" setup=[MutBaseImports] begin
+    rng = MersenneTwister(1)
+    name = :A
+    value = [1.0 2.0; 3.0 4.0]
+    const_ty = TyArray(TyNat(2), TyArray(TyNat(2), FloatTy))
+    local_consts = Dict{Symbol,Any}(name => value)
+    local_consts_ty = Dict{Symbol,TyLike}(name => const_ty)
+    mutation = ArrayConstMutation(;
+        policy=ConstValueMutationPolicy(modes=(:bias,), array_ranks=(:full,), σ_bias=0.4),
+    )
+    mutated = mutate_tree(
+        AstTree(ConstNode(name)),
+        const_ty;
+        rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts,
+        local_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ArrayConstMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+        prune_consts=true,
+    )
+
+    @test mutated isa AstTree
+    out = local_consts[(mutated.root::ConstNode).name]
+    @test size(out) == size(value)
+    @test out != value
+    @test length(unique(round.(vec(out .- value); digits=10))) > 1
+end
+
+@testitem "Mutations ArrayConstMutation supports axis-wise bias policy" setup=[MutBaseImports] begin
+    rng = MersenneTwister(1111)
+    name = :A
+    value = [1.0 2.0 3.0; 4.0 5.0 6.0]
+    const_ty = TyArray(TyNat(2), TyArray(TyNat(3), FloatTy))
+    local_consts = Dict{Symbol,Any}(name => value)
+    local_consts_ty = Dict{Symbol,TyLike}(name => const_ty)
+    mutation = ArrayConstMutation(;
+        policy=ConstValueMutationPolicy(modes=(:bias,), array_ranks=(:axis,), σ_bias=0.4),
+    )
+    mutated = mutate_tree(
+        AstTree(ConstNode(name)),
+        const_ty;
+        rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts,
+        local_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ArrayConstMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+        prune_consts=true,
+    )
+
+    @test mutated isa AstTree
+    out = local_consts[(mutated.root::ConstNode).name]
+    delta = out .- value
+    rowwise = all(isapprox(delta[:, j], delta[:, 1]) for j in axes(delta, 2))
+    colwise = all(isapprox(delta[i, :], delta[1, :]) for i in axes(delta, 1))
+    @test rowwise || colwise
+    @test out != value
+end
+
+@testitem "Mutations ArrayConstMutation supports outer-rank Float NDArray policy" setup=[MutBaseImports] begin
+    rng = MersenneTwister(1234)
+    name = :A
+    value = reshape(collect(1.0:8.0), 2, 2, 2)
+    const_ty = TyArray(TyNat(2), TyArray(TyNat(2), TyArray(TyNat(2), FloatTy)))
+    local_consts = Dict{Symbol,Any}(name => value)
+    local_consts_ty = Dict{Symbol,TyLike}(name => const_ty)
+    mutation = ArrayConstMutation(;
+        policy=ConstValueMutationPolicy(modes=(:bias,), array_ranks=(:outer,), σ_bias=0.4),
+    )
+    mutated = mutate_tree(
+        AstTree(ConstNode(name)),
+        const_ty;
+        rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts,
+        local_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(ArrayConstMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+        prune_consts=true,
+    )
+
+    @test mutated isa AstTree
+    out = local_consts[(mutated.root::ConstNode).name]
+    delta = out .- value
+    @test size(out) == size(value)
+    @test isapprox(delta[:, :, 1], delta[:, :, 2])
+    @test length(unique(round.(vec(delta[:, :, 1]); digits=10))) > 1
+end
+
 @testitem "Mutations PointMutation Index swap respects binder types" setup=[MutBaseImports] begin
     rng = MersenneTwister(1111)
     # λx. λy. #0  (two Int binders so swap is allowed)
@@ -1551,6 +2257,341 @@ end
     @test mutated.root.body.body.index in (0, 1)
 end
 
+@testitem "Mutations SubtreeReplacementMutation uses local binder scope" setup=[MutBaseImports] begin
+    using LambdaRegression.CanonicalGeneration: GenerationWeights
+    using LambdaRegression.Mutations: SubtreeReplacementMutation, PathSiteSelectionPolicy
+
+    rng = MersenneTwister(1234)
+    tree = AstTree(AbsNode(:x, ConstNode(:k)))
+    target_ty = TyFun(FloatTy, FloatTy)
+    local_consts = Dict{Symbol,Any}(:k => 1.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy)
+
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng=rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts=local_consts,
+        local_consts_ty=local_consts_ty,
+        mutations=[
+            SubtreeReplacementMutation(;
+                site_selection=PathSiteSelectionPolicy(Int[1]),
+                generation_kwargs=(;
+                    weights=GenerationWeights(default=0, variable=1),
+                    sampling_depth_limit=1,
+                    sampling_node_budget=4,
+                ),
+            ),
+        ],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplacementMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=5,
+        prune_consts=true,
+    )
+
+    @test mutated isa AstTree
+    @test mutated.root isa AbsNode
+    @test mutated.root.body == IndexNode(0)
+    @test iscompatible(infer(mutated, merge(Dict{Symbol,TyLike}(), local_consts_ty)), target_ty)
+end
+
+@testitem "Mutations SubtreeReplacementMutation exposes replaceable generator hook" setup=[MutBaseImports] begin
+    using LambdaRegression.CanonicalGeneration: GenerationResult
+    using LambdaRegression.Mutations: SubtreeReplacementMutation, PathSiteSelectionPolicy
+    using LambdaRegression.Mutations: AbstractReplacementGenerator, generate_replacement
+
+    struct FixedFloatReplacement <: AbstractReplacementGenerator end
+    function LambdaRegression.Mutations.generate_replacement(
+        ::FixedFloatReplacement,
+        site::LambdaRegression.Mutations.Site,
+        env::LambdaRegression.Mutations.MutationEnv,
+        ctx::NamedTuple,
+        ::NamedTuple,
+    )
+        ctx.local_consts[:replacement] = 2.0
+        ctx.local_consts_ty[:replacement] = site.ty
+        return GenerationResult(AstTree(ConstNode(:replacement)), site.ty, ctx.local_consts, ctx.local_consts_ty, Dict{Symbol,Any}(:source => :test_fixed))
+    end
+
+    tree = AstTree(AbsNode(:x, ConstNode(:k)))
+    target_ty = TyFun(FloatTy, FloatTy)
+    local_consts = Dict{Symbol,Any}(:k => 1.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy)
+
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(42),
+        local_consts=local_consts,
+        local_consts_ty=local_consts_ty,
+        mutations=[
+            SubtreeReplacementMutation(;
+                site_selection=PathSiteSelectionPolicy(Int[1]),
+                replacement_generator=FixedFloatReplacement(),
+            ),
+        ],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplacementMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=5,
+        prune_consts=true,
+    )
+
+    @test mutated isa AstTree
+    @test mutated.root.body == ConstNode(:replacement)
+    @test local_consts == Dict{Symbol,Any}(:replacement => 2.0)
+    @test local_consts_ty == Dict{Symbol,TyLike}(:replacement => FloatTy)
+end
+
+@testitem "Mutations SubtreeReplacementMutation freshens conflicting replacement constants" setup=[MutBaseImports] begin
+    using LambdaRegression.CanonicalGeneration: GenerationResult
+    using LambdaRegression.Mutations: SubtreeReplacementMutation, PathSiteSelectionPolicy, DefaultSiteLockPolicy
+    using LambdaRegression.Mutations: AbstractReplacementGenerator
+    using LambdaRegression.TypeSystem: FADD
+
+    struct ConflictingKReplacement <: AbstractReplacementGenerator end
+    function LambdaRegression.Mutations.generate_replacement(
+        ::ConflictingKReplacement,
+        site::LambdaRegression.Mutations.Site,
+        ::LambdaRegression.Mutations.MutationEnv,
+        ::NamedTuple,
+        ::NamedTuple,
+    )
+        return GenerationResult(
+            AstTree(ConstNode(:k)),
+            site.ty,
+            Dict{Symbol,Any}(:k => 2.0),
+            Dict{Symbol,TyLike}(:k => FloatTy),
+            Dict{Symbol,Any}(:source => :conflict_fixture),
+        )
+    end
+
+    tree = AstTree(AppNode(AppNode(ConstNode(:FADD), ConstNode(:k)), ConstNode(:old)))
+    local_consts = Dict{Symbol,Any}(:k => 1.0, :old => 3.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy, :old => FloatTy)
+    global_consts = Dict{Symbol,Any}(:FADD => FADD)
+    global_consts_ty = Dict{Symbol,TyLike}(:FADD => TypeSystem.get_type(FADD))
+
+    mutated = mutate_tree(
+        tree,
+        FloatTy;
+        rng=MersenneTwister(2000),
+        global_consts,
+        global_consts_ty,
+        local_consts,
+        local_consts_ty,
+        mutations=[
+            SubtreeReplacementMutation(;
+                site_lock=DefaultSiteLockPolicy(spine_only=false),
+                site_selection=PathSiteSelectionPolicy(Int[2]),
+                replacement_generator=ConflictingKReplacement(),
+            ),
+        ],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplacementMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=5,
+        prune_consts=true,
+    )
+
+    @test mutated isa AstTree
+    @test local_consts[:k] == 1.0
+    @test mutated.root.arg isa ConstNode
+    @test mutated.root.arg.name != :k
+    @test local_consts[mutated.root.arg.name] == 2.0
+    @test iscompatible(infer(mutated, merge(global_consts_ty, local_consts_ty)), FloatTy)
+end
+
+@testitem "Mutations SubtreeReplacementMutation default lock is conservative and replaceable" setup=[MutBaseImports] begin
+    using LambdaRegression.Mutations: DefaultSiteLockPolicy, PathSiteSelectionPolicy
+    using LambdaRegression.Mutations: is_site_locked, site_selection_weight
+
+    tree = AstTree(AbsNode(:x, AppNode(ConstNode(:f), IndexNode(0))))
+    target_ty = TyFun(FloatTy, FloatTy)
+    global_consts_ty = Dict{Symbol,TyLike}(:f => TyFun(FloatTy, FloatTy))
+    env = LambdaRegression.Mutations.MutationEnv(
+        MersenneTwister(42),
+        target_ty,
+        global_consts_ty,
+        nothing,
+        nothing,
+        false,
+        IdDict{Any,Any}(),
+        LambdaRegression.Mutations.AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(),
+        LambdaRegression.Mutations.BloatPolicy(),
+    )
+    ctx = (;
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        global_consts_ty=global_consts_ty,
+        tyfactory=newtyvar,
+    )
+    provider = IndexedProvider()
+    prep = LambdaRegression.Mutations.prepare!(provider, tree, global_consts_ty, env, ctx)
+    @test !(prep isa Err)
+
+    f_site = only(filter(s -> s.path == Int[1, 1], LambdaRegression.Mutations.sites(provider)))
+    x_site = only(filter(s -> s.path == Int[1, 2], LambdaRegression.Mutations.sites(provider)))
+    body_site = only(filter(s -> s.path == Int[1], LambdaRegression.Mutations.sites(provider)))
+
+    @test is_site_locked(DefaultSiteLockPolicy(), f_site, env, ctx)
+    @test is_site_locked(DefaultSiteLockPolicy(), x_site, env, ctx)
+    @test !is_site_locked(DefaultSiteLockPolicy(), body_site, env, ctx)
+    @test site_selection_weight(PathSiteSelectionPolicy(Int[1]), body_site, env, ctx) == 1.0
+    @test site_selection_weight(PathSiteSelectionPolicy(Int[1, 1]), body_site, env, ctx) == 0.0
+end
+
+@testitem "Mutations SubtreeReplacementMutation is deterministic under fixed seed" setup=[MutBaseImports] begin
+    using LambdaRegression.CanonicalGeneration: GenerationWeights
+    using LambdaRegression.Mutations: SubtreeReplacementMutation, PathSiteSelectionPolicy
+
+    function run_once()
+        local_consts = Dict{Symbol,Any}(:k => 1.0)
+        local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy)
+        tree = AstTree(AbsNode(:x, ConstNode(:k)))
+        out = mutate_tree(
+            tree,
+            TyFun(FloatTy, FloatTy);
+            rng=MersenneTwister(555),
+            local_consts=local_consts,
+            local_consts_ty=local_consts_ty,
+            mutations=[
+                SubtreeReplacementMutation(;
+                    site_selection=PathSiteSelectionPolicy(Int[1]),
+                    generation_kwargs=(;
+                        weights=GenerationWeights(default=0, variable=1),
+                        sampling_depth_limit=1,
+                        sampling_node_budget=4,
+                    ),
+                ),
+            ],
+            chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplacementMutation=>1.0)),
+            provider=IndexedProvider(),
+            max_try=5,
+            prune_consts=true,
+        )
+        return out, local_consts, local_consts_ty
+    end
+
+    a = run_once()
+    b = run_once()
+    @test a[1] isa AstTree
+    @test a[1] == b[1]
+    @test a[2] == b[2]
+    @test a[3] == b[3]
+end
+
+@testitem "Mutations SubtreeReplacementMutation supports deterministic two-round replacement" setup=[MutBaseImports] begin
+    using LambdaRegression.CanonicalGeneration: GenerationResult
+    using LambdaRegression.Mutations: SubtreeReplacementMutation
+    using LambdaRegression.Mutations: AbstractReplacementGenerator
+
+    mutable struct SequenceReplacement <: AbstractReplacementGenerator
+        counter::Int
+    end
+    function LambdaRegression.Mutations.generate_replacement(
+        generator::SequenceReplacement,
+        site::LambdaRegression.Mutations.Site,
+        ::LambdaRegression.Mutations.MutationEnv,
+        ::NamedTuple,
+        ::NamedTuple,
+    )
+        generator.counter += 1
+        name = Symbol(:replacement, generator.counter)
+        return GenerationResult(
+            AstTree(ConstNode(name)),
+            site.ty,
+            Dict{Symbol,Any}(name => Float64(generator.counter)),
+            Dict{Symbol,TyLike}(name => FloatTy),
+            Dict{Symbol,Any}(:round => generator.counter),
+        )
+    end
+
+    function run_two_rounds()
+        local_consts = Dict{Symbol,Any}(:seed => 0.0)
+        local_consts_ty = Dict{Symbol,TyLike}(:seed => FloatTy)
+        tree = AstTree(ConstNode(:seed))
+        mutation = SubtreeReplacementMutation(; replacement_generator=SequenceReplacement(0))
+        for _ in 1:2
+            tree = mutate_tree(
+                tree,
+                FloatTy;
+                rng=MersenneTwister(1),
+                local_consts,
+                local_consts_ty,
+                mutations=[mutation],
+                chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplacementMutation=>1.0)),
+                provider=IndexedProvider(),
+                max_try=5,
+                prune_consts=true,
+            )
+            @test tree isa AstTree
+        end
+        return tree, local_consts, local_consts_ty
+    end
+
+    a = run_two_rounds()
+    b = run_two_rounds()
+    @test a[1] == b[1]
+    @test a[2] == b[2]
+    @test a[3] == b[3]
+    @test a[1].root == ConstNode(:replacement2)
+    @test a[2] == Dict{Symbol,Any}(:replacement2 => 2.0)
+end
+
+@testitem "Mutations SubtreeReplacementMutation smokes on rich canonical target families" setup=[MutBaseImports] begin
+    using LambdaRegression.CanonicalGeneration: generate_canonical, test_catalog_consts, test_catalog_generation_kwargs
+    using LambdaRegression.Mutations: SubtreeReplacementMutation
+
+    Matrix32 = TyArray(TyNat(3), TyArray(TyNat(2), FloatTy))
+    Float4Fn = TyFun(FloatTy, TyFun(FloatTy, TyFun(FloatTy, TyFun(FloatTy, FloatTy))))
+    targets = [
+        TyFun(Matrix32, Matrix32),
+        TyFun(Matrix32, FloatTy),
+        TyFun(FloatTy, FloatTy),
+        Float4Fn,
+        TyFun(TypeSystem.TyList(FloatTy), FloatTy),
+    ]
+    consts = test_catalog_consts()
+    generation_kwargs = test_catalog_generation_kwargs(profile=:deeper)
+    replacement_kwargs = merge(
+        generation_kwargs,
+        (; sampling_depth_limit=2, sampling_node_budget=24, guarded_expansion_depth=0),
+    )
+
+    for (i, target_ty) in enumerate(targets)
+        generated = generate_canonical(
+            target_ty;
+            rng=MersenneTwister(100 + i),
+            global_consts=consts,
+            generation_kwargs...,
+        )
+        @test generated isa LambdaRegression.CanonicalGeneration.GenerationResult
+
+        local_consts = copy(generated.local_consts)
+        local_consts_ty = copy(generated.local_const_types)
+        mutated = mutate_tree(
+            generated.tree,
+            target_ty;
+            rng=MersenneTwister(200 + i),
+            global_consts=consts,
+            local_consts=local_consts,
+            local_consts_ty=local_consts_ty,
+            mutations=[
+                SubtreeReplacementMutation(; generation_kwargs=replacement_kwargs),
+            ],
+            chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(SubtreeReplacementMutation=>1.0), cache_eligibility=true),
+            provider=IndexedProvider(),
+            max_try=80,
+            prune_consts=true,
+        )
+        @test mutated isa AstTree
+        inferred = infer(mutated, local_consts_ty)
+        @test !(inferred isa Err)
+        @test iscompatible(inferred, target_ty)
+    end
+end
+
 @testitem "Mutations choose_pair eligibility_cache is not reset" setup=[MutBaseImports] begin
     rng = MersenneTwister(1)
     local_consts = Dict{Symbol,Any}(:k => 1.0)
@@ -1563,6 +2604,7 @@ end
         rng,
         FloatTy,
         type_ctx,
+        nothing,
         nothing,
         true,
         IdDict{Any,Any}(),
@@ -1600,6 +2642,7 @@ end
         MersenneTwister(1111),
         TyFun(FloatTy, FloatTy),
         type_ctx,
+        nothing,
         nothing,
         false,
         IdDict{Any,Any}(),
@@ -1684,6 +2727,51 @@ end
     @test mutated isa AstTree
 end
 
+@testitem "Mutations BetaReduceMutation reduces non-root redex under binder" setup=[MutBaseImports] begin
+    rng = MersenneTwister(1234)
+    global_consts_ty = Dict{Symbol,TyLike}(:f => TyFun(IntTy, IntTy))
+    tree = AstTree(AbsNode(:z, AppNode(ConstNode(:f), AppNode(AbsNode(:x, IndexNode(0)), IndexNode(0)))))
+    target_ty = TyFun(IntTy, IntTy)
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng,
+        global_consts_ty,
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        mutations=[BetaReduceMutation()],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(BetaReduceMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+    )
+
+    expected = AstTree(AbsNode(:z, AppNode(ConstNode(:f), IndexNode(0))))
+    @test mutated == expected
+    @test iscompatible(infer(mutated, global_consts_ty), target_ty)
+end
+
+@testitem "Mutations BetaReduceMutation preserves outer binder through nested body" setup=[MutBaseImports] begin
+    rng = MersenneTwister(8000)
+    tree = AstTree(AbsNode(:z, AppNode(AbsNode(:x, AbsNode(:y, IndexNode(1))), IndexNode(0))))
+    target_ty = TyFun(IntTy, TyFun(IntTy, IntTy))
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng,
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        mutations=[BetaReduceMutation()],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(BetaReduceMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+    )
+
+    expected = AstTree(AbsNode(:z, AbsNode(:y, IndexNode(1))))
+    @test mutated == expected
+    @test iscompatible(infer(mutated, Dict{Symbol,TyLike}()), target_ty)
+end
+
 @testitem "Mutations EtaReduceMutation reduces eta-redex + preserves type" setup=[MutBaseImports] begin
     rng = MersenneTwister(42)
     global_consts_ty = Dict{Symbol,TyLike}(:f => TyFun(IntTy, IntTy))
@@ -1702,6 +2790,55 @@ end
         max_try=10,
     )
     @test mutated isa AstTree
+end
+
+@testitem "Mutations EtaReduceMutation reduces non-root eta-redex" setup=[MutBaseImports] begin
+    rng = MersenneTwister(555)
+    global_consts_ty = Dict{Symbol,TyLike}(
+        :f => TyFun(IntTy, IntTy),
+        :h => TyFun(TyFun(IntTy, IntTy), IntTy),
+    )
+    tree = AstTree(AbsNode(:z, AppNode(ConstNode(:h), AbsNode(:x, AppNode(ConstNode(:f), IndexNode(0))))))
+    target_ty = TyFun(IntTy, IntTy)
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng,
+        global_consts_ty,
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        mutations=[EtaReduceMutation()],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(EtaReduceMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+    )
+
+    expected = AstTree(AbsNode(:z, AppNode(ConstNode(:h), ConstNode(:f))))
+    @test mutated == expected
+    @test iscompatible(infer(mutated, global_consts_ty), target_ty)
+end
+
+@testitem "Mutations EtaReduceMutation shifts outer binder at non-root site" setup=[MutBaseImports] begin
+    rng = MersenneTwister(2000)
+    global_consts_ty = Dict{Symbol,TyLike}(:h => TyFun(TyFun(IntTy, IntTy), IntTy))
+    tree = AstTree(AbsNode(:z, AppNode(ConstNode(:h), AbsNode(:x, AppNode(IndexNode(1), IndexNode(0))))))
+    target_ty = TyFun(TyFun(IntTy, IntTy), IntTy)
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng,
+        global_consts_ty,
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        mutations=[EtaReduceMutation()],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(EtaReduceMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+    )
+
+    expected = AstTree(AbsNode(:z, AppNode(ConstNode(:h), IndexNode(0))))
+    @test mutated == expected
+    @test iscompatible(infer(mutated, global_consts_ty), target_ty)
 end
 
 @testitem "Mutations EtaReduceMutation rejects when binder occurs in f" setup=[MutBaseImports] begin
@@ -1751,6 +2888,48 @@ end
     @test (app::AppNode).arg == IndexNode(0)
     inferred = infer(mutated, global_consts_ty)
     @test iscompatible(inferred, target_ty)
+end
+
+@testitem "Mutations EtaExpandMutation expands selected non-root function site" setup=[MutBaseImports] begin
+    rng = MersenneTwister(8000)
+    global_consts_ty = Dict{Symbol,TyLike}(
+        :f => TyFun(IntTy, IntTy),
+        :h => TyFun(TyFun(IntTy, IntTy), IntTy),
+    )
+    tree = AstTree(AbsNode(:z, AppNode(ConstNode(:h), ConstNode(:f))))
+    target_ty = TyFun(IntTy, IntTy)
+    type_ctx = global_consts_ty
+    env = LambdaRegression.Mutations.MutationEnv(
+        rng,
+        target_ty,
+        type_ctx,
+        tree,
+        nothing,
+        false,
+        IdDict{Any,Any}(),
+        LambdaRegression.Mutations.AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(),
+        LambdaRegression.Mutations.BloatPolicy(),
+    )
+    ctx = (;
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        global_consts_ty,
+        tyfactory=newtyvar,
+        symfactory=LambdaRegression.ASTs.NodeASTs.SymbolGenerator(),
+        const_symfactory=LambdaRegression.ASTs.Contexts.ConstSymbolFactory(),
+    )
+    provider = IndexedProvider()
+    prep = LambdaRegression.Mutations.prepare!(provider, tree, type_ctx, env, ctx)
+    @test prep === nothing
+    site = only([s for s in LambdaRegression.Mutations.sites(provider) if s.path == Int[1, 2]])
+
+    result = LambdaRegression.Mutations.apply(EtaExpandMutation(), tree, site, env, ctx)
+
+    expected = AstTree(AbsNode(:z, AppNode(ConstNode(:h), AbsNode(:x, AppNode(ConstNode(:f), IndexNode(0))))))
+    @test result isa AstTree
+    @test tree == expected
+    @test iscompatible(infer(tree, global_consts_ty), target_ty)
 end
 
 @testitem "Mutations CondAppPullMutation pulls application through COND + preserves type" setup=[MutBaseImports] begin
@@ -1832,7 +3011,34 @@ end
         prune_consts=false,
     )
     @test mutated isa AstTree
+    @test mutated != tree
     inferred = infer(mutated, global_consts_ty)
+    @test iscompatible(inferred, target_ty)
+end
+
+@testitem "Mutations CSEMutation single lift can extract non-application site" setup=[MutBaseImports] begin
+    rng = MersenneTwister(1)
+    local_consts = Dict{Symbol,Any}(:k => 1.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy)
+    tree = AstTree(AbsNode(:x, ConstNode(:k)))
+    target_ty = TyFun(FloatTy, FloatTy)
+
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng,
+        local_consts,
+        local_consts_ty,
+        mutations=[CSEMutation(min_count=1)],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(CSEMutation=>1.0)),
+        provider=IndexedProvider(),
+        max_try=10,
+        prune_consts=false,
+    )
+
+    @test mutated isa AstTree
+    @test mutated != tree
+    inferred = infer(mutated, local_consts_ty)
     @test iscompatible(inferred, target_ty)
 end
 

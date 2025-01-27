@@ -20,6 +20,10 @@ include("typesystem/TypeSystem.jl")
 using .TypeSystem
 export TypeSystem
 
+include("factories/ValueFactories.jl")
+using .ValueFactories
+export ValueFactories
+
 include("generate/CanonicalGeneration.jl")
 using .CanonicalGeneration
 export CanonicalGeneration

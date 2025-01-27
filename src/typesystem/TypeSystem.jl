@@ -18,20 +18,21 @@ The engine therefore stays approachable—think of it as a tutorial-sized HM var
 ## Key Types
 - [`Ty`](@ref): abstract supertype of all internal type representations.
 - [`TyConst`](@ref), [`TyVar`](@ref), [`TyFun`](@ref), [`TyProd`](@ref), [`TySum`](@ref), [`TyList`](@ref), [`TyArray`](@ref), [`TyMu`](@ref): concrete building blocks.
-- [`TyScheme`](@ref): polymorphic type schemes with α-equivalent hashing via `_canonical_body`.
+- [`TyScheme`](@ref): polymorphic type schemes with allocation-free α-equivalent keys.
 - [`TyLike`](@ref): convenience alias `Union{Ty,TyScheme}` used throughout contexts and metadata.
 - [`Counter`](@ref) and [`VarFactory`](@ref): fresh-variable generation utilities (`newtyvar` exposes the shared factory).
 
 ## Fundamental Operations
-- [`prune`](@ref): follows `TyVar` instances to canonical representatives.
-- [`occurs`](@ref) & [`_bind!`](@ref): contractiveness-aware occurs check and binding helper.
-- [`unify!`](@ref): equi-recursive unification with memoisation to avoid infinite folding.
+- [`prune`](@ref): materialises the current public `TyVar` facade.
+- [`isequal_mu`](@ref): compares closed recursive types through finite cyclic graphs.
+- [`unify!`](@ref): performs guarded, transactional graph unification.
 - [`instantiate`](@ref) / [`generalize`](@ref): Hindley-Milner instantiation discipline for schemes and let-polymorphism.
 - [`collect_free_vars`](@ref): helper for rigid-variable tracking.
 - [`infer`](@ref): walks an [`AstTree`](@ref LambdaRegression.ASTs.NodeASTs.AstTree) with environments, optionally recording lower/upper type bounds per node.
 
 ## Primitive Library
 - Predefined constants (see [`BoolTy`](@ref TypeSystem.BoolTy), [`IntTy`](@ref TypeSystem.IntTy), [`FloatTy`](@ref TypeSystem.FloatTy), [`TyList`](@ref), [`TyArray`](@ref), [`TyNat`](@ref)) mirror common data structures without altering inference rules.
+- Boolean values and combinators such as `TRUE`, `FALSE`, and `NOT` are ordinary typed constants; generators may inject them into contexts, but inference gives them no special rule.
 - `get_type` specialisations attach the right [`TyScheme`](@ref) or [`Ty`](@ref) to Julia values such as arithmetic combinators or list helpers.
 - Infix constructors (see [`→`](@ref TypeSystem.:→), [`×`](@ref TypeSystem.:×), [`+`](@ref TypeSystem.:+), [`μ`](@ref TypeSystem.:μ), [`∀`](@ref TypeSystem.:∀)) offer concise syntax when authoring types by hand or within tests.
 
@@ -61,11 +62,13 @@ using ..Utils
 using ..ASTs.Contexts: COND
 using TestItems
 
-export Ty, TyConst, TyVar, TyFun, TyMu, TyProd, TySum, TyList, TyNat, TyArray, TyScheme, TyLike
-export iscompatible, islesseq, infer, UnboundVariableError, OccursCheckError, MismatchError
+export Ty, TyConst, TyVar, TyRigid, TyFun, TyMu, TyProd, TySum, TyList, TyNat, TyArray, TyScheme, TyLike
+export iscompatible, islesseq, isequal_mu, infer, UnboundVariableError, OccursCheckError, MismatchError
 export →, ×, μ, ∀, newtyvar, make_tyvar_factory, get_type_ctx, get_ast_type_ctx, collect_types, get_type, infer_scheme
+export type_constructor_tag, type_static_parameters, type_children, rebuild_type
+export TRUE, FALSE, NOT
 
-public BoolTy, IntTy, FloatTy, COND
+public BoolTy, IntTy, FloatTy, COND, UNCONS_CASE
 
 # ------------------------------------------------------------
 # Basic type data structures (internal)
@@ -83,16 +86,30 @@ end
 """
     TyVar(id, level)
 A type variable created during inference.
-• `id`    - unique identifier (integer)
+• `id`    - factory-local display identifier (integer)
 • `level` - creation level, used for generalisation
 • `instance` - if unified, points to another `Ty` (acts like union-find parent), work as the substitution rule in basic Hindley-Milner type inference.
+
+Variable equality uses an internal immutable identity. It is preserved by
+`deepcopy`, independent of `level`, and distinct across detached factories.
 """
 mutable struct TyVar <: Ty
     id::Int
     level::Int
     instance::Union{Ty, Nothing}
+    uid::UInt
 end
+const _TYVAR_UID_COUNTER = Threads.Atomic{UInt}(0)
+_next_tyvar_uid() = Threads.atomic_add!(_TYVAR_UID_COUNTER, UInt(1)) + UInt(1)
+TyVar(id::Int, level::Int, instance::Union{Ty,Nothing}) =
+    TyVar(id, level, instance, _next_tyvar_uid())
 copy_detached(t::TyVar) = TyVar(t.id, t.level, nothing)
+
+"""A rigid query-local type atom. Rigid atoms compare by `id` and never bind."""
+struct TyRigid <: Ty
+    id::UInt
+end
+TyRigid(id::Integer) = TyRigid(UInt(id))
 
 """
     TyFun(arg, res)
@@ -175,47 +192,29 @@ end
 # Constants in context may be monotype (Ty) or polymorphic TyScheme
 const TyLike = Union{Ty,TyScheme}
 
-Base.hash(t::TyVar, h::UInt) = hash(t.id, hash(t.level, (hash(:TyVar, h))))
+Base.hash(t::TyVar, h::UInt) = hash(t.uid, hash(:TyVar, h))
+Base.hash(t::TyRigid, h::UInt) = hash(t.id, hash(:TyRigid, h))
 Base.hash(t::TyFun, h::UInt) = hash(t.arg, hash(t.res, (hash(:TyFun, h))))
 Base.hash(t::TyProd, h::UInt) = hash(t.left, hash(t.right, (hash(:TyProd, h))))
 Base.hash(t::TySum, h::UInt) = hash(t.left, hash(t.right, (hash(:TySum, h))))
 Base.hash(t::TyMu, h::UInt) = hash(t.var, hash(t.body, (hash(:TyMu, h))))
 Base.hash(t::TyNat, h::UInt) = hash(t.value, hash(:TyNat, h))
 Base.hash(t::TyArray, h::UInt) = hash(t.len, hash(t.elem, hash(:TyArray, h)))
-Base.hash(t::TyScheme, h::UInt) = hash(length(t.vars), hash(_canonical_body(t), hash(:TyScheme, h)))
+Base.hash(t::TyScheme, h::UInt) = hash(_scheme_key(t), hash(:TyScheme, h))
 
-Base.:(==)(t1::TyVar, t2::TyVar) = t1.id == t2.id && t1.level == t2.level
+Base.:(==)(t1::TyVar, t2::TyVar) = t1.uid == t2.uid
+Base.isequal(t1::TyVar, t2::TyVar) = t1.uid == t2.uid
+Base.:(==)(t1::TyRigid, t2::TyRigid) = t1.id == t2.id
+Base.isequal(t1::TyRigid, t2::TyRigid) = t1.id == t2.id
 Base.:(==)(t1::TyFun, t2::TyFun) = t1.arg == t2.arg && t1.res == t2.res
 Base.:(==)(t1::TyProd, t2::TyProd) = t1.left == t2.left && t1.right == t2.right
 Base.:(==)(t1::TySum, t2::TySum) = t1.left == t2.left && t1.right == t2.right
 Base.:(==)(t1::TyMu, t2::TyMu) = t1.var == t2.var && t1.body == t2.body
 Base.:(==)(t1::TyNat, t2::TyNat) = t1.value == t2.value
 Base.:(==)(t1::TyArray, t2::TyArray) = t1.len == t2.len && t1.elem == t2.elem
-Base.:(==)(t1::TyScheme, t2::TyScheme) = length(t1.vars) == length(t2.vars) && _canonical_body(t1) == _canonical_body(t2)
+Base.:(==)(t1::TyScheme, t2::TyScheme) = _scheme_key(t1) == _scheme_key(t2)
 
-# --- Structure-only equality and hashing for TyScheme (α-equivalence, order-independent) ---
-
-# Canonicalise TyScheme body by renaming bound variables to deterministic fresh identifiers
-function _canonical_body(s::TyScheme; factory=nothing)::Ty
-    factory === nothing && (factory = deepcopy(newtyvar))
-    acc = TyVar[]
-    _record_vars!(s.ty, s.vars, acc)
-    canonical_scheme = TyScheme(acc, s.ty)
-    return instantiate(canonical_scheme, 0, factory)
-end
-
-_record_vars!(ty::Ty, boundvars::Vector{TyVar}, record::Vector{TyVar}=TyVar[]) = nothing
-function _record_vars!(ty::TyVar, boundvars::Vector{TyVar}, record::Vector{TyVar}=TyVar[])
-    if ty in boundvars && ty ∉ record
-        push!(record, ty)
-    end
-end
-_record_vars!(ty::TyFun, boundvars::Vector{TyVar}, record::Vector{TyVar}=TyVar[]) = (_record_vars!(ty.arg, boundvars, record); _record_vars!(ty.res, boundvars, record))
-_record_vars!(ty::TyProd, boundvars::Vector{TyVar}, record::Vector{TyVar}=TyVar[]) = (_record_vars!(ty.left, boundvars, record); _record_vars!(ty.right, boundvars, record))
-_record_vars!(ty::TySum, boundvars::Vector{TyVar}, record::Vector{TyVar}=TyVar[]) = (_record_vars!(ty.left, boundvars, record); _record_vars!(ty.right, boundvars, record))
-_record_vars!(ty::TyList, boundvars::Vector{TyVar}, record::Vector{TyVar}=TyVar[]) = _record_vars!(ty.elem, boundvars, record)
-_record_vars!(ty::TyArray, boundvars::Vector{TyVar}, record::Vector{TyVar}=TyVar[]) = (_record_vars!(ty.len, boundvars, record); _record_vars!(ty.elem, boundvars, record))
-_record_vars!(ty::TyMu, boundvars::Vector{TyVar}, record::Vector{TyVar}=TyVar[]) = _record_vars!(ty.body, boundvars, record)
+include("EquirecursiveCore.jl")
 
 # ------------------------------------------------------------
 # Error reporting
@@ -301,62 +300,7 @@ function prune(t::Ty)::Ty
 end
 
 # ------------------------------------------------------------
-# Occurs check (contractiveness only)
-# ------------------------------------------------------------
-# return (occurs::Bool, contractive::Bool)
-"""
-    occurs(var::TyVar, ty::Ty)::Tuple{Bool,Bool}
-
-Detect whether `var` occurs inside `ty` and whether **at least one** such occurrence
-is *contractive* (i.e. appears strictly under a type constructor).  Contractiveness
-is required to safely fold the recursion into a finite `μ`-type.  A naked self
-reference like `μ α . α` would be *non-contractive* and therefore forbidden - it
-would otherwise create an infinite, unproductive cycle.
-"""
-function occurs(var::TyVar, ty::Ty, depth::Int=0)::Tuple{Bool,Bool}
-    ty = prune(ty)
-    if ty isa TyVar
-        if ty === var
-            return (true, depth > 0)   # contractive only if nested (depth ≥ 1)
-        else
-            return (false, false)
-        end
-    elseif ty isa TyConst
-        return (false, false)
-    elseif ty isa TyFun
-        occ1, con1 = occurs(var, ty.arg, depth + 1)
-        occ2, con2 = occurs(var, ty.res, depth + 1)
-        return (occ1 || occ2, con1 || con2)
-    elseif ty isa TyProd
-        occ1, con1 = occurs(var, ty.left, depth + 1)
-        occ2, con2 = occurs(var, ty.right, depth + 1)
-        return (occ1 || occ2, con1 || con2)
-    elseif ty isa TySum
-        occ1, con1 = occurs(var, ty.left, depth + 1)
-        occ2, con2 = occurs(var, ty.right, depth + 1)
-        return (occ1 || occ2, con1 || con2)
-    elseif ty isa TyArray
-        occ1, con1 = occurs(var, ty.len, depth + 1)
-        occ2, con2 = occurs(var, ty.elem, depth + 1)
-        return (occ1 || occ2, con1 || con2)
-    elseif ty isa TyNat
-        return (false, false)
-    elseif ty isa TyMu
-        # Bound var shadows outer one
-        if ty.var === var
-            return (false, false)
-        else
-            return occurs(var, ty.body, depth)
-        end
-    elseif ty isa TyList
-        return occurs(var, ty.elem, depth + 1)
-    else
-        return (false, false)
-    end
-end
-
-# ------------------------------------------------------------
-# Binding TyVar with contractiveness & μ-fold
+# Transactional facade changes
 # ------------------------------------------------------------
 
 """
@@ -367,101 +311,70 @@ Undo-log for transactional unification.
 When passed to [`unify!`](@ref), every `TyVar.instance` mutation is recorded so callers can rollback a failed
 generation/mutation attempt without leaking partial bindings.
 """
-mutable struct TyTrail
-    stack::Vector{Tuple{TyVar,Union{Ty,Nothing}}}
+abstract type _TyTrailEntry end
+
+struct _TyInstanceChange <: _TyTrailEntry
+    var::TyVar
+    old::Union{Ty,Nothing}
 end
-TyTrail() = TyTrail(Tuple{TyVar,Union{Ty,Nothing}}[])
+
+struct _TyLevelChange <: _TyTrailEntry
+    var::TyVar
+    old::Int
+end
+
+mutable struct TyTrail
+    stack::Vector{_TyTrailEntry}
+end
+TyTrail() = TyTrail(_TyTrailEntry[])
 
 mark(trail::TyTrail)::Int = length(trail.stack)
 
 function rollback!(trail::TyTrail, m::Int)
     @assert 0 <= m <= length(trail.stack)
     for i in length(trail.stack):-1:(m + 1)
-        v, old = trail.stack[i]
-        v.instance = old
+        change = trail.stack[i]
+        if change isa _TyInstanceChange
+            change.var.instance = change.old
+        else
+            level_change = change::_TyLevelChange
+            level_change.var.level = level_change.old
+        end
     end
     resize!(trail.stack, m)
     return nothing
 end
 
-function _bind!(var::TyVar, ty::Ty, trail::Union{Nothing,TyTrail}=nothing)
-    occ, contractive = occurs(var, ty, 0)
-    if !occ
-        trail === nothing || push!(trail.stack, (var, var.instance))
-        var.instance = ty
-        return nothing
-    elseif !contractive
-        # Non-contractive self-reference (e.g. α = α) is illegal.
-        return Err(OccursCheckError(var, ty))
-    else
-        # Safe recursive occurrence - fold into μ-type.
-        folded = TyMu(var, ty)
-        trail === nothing || push!(trail.stack, (var, var.instance))
-        var.instance = folded
-        return nothing
-    end
+function _set_instance!(var::TyVar, ty::Ty, trail::TyTrail)
+    push!(trail.stack, _TyInstanceChange(var, var.instance))
+    var.instance = ty
+    return nothing
+end
+
+function _set_level!(var::TyVar, level::Int, trail::TyTrail)
+    var.level == level && return nothing
+    push!(trail.stack, _TyLevelChange(var, var.level))
+    var.level = level
+    return nothing
 end
 
 # ------------------------------------------------------------
-# Unification (equi-recursive, memoised)
+# Finite cyclic unification
 # ------------------------------------------------------------
 """
     unify!(t1::Ty, t2::Ty; trail=nothing) -> Union{Nothing,Err}
 
-Equi-recursive unification. The algorithm first tries to bind a type
-variable appearing in the *first* argument. Only when the first argument
-is not a free `TyVar` does it attempt to bind one from the second
-argument. Calling order therefore determines which side is treated as
-flexible (can be instantiated) and which side is considered rigid.
+Equi-recursive unification over a finite query-local graph. Written `μ`
+binders elaborate to fixed back edges, while unbound `TyVar`s become flexible
+metas. Public `TyVar.instance` and level changes are committed only after the
+whole graph equation succeeds; failures roll back the supplied trail.
 """
 function unify!(t1::Ty, t2::Ty; trail::Union{Nothing,TyTrail}=nothing)
-    seen = Set{Tuple{Ty,Ty}}()
-    return _unify!(t1, t2, seen, trail)
-end
-
-function _unify!(t1::Ty, t2::Ty, seen::Set{Tuple{Ty,Ty}}, trail::Union{Nothing,TyTrail})
-    a = prune(t1)
-    b = prune(t2)
-    if a === b
-        return nothing
-    end
-
-    # Symmetric memoisation: (a,b) and (b,a) considered equivalent
-    if (a, b) in seen || (b, a) in seen
-        return nothing
-    end
-    push!(seen, (a, b))
-
-    if a isa TyVar
-        return _bind!(a, b, trail)
-    elseif b isa TyVar
-        return _bind!(b, a, trail)
-    elseif a isa TyConst && b isa TyConst && a.name == b.name
-        return nothing
-    elseif a isa TyFun && b isa TyFun
-        @✓ _unify!(a.arg, b.arg, seen, trail)
-        @✓ _unify!(a.res, b.res, seen, trail)
-    elseif a isa TyProd && b isa TyProd
-        @✓ _unify!(a.left, b.left, seen, trail)
-        @✓ _unify!(a.right, b.right, seen, trail)
-    elseif a isa TySum && b isa TySum
-        @✓ _unify!(a.left, b.left, seen, trail)
-        @✓ _unify!(a.right, b.right, seen, trail)
-    elseif a isa TyArray && b isa TyArray
-        @✓ _unify!(a.len, b.len, seen, trail)
-        @✓ _unify!(a.elem, b.elem, seen, trail)
-    elseif a isa TyNat && b isa TyNat && a.value == b.value
-        return nothing
-    elseif a isa TyMu
-        @✓ _unify!(a.body, b, seen, trail)
-    elseif b isa TyMu
-        @✓ _unify!(a, b.body, seen, trail)
-    elseif a isa TyList && b isa TyList
-        @✓ _unify!(a.elem, b.elem, seen, trail)
-    else
-        return Err(MismatchError(a, b))
-    end
-    return nothing
+    active_trail = trail === nothing ? TyTrail() : trail
+    transaction = mark(active_trail)
+    result = _unify_graph!(t1, t2, active_trail)
+    result isa Err && rollback!(active_trail, transaction)
+    return result
 end
 
 # ------------------------------------------------------------
@@ -469,33 +382,31 @@ end
 # ------------------------------------------------------------
 function instantiate(s::TyScheme, level::Int, factory=newtyvar)
     # Create substitution only for quantified vars
-    subst = Dict{Int,TyVar}()
+    subst = IdDict{TyVar,Ty}()
     for v in s.vars
-        subst[v.id] = factory(level)
+        subst[v] = factory(level)
     end
-    return _inst(s.ty, v -> get(subst, v.id, v))
+    return _inst(s.ty, v -> get(subst, v, v))
 end
 instantiate(t::Ty, ::Int, factory=newtyvar) = t # for concrete types, do nothing
 
-function _inst(t::Ty, mapvar)
+function _inst(t::Ty, mapvar, binders::IdDict{TyVar,Nothing}=IdDict{TyVar,Nothing}())
     if t isa TyVar
-        return mapvar(t)
-    elseif t isa TyConst
-        return t
-    elseif t isa TyFun
-        return TyFun(_inst(t.arg, mapvar), _inst(t.res, mapvar))
-    elseif t isa TyProd
-        return TyProd(_inst(t.left, mapvar), _inst(t.right, mapvar))
-    elseif t isa TySum
-        return TySum(_inst(t.left, mapvar), _inst(t.right, mapvar))
+        return haskey(binders, t) ? t : mapvar(t)
     elseif t isa TyMu
-        return TyMu(t.var, _inst(t.body, mapvar))
-    elseif t isa TyList
-        return TyList(_inst(t.elem, mapvar))
-    elseif t isa TyArray
-        return TyArray(_inst(t.len, mapvar), _inst(t.elem, mapvar))
-    else
+        had_binder = haskey(binders, t.var)
+        binders[t.var] = nothing
+        body = try
+            _inst(t.body, mapvar, binders)
+        finally
+            had_binder || delete!(binders, t.var)
+        end
+        return TyMu(t.var, body)
+    elseif isempty(type_children(t))
         return t
+    else
+        children = map(child -> _inst(child, mapvar, binders), type_children(t))
+        return rebuild_type(t, children)
     end
 end
 
@@ -558,8 +469,9 @@ as a dictionary key.
 """
 function typekey(t::TyLike)
     if t isa TyScheme
-        # Canonicalise bound vars (α-equivalence) before keying.
-        return typekey(_canonical_body(t))
+        # First-occurrence numbering makes quantified names and order irrelevant
+        # without allocating fresh variables or consulting global state.
+        return _typekey(t.ty)
     else
         return _typekey(t)
     end
@@ -569,11 +481,13 @@ function _typekey(t::Ty)
     # We intentionally do not call `prune` here: we want to control how μ-binders and instances are handled.
     free_ids = IdDict{TyVar,Int}()
     mu_stack = TyVar[]
-    seen = IdDict{Ty,Nothing}() # cycle breaker (should be rare outside μ-types)
-    return _typekey_walk(t, free_ids, mu_stack, seen)
+    active = IdDict{Ty,Nothing}() # recursion-stack cycle breaker
+    return _typekey_walk(t, free_ids, mu_stack, active)
 end
 
-function _typekey_walk(t::Ty, free_ids::IdDict{TyVar,Int}, mu_stack::Vector{TyVar}, seen::IdDict{Ty,Nothing})
+_scheme_key(s::TyScheme) = (length(s.vars), _typekey(s.ty))
+
+function _typekey_walk(t::Ty, free_ids::IdDict{TyVar,Int}, mu_stack::Vector{TyVar}, active::IdDict{Ty,Nothing})
     if t isa TyVar
         v = t::TyVar
         # μ-binder reference has priority over instance-following to avoid loops like v.instance == μv. ...
@@ -585,7 +499,7 @@ function _typekey_walk(t::Ty, free_ids::IdDict{TyVar,Int}, mu_stack::Vector{TyVa
             end
         end
         if v.instance !== nothing
-            return _typekey_walk(v.instance, free_ids, mu_stack, seen)
+            return _typekey_walk(v.instance, free_ids, mu_stack, active)
         end
         idx = get!(free_ids, v) do
             length(free_ids)
@@ -593,40 +507,45 @@ function _typekey_walk(t::Ty, free_ids::IdDict{TyVar,Int}, mu_stack::Vector{TyVa
         return (:v, idx)
     end
 
-    # Cycle breaker (defensive): outside μ-types we do not expect cyclic graphs.
-    if haskey(seen, t)
+    # Cycle breaker (defensive): only the current recursion stack is a cycle.
+    # Shared substructure, such as FloatTy appearing in both an argument and a
+    # result type, must be expanded in both places for cache keys to be sound.
+    if haskey(active, t)
         return (:cycle,)
     end
-    seen[t] = nothing
+    active[t] = nothing
 
+    local key
     if t isa TyConst
-        return (:const, (t::TyConst).name)
+        key = (:const, (t::TyConst).name)
     elseif t isa TyNat
-        return (:nat, (t::TyNat).value)
+        key = (:nat, (t::TyNat).value)
     elseif t isa TyFun
         f = t::TyFun
-        return (:fun, _typekey_walk(f.arg, free_ids, mu_stack, seen), _typekey_walk(f.res, free_ids, mu_stack, seen))
+        key = (:fun, _typekey_walk(f.arg, free_ids, mu_stack, active), _typekey_walk(f.res, free_ids, mu_stack, active))
     elseif t isa TyProd
         p = t::TyProd
-        return (:prod, _typekey_walk(p.left, free_ids, mu_stack, seen), _typekey_walk(p.right, free_ids, mu_stack, seen))
+        key = (:prod, _typekey_walk(p.left, free_ids, mu_stack, active), _typekey_walk(p.right, free_ids, mu_stack, active))
     elseif t isa TySum
         s = t::TySum
-        return (:sum, _typekey_walk(s.left, free_ids, mu_stack, seen), _typekey_walk(s.right, free_ids, mu_stack, seen))
+        key = (:sum, _typekey_walk(s.left, free_ids, mu_stack, active), _typekey_walk(s.right, free_ids, mu_stack, active))
     elseif t isa TyList
         l = t::TyList
-        return (:list, _typekey_walk(l.elem, free_ids, mu_stack, seen))
+        key = (:list, _typekey_walk(l.elem, free_ids, mu_stack, active))
     elseif t isa TyArray
         a = t::TyArray
-        return (:array, _typekey_walk(a.len, free_ids, mu_stack, seen), _typekey_walk(a.elem, free_ids, mu_stack, seen))
+        key = (:array, _typekey_walk(a.len, free_ids, mu_stack, active), _typekey_walk(a.elem, free_ids, mu_stack, active))
     elseif t isa TyMu
         m = t::TyMu
         push!(mu_stack, m.var)
-        body_k = _typekey_walk(m.body, free_ids, mu_stack, seen)
+        body_k = _typekey_walk(m.body, free_ids, mu_stack, active)
         pop!(mu_stack)
-        return (:mu, body_k)
+        key = (:mu, body_k)
     else
-        return (:unknown, Symbol(string(typeof(t))))
+        key = (:unknown, Symbol(string(typeof(t))))
     end
+    delete!(active, t)
+    return key
 end
 
 """
@@ -655,19 +574,33 @@ unmodified). The function succeeds only when unification can be achieved
 by binding *only* the flexible variables.
 """
 function islesseq(subset_ty::TyLike, superset_ty::TyLike)::Bool
-    # Instantiate superset to make its quantified variables flexible (bindable).
-    flex_superset = instantiate(superset_ty, 0)
-    # Instantiate subset. Its free variables must remain rigid (unbound).
-    rigid_subset = instantiate(subset_ty, 0)
-    rigid_vars = collect_free_vars(rigid_subset)
-    # Unify with the flexible side as the first argument to guide binding towards it.
-    success = isnothing(unify!(flex_superset, rigid_subset))
-    success || return false
-    # If any rigid variable was bound, it means the subset was improperly narrowed.
-    for v in rigid_vars
-        v.instance === nothing || return false
+    factory = make_tyvar_factory()
+    # The superset is flexible: its quantified variables may be specialised.
+    flex_superset = superset_ty isa TyScheme ?
+        instantiate(superset_ty, 0, factory) : deepcopy(superset_ty)
+
+    # The subset is rigid during this query. Written μ binders are protected by
+    # `_inst`; only genuinely free/quantified variables become rigid atoms.
+    source = subset_ty isa TyScheme ? subset_ty.ty : deepcopy(subset_ty)
+    quantified = if subset_ty isa TyScheme
+        ids = IdDict{TyVar,Nothing}()
+        foreach(v -> ids[v] = nothing, subset_ty.vars)
+        ids
+    else
+        nothing
     end
-    return true
+    rigid_ids = IdDict{TyVar,TyRigid}()
+    next_rigid = Ref(UInt(0))
+    rigid_subset = _inst(source, var -> begin
+        should_rigidify = quantified === nothing || haskey(quantified, var)
+        should_rigidify || return var
+        get!(rigid_ids, var) do
+            next_rigid[] += UInt(1)
+            TyRigid(next_rigid[])
+        end
+    end)
+
+    return isnothing(unify!(flex_superset, rigid_subset))
 end
 
 function collect_free_vars(t::Ty)::Set{TyVar}
@@ -1005,6 +938,10 @@ const IntOp = IntTy → IntTy → IntTy
 const FloatDiscr = FloatTy → FloatTy → BoolTy
 const FloatOp = FloatTy → FloatTy → FloatTy
 
+const TRUE = true
+const FALSE = false
+NOT(x) = !x
+
 # Sum type basic functions
 INL(x) = x
 INR(x) = x
@@ -1022,6 +959,7 @@ HEAD(xs) = isempty(xs) ? NILERR : xs[1]
 TAIL(xs) = isempty(xs) ? NILERR : xs[2:end]
 LENGTH(xs) = length(xs)
 CASENILERR(f) = g -> (x ->(x isa _NilErr ? g(x) : f(x)))
+UNCONS_CASE(xs) = ok -> fallback -> (isempty(xs) ? fallback : ok(xs[1])(xs[2:end]))
 TOLIST(xs) = collect(xs)
 
 """
@@ -1081,6 +1019,7 @@ get_type(::Float64) = FloatTy
 get_type(::Float32) = FloatTy
 
 get_type(::typeof(COND)) = ∀([_α], BoolTy → _α → _α → _α)
+get_type(::typeof(NOT)) = BoolTy → BoolTy
 
 get_type(::typeof(INL)) = ∀([_α, _β], _α → (_α + _β))
 get_type(::typeof(INR)) = ∀([_α, _β], _β → (_α + _β))
@@ -1097,6 +1036,7 @@ get_type(::typeof(HEAD)) = ∀([_α], TyList(_α) → (_α + NilErr))
 get_type(::typeof(TAIL)) = ∀([_α], TyList(_α) → TyList(_α) + NilErr)
 get_type(::typeof(LENGTH)) = ∀([_α], TyList(_α) → IntTy)
 get_type(::typeof(CASENILERR)) = ∀([_α, _β], (_α → _β) → (NilErr → _β) → (_α + NilErr) → _β)
+get_type(::typeof(UNCONS_CASE)) = ∀([_α, _β], TyList(_α) → (_α → TyList(_α) → _β) → _β → _β)
 get_type(::typeof(TOLIST)) = ∀([_α, _β], TyArray(_α, _β) → TyList(_β))
 
 get_type(::typeof(AMAP)) = ∀([_α, _β, _γ], (_β → _γ) → TyArray(_α, _β) → TyArray(_α, _γ))
@@ -1414,6 +1354,15 @@ end
     @test get_type(TOLIST) isa TypeSystem.TyScheme
 end
 
+@testitem "TypeSystem UNCONS_CASE typing and runtime" setup=[TSBaseImports] begin
+    using Test
+    using LambdaRegression.TypeSystem: FloatTy, TyList, UNCONS_CASE, get_type
+
+    @test get_type(UNCONS_CASE) isa LambdaRegression.TypeSystem.TyScheme
+    @test UNCONS_CASE([1.0, 2.0])(x -> xs -> x)(0.0) == 1.0
+    @test UNCONS_CASE(Float64[])(x -> xs -> x)(0.0) == 0.0
+end
+
 @testitem "TypeSystem Array HO primitives typing" setup=[TSBaseImports] begin
     A = TyArray(TyNat(3), FloatTy)
 
@@ -1608,6 +1557,16 @@ end
     a3, b3 = newtyvar(0), newtyvar(0)
     @test typekey(TyFun(a3, a3)) != typekey(TyFun(a3, b3))
 
+    # Instantiated variables are followed without touching the recursion-stack guard.
+    bound = newtyvar(0)
+    @test isnothing(unify!(bound, FloatTy))
+    @test typekey(bound) == typekey(FloatTy)
+
+    # Shared concrete substructure is not a recursive cycle. This protects
+    # generation caches for targets such as Matrix32 -> Matrix32 vs Matrix32 -> Float.
+    Matrix32 = TyArray(TyNat(3), TyArray(TyNat(2), FloatTy))
+    @test typekey(TyFun(Matrix32, Matrix32)) != typekey(TyFun(Matrix32, FloatTy))
+
     # μ-type key must terminate and be stable.
     v = newtyvar(0)
     @test isnothing(unify!(v, TyFun(v, IntTy)))
@@ -1621,6 +1580,23 @@ end
     a = Dict{Symbol,TyLike}(:x => IntTy, :y => BoolTy)
     b = Dict{Symbol,TyLike}(:y => BoolTy, :x => IntTy)
     @test typectx_fingerprint(a) == typectx_fingerprint(b)
+end
+
+@testitem "boolean primitives expose true false and not" setup=[TSBaseImports] begin
+    using LambdaRegression.TypeSystem: TRUE, FALSE, NOT, BoolTy, get_type, get_type_ctx, →
+
+    @test TRUE === true
+    @test FALSE === false
+    @test NOT(TRUE) === false
+    @test NOT(FALSE) === true
+    @test get_type(TRUE) === BoolTy
+    @test get_type(FALSE) === BoolTy
+    @test get_type(NOT) == (BoolTy → BoolTy)
+
+    ctx = get_type_ctx(Dict{Symbol,Any}(:TRUE => TRUE, :FALSE => FALSE, :NOT => NOT))
+    @test ctx[:TRUE] === BoolTy
+    @test ctx[:FALSE] === BoolTy
+    @test ctx[:NOT] == (BoolTy → BoolTy)
 end
 
 end # module TypeSystem
