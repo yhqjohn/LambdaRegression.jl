@@ -604,7 +604,9 @@ end
 """
     apply_node!(tree::AstTree, func::AbsNode, arg::AstNode)
 
-Apply a function to an argument by performing lambda substitution.
+Apply a function to an argument by performing capture-avoiding lambda
+substitution. References to outer binders are shifted down when the function's
+binder is removed.
 
 # Arguments
 - `tree::AstTree`: The tree containing the function. The argument is not necessarily a part of the tree.
@@ -623,7 +625,8 @@ function apply_node!(tree::AstTree, func::AbsNode, arg::AstNode)
     body_tree = AstTree(deepcopy(func.body))
     varname = func.name
     
-    # Traverse the body and substitute all occurrences of the bound variable
+    # Traverse the body, substitute the removed binder, and rebase references
+    # that crossed it toward outer binders.
     traverse(body_tree, AbstractionDepthState, PointerState) do tree, node, bag
         depth_state = getstate(bag, AbstractionDepthState)
         if ((node isa VarNode) && (node.name == varname)) ||
@@ -633,6 +636,10 @@ function apply_node!(tree::AstTree, func::AbsNode, arg::AstNode)
 
             pointer = getstate(bag, PointerState{AstNode})
             setchild!(tree, pointer.parent, pointer.child_index, arg_tree)
+        elseif (node isa IndexNode) && (node.index > depth_state.depth)
+            pointer = getstate(bag, PointerState{AstNode})
+            rebased = AstTree(IndexNode(node.index - 1))
+            setchild!(tree, pointer.parent, pointer.child_index, rebased)
         end
     end
     return body_tree
@@ -1242,6 +1249,16 @@ end
     result_shift = apply_node!(AstTree(outer_abs_shift), outer_abs_shift, IndexNode(0))
     @test result_shift.root isa AbsNode
     @test result_shift.root.body isa IndexNode && result_shift.root.body.index == 1
+
+    # Removing x also shifts references that cross x toward an outer binder.
+    # (λx. λy. #2) value -> λy. #1
+    outer_capture = AbsNode(:x, AbsNode(:y, IndexNode(2)))
+    result_outer_capture = apply_node!(
+        AstTree(outer_capture),
+        outer_capture,
+        ConstNode(:value),
+    )
+    @test result_outer_capture == AstTree(AbsNode(:y, IndexNode(1)))
 end
 
 end # module NodeASTs

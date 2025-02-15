@@ -1,33 +1,36 @@
 # Canonical Generation
 
-Canonical generation separates finite inhabitation from recursive decoration.
-Its closed fragment is:
+The finite canonical core decides closed targets in:
 
 ```text
 T ::= κ | T → T | List T | Array[n, T]
 ```
 
-For a generalized demand `∀α₁ … αₘ. T`, replace the variables with distinct
-rigid query atoms, solve the closed demand, then discharge them. Rigid atoms
-are not concrete values, flexible variables, or factory sources.
+It uses a finite closed type and length universe. Generalized demands are
+rigidified with fresh query atoms; those atoms may be matched by scoped binders
+or polymorphic schemes, but cannot be supplied as monomorphic values.
 
-`Known(G, T)` is the least fixed point of finite typed rules. Ordinary rules
-include variables, constants, lambda abstraction, `NIL`, closed array sources,
-fixed array constructors, and applications of available scoped function
-binders. `TOLIST` and `AMAP` are anchored: their source array must already be
-known. `CONS`, folds, identity, and conditionals are guarded expansions.
+`Known(G, T)` is saturated from variables, constants, lambda abstraction,
+closed array sources, fixed constructors, and finite applications of available
+scoped function binders. `TOLIST` and `AMAP` require grounded array sources.
+Folds, `CONS`, identity, and conditionals are guarded expansions rather than
+first availability rules.
 
-```text
-Known(G, Array[n,A])                 Known(G, A → B)
---------------------------           ----------------------
-Known(G, List A) [TOLIST]             Known(G, Array[n,B]) [AMAP]
-```
+## Recursive function provider
 
-Every premise and conclusion belongs to the finite universe. A target absent
-from the saturated relation fails finitely. A target present in the relation
-may be sampled through a finite witness, while guarded construction uses an
-explicit finite resource bound.
+`FunctionDef` is a guarded provider attached to the finite core. For target
+function type `F`, it first requires a finite acyclic base witness while
+recursive providers and fixed-point sources are disabled. It then introduces
+one anonymous monomorphic self binder `self : F` and constructs a body of type
+`F` under the typed context.
 
-The generator emits explicit-binder syntax first and lowers binders afterward.
-The decision relation does not promise a unique or shortest witness, and
-guarded expansion cannot turn an ungrounded recursive cycle into availability.
+The base witness prevents recursion from proving its own first availability.
+It does not require the final body to use self, terminate, or be productive.
+The provider emits one definition node rather than unfolding a runtime fixed
+point. Nested definitions share finite node, depth, provider, and nesting
+budgets.
+
+The core rejects impossible targets before guarded construction. Successful
+construction emits explicit-binder syntax and lowers it to De Bruijn indices.
+Typing and generation remain separate from termination: a well-typed recursive
+result may diverge.

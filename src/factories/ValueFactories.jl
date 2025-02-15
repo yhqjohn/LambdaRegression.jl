@@ -47,7 +47,7 @@ module ValueFactories
 
 import Random
 
-using ..TypeSystem: Ty, TyConst, TyList, TyArray, TyNat, TyLike, BoolTy, FloatTy, IntTy, typekey
+using ..TypeSystem: Ty, TyConst, TyList, TyArray, TyNat, TyLike, BoolTy, FloatTy, IntTy, semantic_typekey, typekey
 using TestItems
 
 export AbstractValueFactory
@@ -107,8 +107,8 @@ factory_name(::IntArrayFactory) = :INT_ARRAY
 factory_name(::BoolArrayFactory) = :BOOL_ARRAY
 
 supports(::NilFactory, ty::Ty) = ty isa TyList
-supports(::FloatScalarFactory, ty::Ty) = typekey(ty) == typekey(FloatTy)
-supports(::IntScalarFactory, ty::Ty) = typekey(ty) == typekey(IntTy)
+supports(::FloatScalarFactory, ty::Ty) = semantic_typekey(ty) == semantic_typekey(FloatTy)
+supports(::IntScalarFactory, ty::Ty) = semantic_typekey(ty) == semantic_typekey(IntTy)
 supports(::FloatArrayFactory, ty::Ty) = _array_ends_in(ty, FloatTy)
 supports(::IntArrayFactory, ty::Ty) = _array_ends_in(ty, IntTy)
 supports(::BoolArrayFactory, ty::Ty) = _array_ends_in(ty, BoolTy)
@@ -122,7 +122,7 @@ function _array_ends_in(ty::Ty, elem::TyConst)
         tail.len isa TyNat || return false
         tail = tail.elem
     end
-    return typekey(tail) == typekey(elem)
+    return semantic_typekey(tail) == semantic_typekey(elem)
 end
 
 function provided_types(factory::AbstractValueFactory, universe_types)
@@ -131,7 +131,7 @@ function provided_types(factory::AbstractValueFactory, universe_types)
     for ty in universe_types
         ty isa Ty || continue
         supports(factory, ty) || continue
-        key = typekey(ty)
+        key = semantic_typekey(ty)
         key in seen && continue
         push!(seen, key)
         push!(out, ty)
@@ -145,7 +145,7 @@ function provided_types(factories, universe_types)
     for factory in factories
         factory isa AbstractValueFactory || continue
         for ty in provided_types(factory, universe_types)
-            key = typekey(ty)
+            key = semantic_typekey(ty)
             key in seen && continue
             push!(seen, key)
             push!(out, ty)

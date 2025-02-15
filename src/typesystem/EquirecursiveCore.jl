@@ -16,6 +16,17 @@ type_static_parameters(::Ty)::Tuple = ()
 type_children(::Ty)::Tuple = ()
 
 """
+    type_node_identity(t::Ty) -> Any
+
+Optionally return a cheap, stable identity key for an immutable extension node
+that may be shared across non-sibling DAG positions. The key must uniquely
+identify that node during a query and remain unchanged for the node's lifetime.
+Mutable nodes use physical identity; ordinary immutable trees may keep the
+default `nothing`.
+"""
+type_node_identity(::Ty) = nothing
+
+"""
     rebuild_type(prototype::Ty, children::Tuple) -> Ty
 
 Rebuild one constructor node from semantic children. Extensions implementing a
@@ -58,6 +69,10 @@ type_constructor_tag(::TyArray) = :Array
 type_children(t::TyArray) = (t.len, t.elem)
 rebuild_type(::TyArray, children::Tuple{Ty,Ty}) = TyArray(children...)
 
+type_constructor_tag(::TyMu) = :Mu
+type_children(t::TyMu) = (t.body,)
+rebuild_type(t::TyMu, children::Tuple{Ty}) = TyMu(t.var, children[1])
+
 mutable struct _MuEqNode
     tag::Symbol
     parameters::Tuple
@@ -72,13 +87,57 @@ struct _MuEqGraph
     root::Int
 end
 
-mutable struct _MuEqBuilder
-    nodes::Vector{_MuEqNode}
-    binders::IdDict{TyVar,Int}
-    resolving::IdDict{TyVar,Nothing}
+const _CONSTRUCTOR_MEMO_THRESHOLD = 64
+
+mutable struct _ConstructorMemo
+    mutable_entries::IdDict{Ty,Tuple{Int,Int}}
+    keyed_entries::Dict{Tuple{DataType,Any},Tuple{Int,Int}}
 end
 
-_MuEqBuilder() = _MuEqBuilder(_MuEqNode[], IdDict{TyVar,Int}(), IdDict{TyVar,Nothing}())
+_ConstructorMemo() = _ConstructorMemo(
+    IdDict{Ty,Tuple{Int,Int}}(),
+    Dict{Tuple{DataType,Any},Tuple{Int,Int}}(),
+)
+
+mutable struct _MuEqBuilder
+    nodes::Vector{_MuEqNode}
+    binders::Dict{TyVar,Int}
+    resolving::Dict{TyVar,Nothing}
+    constructors::Union{Nothing,_ConstructorMemo}
+    scope::Int
+    next_scope::Int
+end
+
+_MuEqBuilder() = _MuEqBuilder(
+    _MuEqNode[],
+    Dict{TyVar,Int}(),
+    Dict{TyVar,Nothing}(),
+    nothing,
+    0,
+    0,
+)
+
+@inline function _constructor_node(index::_ConstructorMemo, ty::Ty, scope::Int)
+    if Base.ismutabletype(typeof(ty))
+        entry = get(index.mutable_entries, ty, nothing)
+        entry !== nothing && entry[1] == scope && return entry[2]
+        return 0
+    end
+    identity = type_node_identity(ty)
+    identity === nothing && return 0
+    entry = get(index.keyed_entries, (typeof(ty), identity), nothing)
+    return entry !== nothing && entry[1] == scope ? entry[2] : 0
+end
+
+@inline function _remember_constructor_node!(index::_ConstructorMemo, ty::Ty, scope::Int, root::Int)
+    if Base.ismutabletype(typeof(ty))
+        index.mutable_entries[ty] = (scope, root)
+    else
+        identity = type_node_identity(ty)
+        identity === nothing || (index.keyed_entries[(typeof(ty), identity)] = (scope, root))
+    end
+    return root
+end
 
 function _new_mu_eq_node!(builder::_MuEqBuilder, node::_MuEqNode=_MuEqNode())::Int
     push!(builder.nodes, node)
@@ -88,10 +147,14 @@ end
 function _with_mu_binder(f, builder::_MuEqBuilder, binder::TyVar, root::Int)
     had_old = haskey(builder.binders, binder)
     old = had_old ? builder.binders[binder] : 0
+    old_scope = builder.scope
+    builder.next_scope += 1
+    builder.scope = builder.next_scope
     builder.binders[binder] = root
     try
         return f()
     finally
+        builder.scope = old_scope
         if had_old
             builder.binders[binder] = old
         else
@@ -101,7 +164,16 @@ function _with_mu_binder(f, builder::_MuEqBuilder, binder::TyVar, root::Int)
 end
 
 function _elaborate_mu!(builder::_MuEqBuilder, mu::TyMu)::Int
+    scope = builder.scope
+    index = builder.constructors
+    if index === nothing && length(builder.nodes) >= _CONSTRUCTOR_MEMO_THRESHOLD
+        index = _ConstructorMemo()
+        builder.constructors = index
+    end
+    known = index === nothing ? 0 : _constructor_node(index, mu, scope)
+    known != 0 && return known
     root = _new_mu_eq_node!(builder)
+    index === nothing || _remember_constructor_node!(index, mu, scope, root)
     body_root = _with_mu_binder(builder, mu.var, root) do
         _elaborate_mu_eq!(builder, mu.body)
     end
@@ -134,10 +206,31 @@ function _elaborate_mu_eq!(builder::_MuEqBuilder, ty::Ty)::Int
 
     tag = type_constructor_tag(ty)
     parameters = type_static_parameters(ty)
+    scope = builder.scope
+    index = builder.constructors
+    if index === nothing && length(builder.nodes) >= _CONSTRUCTOR_MEMO_THRESHOLD
+        index = _ConstructorMemo()
+        builder.constructors = index
+    end
+    known = index === nothing ? 0 : _constructor_node(index, ty, scope)
+    known != 0 && return known
     root = _new_mu_eq_node!(builder, _MuEqNode(tag, parameters, Int[], true))
-    for child in type_children(ty)
+    index === nothing || _remember_constructor_node!(index, ty, scope, root)
+    children = type_children(ty)
+    for i in eachindex(children)
+        child = children[i]
         child isa Ty || throw(ArgumentError("type-constructor children must be Ty values"))
-        push!(builder.nodes[root].children, _elaborate_mu_eq!(builder, child))
+        duplicate = 0
+        for j in 1:(i - 1)
+            if children[j] === child
+                duplicate = builder.nodes[root].children[j]
+                break
+            end
+        end
+        push!(
+            builder.nodes[root].children,
+            duplicate == 0 ? _elaborate_mu_eq!(builder, child) : duplicate,
+        )
     end
     return root
 end
@@ -183,6 +276,72 @@ function isequal_mu(a::Ty, b::Ty)::Bool
     return true
 end
 
+function _mu_bisimulation_classes(graph::_MuEqGraph)::Vector{Int}
+    count = length(graph.nodes)
+    classes = zeros(Int, count)
+    initial = Dict{Any,Int}()
+    for node_id in 1:count
+        node = graph.nodes[node_id]
+        signature = (node.tag, node.parameters, length(node.children))
+        classes[node_id] = get!(initial, signature) do
+            length(initial) + 1
+        end
+    end
+
+    while true
+        refined = zeros(Int, count)
+        signatures = Dict{Any,Int}()
+        for node_id in 1:count
+            node = graph.nodes[node_id]
+            child_classes = tuple((classes[child] for child in node.children)...)
+            signature = (node.tag, node.parameters, child_classes)
+            refined[node_id] = get!(signatures, signature) do
+                length(signatures) + 1
+            end
+        end
+        refined == classes && return classes
+        classes = refined
+    end
+end
+
+function _semantic_mu_graph_key(graph::_MuEqGraph)
+    classes = _mu_bisimulation_classes(graph)
+    representatives = Dict{Int,Int}()
+    for node_id in eachindex(graph.nodes)
+        get!(representatives, classes[node_id], node_id)
+    end
+
+    root_class = classes[graph.root]
+    canonical_ids = Dict{Int,Int}(root_class => 0)
+    queue = Int[root_class]
+    records = Any[]
+    cursor = 1
+    while cursor <= length(queue)
+        class = queue[cursor]
+        cursor += 1
+        node = graph.nodes[representatives[class]]
+        child_classes = Int[classes[child] for child in node.children]
+        for child_class in child_classes
+            if !haskey(canonical_ids, child_class)
+                canonical_ids[child_class] = length(canonical_ids)
+                push!(queue, child_class)
+            end
+        end
+        child_ids = tuple((canonical_ids[child] for child in child_classes)...)
+        push!(records, (node.tag, node.parameters, child_ids))
+    end
+    return (:equirecursive, tuple(records...))
+end
+
+"""
+    semantic_typekey(t::Ty) -> Any
+
+Return a canonical key for a closed type modulo equirecursive equality. Unlike
+[`typekey`](@ref), this key identifies finite unfoldings and different written
+periods of the same contractive `μ` type. Open inference metas are rejected.
+"""
+semantic_typekey(t::Ty) = _semantic_mu_graph_key(_mu_eq_graph(t))
+
 # Query-local graph used by unification. Written μ binders elaborate to fixed
 # constructor back edges; only `_GRAPH_META` nodes may acquire links.
 const _GRAPH_META = UInt8(1)
@@ -215,22 +374,28 @@ end
 
 mutable struct _TypeGraph
     nodes::Vector{_TypeGraphNode}
-    variables::IdDict{TyVar,Int}
-    binders::IdDict{TyVar,Int}
-    binder_used::IdDict{TyVar,Bool}
-    resolving::IdDict{TyVar,Nothing}
+    variables::Dict{TyVar,Int}
+    binders::Dict{TyVar,Int}
+    binder_used::Dict{TyVar,Bool}
+    resolving::Dict{TyVar,Nothing}
     rigids::Dict{UInt,Int}
     preferred_binders::Dict{Int,TyVar}
+    constructors::Union{Nothing,_ConstructorMemo}
+    scope::Int
+    next_scope::Int
 end
 
 _TypeGraph() = _TypeGraph(
     _TypeGraphNode[],
-    IdDict{TyVar,Int}(),
-    IdDict{TyVar,Int}(),
-    IdDict{TyVar,Bool}(),
-    IdDict{TyVar,Nothing}(),
+    Dict{TyVar,Int}(),
+    Dict{TyVar,Int}(),
+    Dict{TyVar,Bool}(),
+    Dict{TyVar,Nothing}(),
     Dict{UInt,Int}(),
     Dict{Int,TyVar}(),
+    nothing,
+    0,
+    0,
 )
 
 function _push_graph_node!(graph::_TypeGraph, node::_TypeGraphNode)::Int
@@ -256,6 +421,9 @@ function _elaborate_graph_var!(graph::_TypeGraph, var::TyVar)::Int
 
     haskey(graph.resolving, var) &&
         throw(_TypeElaborationError("constructor-free type-variable link cycle"))
+    if var.instance isa TyVar && haskey(graph.resolving, var.instance)
+        throw(_TypeElaborationError("constructor-free type-variable link cycle"))
+    end
     graph.resolving[var] = nothing
     try
         node = _elaborate_graph!(graph, var.instance)
@@ -267,11 +435,23 @@ function _elaborate_graph_var!(graph::_TypeGraph, var::TyVar)::Int
 end
 
 function _elaborate_graph_mu!(graph::_TypeGraph, mu::TyMu)::Int
+    scope = graph.scope
+    index = graph.constructors
+    if index === nothing && length(graph.nodes) >= _CONSTRUCTOR_MEMO_THRESHOLD
+        index = _ConstructorMemo()
+        graph.constructors = index
+    end
+    known = index === nothing ? 0 : _constructor_node(index, mu, scope)
+    known != 0 && return known
     root = _push_graph_node!(graph, _placeholder_node())
+    index === nothing || _remember_constructor_node!(index, mu, scope, root)
     had_binder = haskey(graph.binders, mu.var)
     old_binder = had_binder ? graph.binders[mu.var] : 0
     had_used = haskey(graph.binder_used, mu.var)
     old_used = had_used ? graph.binder_used[mu.var] : false
+    old_scope = graph.scope
+    graph.next_scope += 1
+    graph.scope = graph.next_scope
     graph.binders[mu.var] = root
     graph.binder_used[mu.var] = false
 
@@ -281,6 +461,7 @@ function _elaborate_graph_mu!(graph::_TypeGraph, mu::TyMu)::Int
         body_root = _elaborate_graph!(graph, mu.body)
         used = graph.binder_used[mu.var]
     finally
+        graph.scope = old_scope
         if had_binder
             graph.binders[mu.var] = old_binder
         else
@@ -323,10 +504,31 @@ function _elaborate_graph!(graph::_TypeGraph, ty::Ty)::Int
         end
     end
 
+    scope = graph.scope
+    index = graph.constructors
+    if index === nothing && length(graph.nodes) >= _CONSTRUCTOR_MEMO_THRESHOLD
+        index = _ConstructorMemo()
+        graph.constructors = index
+    end
+    known = index === nothing ? 0 : _constructor_node(index, ty, scope)
+    known != 0 && return known
     root = _push_graph_node!(graph, _con_node(ty))
-    for child in type_children(ty)
+    index === nothing || _remember_constructor_node!(index, ty, scope, root)
+    children = type_children(ty)
+    for i in eachindex(children)
+        child = children[i]
         child isa Ty || throw(ArgumentError("type-constructor children must be Ty values"))
-        push!(graph.nodes[root].children, _elaborate_graph!(graph, child))
+        duplicate = 0
+        for j in 1:(i - 1)
+            if children[j] === child
+                duplicate = graph.nodes[root].children[j]
+                break
+            end
+        end
+        push!(
+            graph.nodes[root].children,
+            duplicate == 0 ? _elaborate_graph!(graph, child) : duplicate,
+        )
     end
     return root
 end
@@ -426,19 +628,13 @@ function _unify_graph_nodes!(graph::_TypeGraph, left::Int, right::Int)::Bool
 end
 
 mutable struct _MaterializeState
-    active_meta::Dict{Int,TyVar}
-    active_con::Dict{Int,TyVar}
-    recursive_meta::Set{Int}
-    recursive_con::Set{Int}
-    cache::Dict{Int,Ty}
+    active_meta::Dict{Int,Tuple{TyVar,Base.RefValue{Bool}}}
+    active_con::Dict{Int,Tuple{TyVar,Base.RefValue{Bool}}}
 end
 
 _MaterializeState() = _MaterializeState(
-    Dict{Int,TyVar}(),
-    Dict{Int,TyVar}(),
-    Set{Int}(),
-    Set{Int}(),
-    Dict{Int,Ty}(),
+    Dict{Int,Tuple{TyVar,Base.RefValue{Bool}}}(),
+    Dict{Int,Tuple{TyVar,Base.RefValue{Bool}}}(),
 )
 
 function _materialize_graph!(graph::_TypeGraph, node_id::Int, state::_MaterializeState)::Ty
@@ -446,51 +642,60 @@ function _materialize_graph!(graph::_TypeGraph, node_id::Int, state::_Materializ
     if node.kind == _GRAPH_META
         node.link == 0 && return node.origin::TyVar
         if haskey(state.active_meta, node_id)
-            push!(state.recursive_meta, node_id)
-            return state.active_meta[node_id]
+            binder, recursive = state.active_meta[node_id]
+            recursive[] = true
+            return binder
         end
-        haskey(state.cache, node_id) && return state.cache[node_id]
 
-        binder = node.origin::TyVar
-        state.active_meta[node_id] = binder
+        # A syntax binder is rigid and must never reuse the flexible facade meta
+        # whose solution is being committed.
+        binder = TyVar(-(node.origin::TyVar).id, node.level, nothing)
+        recursive = Ref(false)
+        state.active_meta[node_id] = (binder, recursive)
         body = _materialize_graph!(graph, node.link, state)
         delete!(state.active_meta, node_id)
-        result = node_id in state.recursive_meta ? TyMu(binder, body) : body
-        state.cache[node_id] = result
-        return result
+        return recursive[] ? TyMu(binder, body) : body
     elseif node.kind == _GRAPH_RIGID
         return node.prototype::TyRigid
     end
 
     if haskey(state.active_con, node_id)
-        push!(state.recursive_con, node_id)
-        return state.active_con[node_id]
+        binder, recursive = state.active_con[node_id]
+        recursive[] = true
+        return binder
     end
-    haskey(state.cache, node_id) && return state.cache[node_id]
 
-    binder = get(graph.preferred_binders, node_id, nothing)
-    binder === nothing && (binder = TyVar(-node_id, 0, nothing))
-    state.active_con[node_id] = binder
+    preferred = get(graph.preferred_binders, node_id, nothing)
+    binder = preferred === nothing ?
+        TyVar(-node_id, 0, nothing) :
+        TyVar(preferred.id, preferred.level, nothing)
+    recursive = Ref(false)
+    state.active_con[node_id] = (binder, recursive)
     children = Ty[_materialize_graph!(graph, child, state) for child in node.children]
     delete!(state.active_con, node_id)
     body = rebuild_type(node.prototype::Ty, tuple(children...))
-    result = node_id in state.recursive_con ? TyMu(binder, body) : body
-    state.cache[node_id] = result
-    return result
+    return recursive[] ? TyMu(binder, body) : body
 end
 
 function _commit_graph!(graph::_TypeGraph, trail)
-    for node in graph.nodes
-        node.kind == _GRAPH_META || continue
-        origin = node.origin::TyVar
-        origin.level != node.level && _set_level!(origin, node.level, trail)
-    end
+    # Materialisation is extension-defined and may throw. Build the complete
+    # change set before touching the public facade so such an exception cannot
+    # leak a prefix of successful links or level lowering.
+    bindings = Tuple{TyVar,Ty}[]
     for (node_id, node) in pairs(graph.nodes)
         node.kind == _GRAPH_META || continue
         node.link == 0 && continue
-        origin = node.origin::TyVar
-        origin.instance === nothing || continue
         value = _materialize_graph!(graph, node_id, _MaterializeState())
+        origin = node.origin::TyVar
+        origin.instance === nothing && push!(bindings, (origin, value))
+    end
+
+    for node in graph.nodes
+        node.kind == _GRAPH_META || continue
+        origin = node.origin::TyVar
+        origin.level > node.level && _set_level!(origin, node.level, trail)
+    end
+    for (origin, value) in bindings
         _set_instance!(origin, value, trail)
     end
     return nothing

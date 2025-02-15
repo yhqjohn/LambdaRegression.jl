@@ -17,7 +17,10 @@ Design goals
   whose types are visible to individuals.
 
 Status
-- `fit!` implements a minimal typed population loop with injected `evaluate` and `loss`.
+- `fit!` implements a typed population loop with injected `evaluate` and `loss`.
+- `default_components` supplies bounded procedural initialization, native
+  FunctionDef evaluation, procedural mutations, and automatic core/procedural
+  crossover dispatch.
 - For diagnostics, `fit!` supports `callback(state)` and an optional `components.init_population(...)` hook.
 - Thread-safe primitives for SR paths live in `ASTs.Contexts.EvalContext` and
   `TypeSystem.make_tyvar_factory`.
@@ -35,6 +38,9 @@ using ..TypeSystem: Ty, TyLike, make_tyvar_factory, get_type_ctx
 using ..ASTs.Contexts: EvalContext, ConstSymbolFactory, new_constant!
 using ..ASTs.NodeASTs: AstTree, AstNode, AppNode, AbsNode, ConstNode, IndexNode, SymbolGenerator
 using ..Reduces: beta_reduce!
+using ..Procedural
+using ..ProceduralMutations
+using ..CanonicalGeneration
 using ..Mutations
 using ..Mutations: Populations
 using ..Mutations.Populations: Individual
@@ -161,6 +167,15 @@ function _node_count(tree::AstTree)::Int
         c += 1
     end
     return c
+end
+
+_contains_procedural(tree::AstTree) = any(
+    node -> node isa Procedural.ScopeNode || node isa Procedural.FunctionDefNode,
+    tree,
+)
+
+function _default_mutation_driver(tree::AstTree, target_ty::Ty; kwargs...)
+    return ProceduralMutations.mutate_procedural(tree, target_ty; kwargs...)
 end
 
 function _apply_inputs(program::AstTree, input_slots::Vector{Symbol})::AstTree
@@ -297,6 +312,8 @@ end
 
 Default evaluation strategy:
 - inject input values into an `EvalContext` overlay under `components.input_slots`,
+- run trees containing `ScopeNode` or `FunctionDefNode` through the native prepared
+  procedural evaluator with one shared budget,
 - evaluate `(program x1 x2 ...)` by beta-reducing for `config.max_reduce_steps` steps,
 - require a `ConstNode` result whose value is in the evaluation context.
 """
@@ -322,6 +339,33 @@ function evaluate_default(ind::Individual, x, components::NamedTuple, config::Na
         globals=components.global_consts,
         symfactory=components.const_symfactory_ctor(),
     )
+
+    if _contains_procedural(ind.tree)
+        arguments = length(input_slots) == 1 ? (x,) : x
+        steps = get(
+            config,
+            :procedural_max_steps,
+            max(256, 4 * get(config, :max_reduce_steps, 64)),
+        )
+        result = Procedural.run_procedural(
+            Procedural.prepare_procedural(ind.tree; copy_tree=false),
+            ctx;
+            args=arguments,
+            max_steps=steps,
+        )
+        if result isa Err
+            issue = result.value
+            issue isa Procedural.ProceduralStepLimitError &&
+                return Err(MaxReduceStepsErr(steps))
+            issue isa Procedural.ProceduralEvaluationCycleError &&
+                return Err(MaxReduceStepsErr(steps))
+            issue isa Procedural.ProceduralMissingConstantError &&
+                return Err(MissingConstValueErr(issue.name))
+            issue isa Procedural.ProceduralEvaluationError &&
+                return Err(NonConstOutputErr())
+        end
+        return result
+    end
 
     tree = _apply_inputs(ind.tree, input_slots)
     steps = get(config, :max_reduce_steps, 64)
@@ -390,20 +434,22 @@ end
 """
     default_config(; kwargs...) -> NamedTuple
 
-Load a default configuration. This function makes strong assumptions and is
-intended only as a convenience.
+Load a bounded active-development startup configuration. This function makes
+strong assumptions and is intended for quick integrated runs, not as a stable
+stable general-purpose configuration.
 """
 function default_config(;
-    population_size::Int=200,
-    generations::Int=50,
+    population_size::Int=64,
+    generations::Int=20,
     error_threshold::Float64=1e-6,
     max_reduce_steps::Int=64,
+    procedural_max_steps::Int=max(256, 4 * max_reduce_steps),
     closure_max_reduce_steps::Int=max_reduce_steps,
     closure_lift_max_per_pass::Int=64,
-    mutation_rate::Float64=0.7,
-    crossover_rate::Float64=0.2,
-    elitism::Int=1,
-    tournament_size::Int=7,
+    mutation_rate::Float64=0.65,
+    crossover_rate::Float64=0.5,
+    elitism::Int=2,
+    tournament_size::Int=3,
     error_penalty::Float64=1e12,
     repro=(;
         require_change=true,
@@ -429,6 +475,7 @@ function default_config(;
         generations,
         error_threshold,
         max_reduce_steps,
+        procedural_max_steps,
         closure_max_reduce_steps,
         closure_lift_max_per_pass,
         mutation_rate,
@@ -447,7 +494,8 @@ end
 """
     default_components(; kwargs...) -> NamedTuple
 
-Load default component wiring for regression.
+Load default component wiring for regression, including self-contained typed
+population initialization and procedural first-class dispatch.
 
 This is a **loader only**: it does not run any business logic. The returned
 components are designed to be easy to override via `merge`.
@@ -467,15 +515,65 @@ function default_components(;
         Mutations.CSEMutation(),
         Mutations.BetaReduceMutation(),
         Mutations.EtaReduceMutation(),
+        Mutations.LetHoistMutation(),
+        Mutations.LetSinkMutation(),
+        Mutations.LetPruneMutation(),
+        Mutations.SourceBindingInsertionMutation(),
+        Mutations.SubtreeReplacementMutation(;
+            replacement_generator=Mutations.ScopedReplacementGenerator(
+                Procedural.generate_procedural_scoped;
+                include_local_consts=true,
+            ),
+            generation_kwargs=(;
+                weights=CanonicalGeneration.GenerationWeights(
+                    default=1,
+                    function_def=0.1,
+                ),
+                sampling_depth_limit=3,
+                sampling_node_budget=48,
+                guarded_expansion_depth=1,
+            ),
+        ),
+        ProceduralMutations.FunctionDefMutation(:finite_body),
+        ProceduralMutations.FunctionDefMutation(:recursive_body),
+        ProceduralMutations.FunctionDefMutation(:remove),
     ],
     mutation_chooser::Mutations.AbstractPairChooser=Mutations.WeightedPairChooser(),
     mutation_provider::Mutations.AbstractSiteProvider=Mutations.IndexedProvider(),
     mutation_max_try::Int=25,
     mutation_prune_consts::Bool=true,
-    crossover_op=Populations.TypedSubtreeSwapCrossover(),
+    crossover_op=ProceduralMutations.AutoTypedCrossover(),
+    mutation_driver=_default_mutation_driver,
+    functiondef_provider=Procedural.FunctionDefProvider(),
+    generation_config_factory=rng -> CanonicalGeneration.GenerationConfig(;
+        rng,
+        weights=CanonicalGeneration.GenerationWeights(
+            default=1,
+            function_def=0.1,
+        ),
+        sampling_depth_limit=8,
+        sampling_node_budget=96,
+        guarded_expansion_depth=1,
+    ),
+    force_lambda_root_probability::Float64=0.75,
+    init_candidates_per_individual::Int=2,
+    init_target_nodes::Tuple{Vararg{Int}}=(3, 5, 8, 12),
+    init_max_try::Int=8,
+    init_population=nothing,
+    make_immigrant=nothing,
     kwargs...
 )
     global_consts_ty === nothing && (global_consts_ty = get_type_ctx(global_consts))
+    init_max_try >= 1 || throw(ArgumentError("init_max_try must be positive"))
+    init_candidates_per_individual >= 1 || throw(ArgumentError(
+        "init_candidates_per_individual must be positive",
+    ))
+    !isempty(init_target_nodes) && all(>(0), init_target_nodes) || throw(ArgumentError(
+        "init_target_nodes must contain positive sizes",
+    ))
+    0 <= force_lambda_root_probability <= 1 || throw(ArgumentError(
+        "force_lambda_root_probability must be in [0, 1]",
+    ))
 
     # Thread-safe evaluation context constructor:
     # writes go to `overlay` only; `globals` is assumed read-only.
@@ -485,6 +583,123 @@ function default_components(;
         globals::Dict{Symbol,Any}=global_consts,
         symfactory::ConstSymbolFactory=const_symfactory_ctor(),
     ) -> EvalContext(overlay=overlay, locals=locals, globals=globals, symfactory=symfactory)
+
+    function generate_lambda_root(target_ty::Ty, rng, config)
+        argument_types = Ty[]
+        result_type = TypeSystem.prune(target_ty)
+        while result_type isa TyFun
+            push!(argument_types, result_type.arg)
+            result_type = TypeSystem.prune(result_type.res)
+        end
+        isempty(argument_types) && return nothing
+        result = Procedural.generate_procedural_scoped(
+            result_type;
+            scope_tys=reverse(argument_types),
+            global_consts,
+            global_consts_ty,
+            functiondef_provider,
+            config,
+        )
+        result isa Err && return result
+        root = result.tree.root
+        for index in Iterators.reverse(eachindex(argument_types))
+            root = AbsNode(Symbol("x", index), root)
+        end
+        result.metadata[:forced_lambda_root] = true
+        return CanonicalGeneration.GenerationResult(
+            AstTree(root),
+            target_ty,
+            result.local_consts,
+            result.local_const_types,
+            result.metadata,
+        )
+    end
+
+    function generate_individual(target_ty, seed::UInt64, slot::Int, attempt_offset::Int=0)
+        last_error = nothing
+        candidates = CanonicalGeneration.GenerationResult[]
+        for attempt in 1:init_max_try
+            rng = derive_rng(
+                seed,
+                0,
+                (slot << 8) + attempt_offset + attempt,
+                :init_tree,
+            )
+            config = generation_config_factory(rng)
+            config isa CanonicalGeneration.GenerationConfig || throw(ArgumentError(
+                "generation_config_factory must return GenerationConfig",
+            ))
+            result = if TypeSystem.prune(target_ty) isa TypeSystem.TyFun &&
+                        rand(rng) < force_lambda_root_probability
+                generate_lambda_root(target_ty, rng, config)
+            else
+                Procedural.generate_procedural(
+                    target_ty;
+                    global_consts,
+                    global_consts_ty,
+                    functiondef_provider,
+                    config,
+                )
+            end
+            if result isa Err
+                last_error = result
+                continue
+            end
+            result isa CanonicalGeneration.GenerationResult || throw(ArgumentError(
+                "procedural generator must return GenerationResult or Err",
+            ))
+            push!(candidates, result)
+            length(candidates) >= init_candidates_per_individual && break
+        end
+        isempty(candidates) && return last_error === nothing ?
+            Err(Mutations.MaxTryReachedErr()) : last_error
+        target_nodes = init_target_nodes[mod1(slot, length(init_target_nodes))]
+        candidate_sizes = _node_count.(getfield.(candidates, :tree))
+        selected_index = argmin([
+            (abs(size - target_nodes), -size)
+            for size in candidate_sizes
+        ])
+        result = candidates[selected_index]
+        result.metadata[:init_target_nodes] = target_nodes
+        result.metadata[:init_candidate_count] = length(candidates)
+        return Individual(
+            result.tree,
+            target_ty;
+            local_consts=result.local_consts,
+            local_consts_ty=result.local_const_types,
+            meta=(generation=result.metadata,),
+        )
+    end
+
+    default_init_population = function (reg, data; N, seed, global_type_ctx)
+        population = Vector{Individual}(undef, N)
+        for slot in 1:N
+            generated = generate_individual(reg.target_ty, UInt64(seed), slot)
+            generated isa Err && return generated
+            population[slot] = generated
+        end
+        return population
+    end
+
+    default_make_immigrant = function (
+        reg,
+        data;
+        seed,
+        global_type_ctx,
+        slot,
+        attempt,
+        recorder=nothing,
+    )
+        return generate_individual(
+            reg.target_ty,
+            UInt64(seed),
+            slot,
+            attempt << 16,
+        )
+    end
+
+    init_population === nothing && (init_population = default_init_population)
+    make_immigrant === nothing && (make_immigrant = default_make_immigrant)
 
     base = (;
         global_consts,
@@ -500,6 +715,15 @@ function default_components(;
         mutation_max_try,
         mutation_prune_consts,
         crossover_op,
+        mutation_driver,
+        functiondef_provider,
+        generation_config_factory,
+        force_lambda_root_probability,
+        init_candidates_per_individual,
+        init_target_nodes,
+        init_max_try,
+        init_population,
+        make_immigrant,
     )
     return merge(base, (;kwargs...))
 end
@@ -835,7 +1059,12 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
                         const_symfactory = components.const_symfactory_ctor()
                         local_consts = copy(child.local_consts)
                         local_consts_ty = copy(child.local_consts_ty)
-                        mutated = Mutations.mutate_tree(
+                        mutation_driver = get(
+                            components,
+                            :mutation_driver,
+                            Mutations.mutate_tree,
+                        )
+                        mutated = mutation_driver(
                             child.tree,
                             reg.target_ty;
                             rng=rng_mut,
@@ -965,6 +1194,23 @@ end
     @test f(0).id == 1
     sf = c.const_symfactory_ctor()
     @test sf isa ConstSymbolFactory
+    @test any(m -> m isa Mutations.LetHoistMutation, c.mutations)
+    @test any(m -> m isa Mutations.LetSinkMutation, c.mutations)
+    @test any(m -> m isa Mutations.LetPruneMutation, c.mutations)
+    @test !any(
+        m -> m isa Mutations.LetHoistMutation && m.max_bindings > 1,
+        c.mutations,
+    )
+    @test count(
+        m -> m isa LambdaRegression.ProceduralMutations.FunctionDefMutation,
+        c.mutations,
+    ) == 3
+    @test c.crossover_op isa LambdaRegression.ProceduralMutations.AutoTypedCrossover
+    cfg = default_config()
+    @test cfg.population_size == 64
+    @test cfg.generations == 20
+    @test cfg.tournament_size == 3
+    @test cfg.crossover_rate == 0.5
 end
 
 @testitem "Regression mse basic cases" setup=[RegBaseImports] begin
@@ -989,6 +1235,75 @@ end
     cfg = default_config(max_reduce_steps=20)
     y = evaluate_default(ind, x, comps, cfg)
     @test y == x
+end
+
+@testitem "Regression evaluate_default runs FunctionDef natively" setup=[RegBaseImports] begin
+    using LambdaRegression: Procedural
+
+    target_ty = TyFun(FloatTy, FloatTy)
+    tree = AstTree(Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0))))
+    ind = Individual(
+        tree,
+        target_ty;
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+    )
+    comps = default_components(
+        global_consts=Dict{Symbol,Any}(),
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        input_slots=Symbol[:x],
+        input_types=Dict{Symbol,TyLike}(:x => FloatTy),
+    )
+
+    @test evaluate_default(ind, 3.5, comps, default_config()) == 3.5
+end
+
+@testitem "Regression startup defaults initialize and fit without injected hooks" setup=[RegBaseImports] begin
+    using Random
+    using LambdaRegression.TypeSystem: IntTy
+
+    target_ty = TyFun(FloatTy, FloatTy)
+    comps = default_components(
+        global_consts=Dict{Symbol,Any}(),
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        input_slots=Symbol[:x],
+        input_types=Dict{Symbol,TyLike}(:x => FloatTy),
+        init_candidates_per_individual=1,
+    )
+    cfg = default_config(
+        population_size=4,
+        generations=1,
+        mutation_rate=0.0,
+        crossover_rate=0.0,
+        parallel=(enabled=false,),
+        seed=UInt64(9),
+    )
+    data = SupervisedDataset([-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0])
+    reg = Regressor(target_ty, comps, cfg, MersenneTwister(1111))
+
+    result = fit!(reg, data)
+    @test !(result isa Err)
+    @test result.best !== nothing
+    @test result.history[1].best_loss == 0.0
+
+    scalar_components = default_components(
+        global_consts=Dict{Symbol,Any}(:one => 1),
+        global_consts_ty=Dict{Symbol,TyLike}(:one => IntTy),
+        input_slots=Symbol[],
+        input_types=Dict{Symbol,TyLike}(),
+        force_lambda_root_probability=1.0,
+        init_candidates_per_individual=1,
+    )
+    scalar_reg = Regressor(IntTy, scalar_components, cfg, MersenneTwister(2000))
+    scalar_population = scalar_components.init_population(
+        scalar_reg,
+        data;
+        N=1,
+        seed=UInt64(10),
+        global_type_ctx=scalar_components.global_consts_ty,
+    )
+    @test !(scalar_population isa Err)
+    @test scalar_population[1].target_ty === IntTy
 end
 
 @testitem "Regression closure_lift unlocks AMAP with AST lambdas" setup=[RegBaseImports] begin
@@ -1180,6 +1495,7 @@ end
             mutation_max_try=1,
             mutation_prune_consts=true,
             crossover_op=nothing,
+            make_immigrant=nothing,
             init_population=(reg, data; N, seed, global_type_ctx) -> [Individual(id_tree, reg.target_ty; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}()) for _ in 1:N],
         ),
     )
@@ -1204,6 +1520,58 @@ end
     rs = res.history[1].repro_stats
     @test rs[:n_immigrant] == 0
     @test rs[:n_clone_fallback] == 5
+end
+
+@testitem "Regression fit! uses default crossover before finite clone fallback" setup=[RegBaseImports] begin
+    target_ty = TyFun(FloatTy, FloatTy)
+    id_tree = AstTree(AbsNode(:x, IndexNode(0)))
+
+    # Keep the default TypedSubtreeSwapCrossover. Identical typed parents make
+    # the finite no-op/error path deterministic without replacing the operator.
+    comps = merge(
+        default_components(
+            global_consts=Dict{Symbol,Any}(),
+            global_consts_ty=Dict{Symbol,TyLike}(),
+            input_slots=Symbol[:x],
+            input_types=Dict{Symbol,TyLike}(:x => FloatTy),
+        ),
+        (;
+            mutations=Mutations.AbstractMutation[],
+            mutation_chooser=WeightedPairChooser(),
+            mutation_provider=Mutations.IndexedProvider(),
+            mutation_max_try=1,
+            mutation_prune_consts=true,
+            init_population=(reg, data; N, seed, global_type_ctx) -> [
+                Individual(id_tree, reg.target_ty;
+                    local_consts=Dict{Symbol,Any}(),
+                    local_consts_ty=Dict{Symbol,TyLike}(),
+                ) for _ in 1:N
+            ],
+        ),
+    )
+
+    cfg = default_config(
+        population_size=4,
+        generations=1,
+        error_threshold=-1.0,
+        mutation_rate=0.0,
+        crossover_rate=1.0,
+        elitism=1,
+        tournament_size=2,
+        repro=(; require_change=true, max_resample=1, on_fail=:clone, immigrant_max_try=1, immigrants_per_gen=0),
+        stats=(; enabled=true, mutation=false, reproduction=true, print=false, every=1, topk_types=4),
+    )
+    data = SupervisedDataset([1.0], [1.0])
+    reg = Regressor(target_ty, comps, cfg, MersenneTwister(8000))
+
+    res = fit!(reg, data)
+    @test !(res isa Err)
+    @test length(res.history) == 1
+    rs = res.history[1].repro_stats
+    @test rs[:crossover_attempt] > 0
+    @test rs[:crossover_ok] + rs[:crossover_err] == rs[:crossover_attempt]
+    @test rs[:n_clone_fallback] > 0
+    @test rs[:n_child_total] + rs[:n_clone_fallback] == 3
 end
 
 @testitem "Regression fit! callback exposes eval_stats classifications" setup=[RegBaseImports] begin

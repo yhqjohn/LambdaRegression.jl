@@ -101,7 +101,8 @@ The public knobs are intentionally small and composable:
   `generate_canonical_scoped` and treats old local constants as reserved
   context rather than preferred source heads. Implement
   `generate_replacement(::MyGenerator, site, env, ctx, generation_kwargs)` to
-  inject another generator.
+  inject another generator, or wrap any compatible scoped callable with
+  `ScopedReplacementGenerator(callable)`.
 - `generation_kwargs`: forwarded to `generate_canonical_scoped`. Defaults are
   deliberately small (`sampling_depth_limit=2`, `sampling_node_budget=24`,
   `guarded_expansion_depth=0`) so repeated mutation batches stay fast; callers
@@ -119,6 +120,12 @@ mutation = SubtreeReplacementMutation(;
     generation_kwargs=(; sampling_depth_limit=3, sampling_node_budget=48),
 )
 ```
+
+`mutate_tree(...; type_inference=checker)` replaces the four-argument type
+checker used for both site decoration and post-mutation validation. The callable
+receives `(tree, type_ctx, tyfactory, meta_or_nothing)`. Omitting it preserves the
+ordinary core `infer` path; procedural layers can inject their lowering-aware
+checker without coupling this module to that AST extension.
 
 ## Constant mutation policies
 
@@ -143,6 +150,242 @@ mutation = ArrayConstMutation(;
 Scale uses a positive log-normal factor `exp(σ_scale * randn(rng))`. The policy
 object is deliberately small so callers can replace value-level behavior without
 changing site selection, pair choice, or mutation validation.
+
+## Let-region mutations
+
+Let-like regions are recognized from the core encoding
+`AppNode(AbsNode(...), rhs)`; callers do not need a persistent `ScopeNode`.
+Three accepted operators share one attempt-local binder-resolved view:
+
+- `LetHoistMutation()` moves one binding across one legal parent. Set
+  `min_bindings` and `max_bindings` above one to opt into consecutive,
+  dependency-closed block Hoist; block Hoist is not in the default preset.
+- `LetSinkMutation()` moves a binding to the deepest region containing every
+  use. `allow_trivial=true` also admits otherwise unhelpful local moves.
+- `LetPruneMutation()` removes an explicitly unused binding.
+
+They require no mutation-specific context fields. Capture safety, De Bruijn
+rebasing, and the distinction between ordinary applications and maximally
+generalized let-like applications are checked by the shared rewrite kernel;
+the usual final `infer`/`iscompatible` check remains authoritative. An operator
+can fail normally when no legal region exists, when a move would alter a
+retained application role, or when final validation rejects the result.
+
+The mutation set, routing weights, site provider, and chooser are independent
+injection points:
+
+```julia
+using LambdaRegression.Mutations
+
+let_mutations = AbstractMutation[
+    LetHoistMutation(),
+    LetSinkMutation(),
+    LetPruneMutation(),
+]
+let_weights = Dict{Type,Float64}(
+    LetHoistMutation => 0.03,
+    LetSinkMutation => 0.03,
+    LetPruneMutation => 0.02,
+)
+chooser = WeightedPairChooser(weights=let_weights, cache_eligibility=true)
+
+mutated = mutate_tree(
+    tree,
+    target_ty;
+    mutations=let_mutations,
+    chooser,
+    provider=IndexedProvider(),
+    # rng and constant contexts as in the quickstart above
+)
+```
+
+Passing a custom `AbstractPairChooser` can replace routing entirely; passing a
+custom `AbstractSiteProvider` can replace indexing. Omitting these operators
+from `mutations` avoids their scoped analysis and candidate scans.
+
+## Binding insertion and explicit inline
+
+`SourceBindingInsertionMutation()` copies one already typed subtree into an
+intentionally unused, maximally generalized let-like binding. It is the only
+binding-insertion operator in the ordinary preset, with routing weight `0.015`.
+The chooser selects the source site; `host_weight(source_site, host_path,
+distance, env, ctx)` then weights its finite capture-safe ancestor hosts. A zero
+weight excludes a host. Omitting this operator removes its source/host scan. If
+Hoist, Sink, Prune, or another scoped family remains enabled, that family may
+still build the shared scoped view; omitting every scoped family avoids it.
+
+`LetInlineMutation()` exposes the inverse let-like β step as an independently
+routable, path-authoritative operator. It remains opt-in because the default
+`BetaReduceMutation()` already reduces direct-`Abs` applications. Let RHS and
+body replacement use `SubtreeReplacementMutation` with its injected site lock,
+path-selection policy, and replacement generator.
+
+All three rewrites resolve the selected node from the attempt-local `site.path`;
+stale object identity cannot redirect them. A source or generated unused binding
+is still a call-by-value application `(λx. body) rhs`: `rhs` may therefore
+diverge, time out, or raise a host error even though `x` is unused. These
+operators preserve typing and lexical scope, not termination or totality.
+
+`GeneratedBindingInsertionMutation(rhs_types; ...)` is also opt-in. `rhs_types`
+must be an explicit finite collection of closed monotypes and/or fully quantified
+`TyScheme`s. The operator samples one demand with `rhs_type_weight(rhs_ty, host,
+env, ctx)`, asks `replacement_generator` for an RHS, independently checks that
+RHS against the selected demand, and only then commits the new let-like binding
+and staged local constants. Captured host binders remain rigid during this check;
+quantified variables in the selected scheme remain genuinely polymorphic. RHS
+generalization follows `FTV(rhs) ∖ FTV(environment)`, and enclosing binder types
+are reconstructed from the current tree and authoritative path rather than
+trusted from caller-supplied `Site` metadata.
+
+```julia
+fresh = LambdaRegression.TypeSystem.make_tyvar_factory()
+a = fresh(0)
+
+source = SourceBindingInsertionMutation(
+    host_weight=(_, _, distance, _, _) -> exp(-0.4 * distance),
+)
+
+generated = GeneratedBindingInsertionMutation(
+    TyLike[IntTy, TyScheme([a], TyFun(a, a))];
+    replacement_generator=CanonicalReplacementGenerator(),
+    rhs_type_weight=(rhs_ty, _, _, _) -> rhs_ty === IntTy ? 2.0 : 1.0,
+    generation_kwargs=(;
+        sampling_depth_limit=3,
+        sampling_node_budget=48,
+        guarded_expansion_depth=0,
+        providers=my_providers,
+        weights=my_generation_weights,
+    ),
+)
+
+mutations = AbstractMutation[source, generated, LetInlineMutation()]
+chooser = WeightedPairChooser(
+    weights=Dict{Type,Float64}(
+        SourceBindingInsertionMutation => 0.02,
+        GeneratedBindingInsertionMutation => 0.01,
+        LetInlineMutation => 0.01,
+    ),
+    cache_eligibility=true,
+)
+
+rhs_or_body_edit = SubtreeReplacementMutation(
+    site_lock=DefaultSiteLockPolicy(spine_only=false),
+    site_selection=PathSiteSelectionPolicy(rhs_or_body_path),
+    replacement_generator=CanonicalReplacementGenerator(),
+)
+```
+
+Here `my_providers` and `my_generation_weights` are caller-owned canonical
+generation configuration. The constructor snapshots and validates the type
+catalog. `generation_kwargs` cannot override the caller RNG, host scope,
+constant dictionaries, or complete generation config. Custom RHS construction
+extends `generate_binding_rhs(generator, rhs_ty, host, env, ctx,
+generation_kwargs)` on an `AbstractReplacementGenerator`; the mutation kernel
+continues to own finite catalog routing, transactional constants, independent
+RHS verification, host insertion, and final root validation.
+
+Expected failure is ordinary: a source may have no legal host, all injected
+weights may be zero, generation may fail within its finite budget, or either RHS
+or root validation may reject the candidate. Negative, non-finite, and otherwise
+invalid policy weights are configuration errors returned as failed attempts;
+they never silently broaden the candidate set.
+
+## Existing-binding Graft
+
+`GraftMutation()` adds a new use of an existing maximally generalized let-like
+binding:
+
+```text
+let x = D in B[R]  ↦  let x = D in B[x]
+```
+
+It neither creates a binding nor copies/moves the RHS. A legal pair requires the
+recipient to lie in the binding body, not already depend on that binder, differ
+from the RHS under scope-aware α normalization, preserve retained HM application
+roles, and accept a fresh instantiation of the binding scheme at the recipient.
+Final whole-tree inference remains authoritative. This is a semantic-changing
+operator and may activate recursion or divergence; it is opt-in and absent from
+the ordinary preset.
+
+Routing is caller-owned and evaluated once per attempt-local candidate:
+
+```julia
+graft = GraftMutation(
+    recipient_weight=(site, env, ctx) -> exp(-0.25 * site.depth),
+    donor_weight=(binding, site, env, ctx) ->
+        binding.name === :preferred ? 3.0 : 1.0,
+)
+
+mutated = mutate_tree(
+    tree,
+    target_ty;
+    mutations=AbstractMutation[graft],
+    chooser=WeightedPairChooser(
+        weights=Dict{Type,Float64}(GraftMutation => 1.0),
+        cache_eligibility=true,
+    ),
+    provider=IndexedProvider(),
+    # rng and constant contexts as in the quickstart above
+)
+```
+
+`GraftSite` exposes the read-only attempt-local recipient path, node, type, and
+lexical depth. The likewise read-only `GraftBinding` exposes the complete let
+path, RHS path, binder name, and generalized scheme. Zero weight excludes a site or pair; negative,
+non-real, or non-finite weights are configuration errors. No extra context field
+is required beyond `mutate_tree`'s ordinary typing context. The current resolver
+accepts the core lambda AST and rejects unsupported procedural nodes finitely;
+procedural-aware Graft belongs to that extension. Omitting `GraftMutation` from
+`mutations` avoids its scoped analysis entirely. As with every injected policy,
+finite-time claims assume callbacks return and do not mutate these views.
+
+## Product packing and unpacking
+
+`ProductPackMutation(capability)` replaces two adjacent, independent let-like
+bindings with one product binding. `ProductUnpackMutation(capability)` is its
+strict syntactic inverse: it only accepts a product binding whose uses are
+exclusively exact left/right projections. Component order is stable; neither
+operator reassociates nested products or performs general product normalization.
+They are opt-in and absent from the ordinary preset, so omitting them avoids
+their scoped candidate analysis.
+
+This is a type-preserving search mutation, not an evaluator-equivalence pass.
+The ordinary host `PAIR` is strict, while an unused let RHS can remain
+unevaluated under normal-order beta reduction. Packing can therefore change
+termination behavior, for example when an unused component diverges. Use this
+family only where that semantic-changing search move is intended.
+
+The required capability supplies the three constant heads used by the rewrite.
+The convenience capability below uses the type system's ordinary primitives;
+callers must still inject matching types and runtime values into the mutation
+context:
+
+```julia
+using LambdaRegression.Mutations
+using LambdaRegression.TypeSystem: FST, PAIR, SND, TyLike, get_type_ctx
+
+capability = PrimitiveProductCapability(
+    pair_head=:MAKE_PAIR,
+    left_head=:LEFT_OF,
+    right_head=:RIGHT_OF,
+)
+values = Dict{Symbol,Any}(
+    :MAKE_PAIR => PAIR,
+    :LEFT_OF => FST,
+    :RIGHT_OF => SND,
+)
+types = Dict{Symbol,TyLike}(get_type_ctx(values))
+mutations = AbstractMutation[
+    ProductPackMutation(capability),
+    ProductUnpackMutation(capability),
+]
+```
+
+Custom primitive-head mappings subtype `AbstractProductCapability` and define
+`product_primitive_heads(::MyCapability)`. The current protocol does not replace
+the product AST shape or its evaluation strategy. The shared kernel continues
+to own binder resolution, strict matching, materialization, and final type
+validation.
 """
 module Mutations
 
@@ -171,9 +414,16 @@ export PointMutation
 export SubtreeReplacementMutation
 export AbstractSiteLockPolicy, DefaultSiteLockPolicy
 export AbstractSiteSelectionPolicy, ExponentialSiteSelectionPolicy, PathSiteSelectionPolicy
-export AbstractReplacementGenerator, CanonicalReplacementGenerator
+export AbstractReplacementGenerator, CanonicalReplacementGenerator, ScopedReplacementGenerator
 export is_site_locked, site_selection_weight, generate_replacement
 export BetaReduceMutation, EtaReduceMutation, EtaExpandMutation, CSEMutation
+export LetPruneMutation, LetHoistMutation, LetSinkMutation
+export SourceBindingInsertionMutation, GeneratedBindingInsertionMutation, LetInlineMutation
+export GraftMutation, GraftSite, GraftBinding
+export AbstractProductCapability, PrimitiveProductCapability
+export ProductPackMutation, ProductUnpackMutation
+export product_primitive_heads
+export generate_binding_rhs
 export CondAppPullMutation, CondAppPushMutation
 export Populations
 
@@ -636,7 +886,7 @@ function prepare!(p::IndexedProvider, tree::AstTree, type_ctx::Dict{Symbol,<:TyL
     reset!(p)
     meta = Dict{AstNode,Tuple{TyLike,TyLike}}()
     factory = haskey(ctx, :tyfactory) ? ctx.tyfactory : newtyvar
-    ty = infer(tree, type_ctx, factory, meta)
+    ty = _run_mutation_inference(ctx, tree, type_ctx, factory, meta)
     ty isa Err && return ty
     env.meta = meta
     p.sites_all = _collect_sites(tree, meta, ctx, env.target_ty)
@@ -662,11 +912,14 @@ Selection model:
    - eligibility is filtered by `is_site_eligible(m, site, env, ctx)`
    - weights are `site_weight(m, site, env, ctx)`
 2) Sample a mutation by its *mass*:
-   `mass(m) = weight(typeof(m)) * sum(site_weights) * success_hint(m)`
+   `mass(m) = weight(m) * sum(site_weights) * success_hint(m)`
 3) Sample a site within that mutation by its site weights.
 
 ## Parameters
-- `weights::Dict{DataType,Float64}`: per-mutation-type weights. Defaults:
+- `weights`: per-mutation-type weights. A concrete parameterized type overrides
+  its family key, so callers may configure either `typeof(mutation)` or a whole
+  family such as `SourceBindingInsertionMutation`. Existing
+  `Dict{DataType,Float64}` inputs remain accepted. Defaults:
 - `ScalarConstMutation => 0.25`
 - `ArrayConstMutation => 0.25`
 - `BoolConstMutation => 0.05`
@@ -675,6 +928,10 @@ Selection model:
 - `BetaReduceMutation => 0.04`
 - `EtaExpandMutation => 0.03`
 - `EtaReduceMutation => 0.03`
+- `LetHoistMutation => 0.025`
+- `LetSinkMutation => 0.025`
+- `LetPruneMutation => 0.02`
+- `SourceBindingInsertionMutation => 0.015`
 - `cache_eligibility::Bool=false`: cache eligible site lists per mutation within
   one `mutate_tree` call (Milestone C).
 
@@ -683,27 +940,62 @@ Notes
   have wildly different success rates and usefulness (constants often dominate).
 """
 struct WeightedPairChooser <: AbstractPairChooser
-    weights::Dict{DataType,Float64}
+    weights::Dict{Type,Float64}
     cache_eligibility::Bool
 end
 
-function WeightedPairChooser(; weights::Union{Nothing,Dict{DataType,Float64}}=nothing, cache_eligibility::Bool=false)
-	    default = Dict{DataType,Float64}(
-	        # Split constant operators (preferred).
-	        ScalarConstMutation => 0.25,
-	        ArrayConstMutation => 0.25,
-	        BoolConstMutation => 0.05,
+function _normalize_mutation_weights(weights)
+    normalized = Dict{Type,Float64}()
+    for (mutation_type, weight) in pairs(weights)
+        mutation_type isa Type || throw(ArgumentError(
+            "mutation weight keys must be types, got $(repr(mutation_type))",
+        ))
+        weight isa Real || throw(ArgumentError(
+            "mutation weights must be real, got $(repr(weight))",
+        ))
+        normalized[mutation_type] = Float64(weight)
+    end
+    return normalized
+end
+
+function WeightedPairChooser(; weights=nothing, cache_eligibility::Bool=false)
+    default = Dict{Type,Float64}(
+        # Split constant operators (preferred).
+        ScalarConstMutation => 0.25,
+        ArrayConstMutation => 0.25,
+        BoolConstMutation => 0.05,
         # Backwards-compatible wrapper.
         ConstMutation => 0.55,
 
         PointMutation => 0.10,
-	        CSEMutation => 0.08,
-	        BetaReduceMutation => 0.04,
-	        EtaExpandMutation => 0.03,
-	        EtaReduceMutation => 0.03,
-	    )
-	    return WeightedPairChooser(weights === nothing ? default : weights, cache_eligibility)
-	end
+        CSEMutation => 0.08,
+        BetaReduceMutation => 0.04,
+        EtaExpandMutation => 0.03,
+        EtaReduceMutation => 0.03,
+        LetHoistMutation => 0.025,
+        LetSinkMutation => 0.025,
+        LetPruneMutation => 0.02,
+        SourceBindingInsertionMutation => 0.015,
+    )
+    return WeightedPairChooser(
+        weights === nothing ? default : _normalize_mutation_weights(weights),
+        cache_eligibility,
+    )
+end
+
+WeightedPairChooser(weights::AbstractDict, cache_eligibility::Bool) =
+    WeightedPairChooser(_normalize_mutation_weights(weights), cache_eligibility)
+
+function _mutation_weight(
+    chooser::WeightedPairChooser,
+    mutation::AbstractMutation,
+    default::Real,
+)
+    concrete = typeof(mutation)
+    haskey(chooser.weights, concrete) && return chooser.weights[concrete]
+    family = Base.typename(concrete).wrapper
+    return get(chooser.weights, family, Float64(default))
+end
 
 function _eligible_sites(m::AbstractMutation, provider::AbstractSiteProvider, env::MutationEnv, ctx::NamedTuple)
     if env.cache_eligibility && haskey(env.eligibility_cache, m)
@@ -747,7 +1039,7 @@ function choose_pair(chooser::WeightedPairChooser,
             push!(payloads, (m, eligible, wts))
             continue
         end
-        mass = get(chooser.weights, typeof(m), base_weight(m, ctx)) * sum(wts) * _success_hint(env, m)
+        mass = _mutation_weight(chooser, m, base_weight(m, ctx)) * sum(wts) * _success_hint(env, m)
         push!(masses, mass)
         push!(payloads, (m, eligible, wts))
     end
@@ -842,6 +1134,20 @@ struct CanonicalReplacementGenerator <: AbstractReplacementGenerator
 end
 CanonicalReplacementGenerator(; include_local_consts::Bool=false) = CanonicalReplacementGenerator(include_local_consts)
 
+"""
+    ScopedReplacementGenerator(generate_scoped; include_local_consts=false)
+
+Adapt a callable with the shape `generate_scoped(target_ty; kwargs...)` to the
+subtree replacement protocol. This keeps procedural or other alternative
+generators injectable without adding a dependency from `Mutations` to them.
+"""
+struct ScopedReplacementGenerator{F} <: AbstractReplacementGenerator
+    generate_scoped::F
+    include_local_consts::Bool
+end
+ScopedReplacementGenerator(generate_scoped; include_local_consts::Bool=false) =
+    ScopedReplacementGenerator(generate_scoped, include_local_consts)
+
 is_site_locked(::AbstractSiteLockPolicy, ::Site, ::MutationEnv, ::NamedTuple) = false
 
 function is_site_locked(policy::DefaultSiteLockPolicy, site::Site, ::MutationEnv, ::NamedTuple)
@@ -876,8 +1182,21 @@ function _generation_closed_type(ty::Ty)
     return false
 end
 
-function generate_replacement(
-    generator::CanonicalReplacementGenerator,
+function _default_mutation_inference(tree, type_ctx, factory, meta)
+    meta === nothing && return infer(tree, type_ctx, factory)
+    return infer(tree, type_ctx, factory, meta)
+end
+
+function _run_mutation_inference(ctx, tree, type_ctx, factory, meta)
+    checker = haskey(ctx, :type_inference) ? ctx.type_inference : _default_mutation_inference
+    applicable(checker, tree, type_ctx, factory, meta) || throw(ArgumentError(
+        "type_inference must accept (tree, type_ctx, tyfactory, meta_or_nothing)",
+    ))
+    return checker(tree, type_ctx, factory, meta)
+end
+
+function _replacement_generation_kwargs(
+    include_local_consts::Bool,
     site::Site,
     env::MutationEnv,
     ctx::NamedTuple,
@@ -890,10 +1209,43 @@ function generate_replacement(
         global_consts_ty=ctx.global_consts_ty,
         local_consts=ctx.local_consts,
         local_consts_ty=ctx.local_consts_ty,
-        source_local_consts=generator.include_local_consts,
+        source_local_consts=include_local_consts,
     )
-    kwargs = merge(defaults, generation_kwargs)
+    return merge(defaults, generation_kwargs)
+end
+
+function generate_replacement(
+    generator::CanonicalReplacementGenerator,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+    generation_kwargs::NamedTuple,
+)
+    kwargs = _replacement_generation_kwargs(
+        generator.include_local_consts,
+        site,
+        env,
+        ctx,
+        generation_kwargs,
+    )
     return generate_canonical_scoped(site.ty; kwargs...)
+end
+
+function generate_replacement(
+    generator::ScopedReplacementGenerator,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+    generation_kwargs::NamedTuple,
+)
+    kwargs = _replacement_generation_kwargs(
+        generator.include_local_consts,
+        site,
+        env,
+        ctx,
+        generation_kwargs,
+    )
+    return generator.generate_scoped(site.ty; kwargs...)
 end
 
 """
@@ -943,14 +1295,15 @@ end
 
 function _same_const_binding(
     name::Symbol,
-    result_local_consts::Dict{Symbol,Any},
-    result_local_const_types::Dict{Symbol,TyLike},
-    current_local_consts::Dict{Symbol,Any},
-    current_local_const_types::Dict{Symbol,TyLike},
+    result_local_consts::AbstractDict{Symbol,<:Any},
+    result_local_const_types::AbstractDict{Symbol,<:TyLike},
+    current_local_consts::AbstractDict{Symbol,<:Any},
+    current_local_const_types::AbstractDict{Symbol,<:TyLike},
 )
     haskey(current_local_const_types, name) || return false
     haskey(result_local_const_types, name) || return false
-    TypeSystem.typekey(current_local_const_types[name]) == TypeSystem.typekey(result_local_const_types[name]) || return false
+    TypeSystem.semantic_typekey(current_local_const_types[name]) ==
+        TypeSystem.semantic_typekey(result_local_const_types[name]) || return false
     haskey(current_local_consts, name) || return false
     haskey(result_local_consts, name) || return false
     return try
@@ -973,12 +1326,9 @@ end
 function _rename_const_nodes(node::AstNode, renames::Dict{Symbol,Symbol})::AstNode
     if node isa ConstNode
         return ConstNode(get(renames, node.name, node.name))
-    elseif node isa AppNode
-        return AppNode(_rename_const_nodes(node.func, renames), _rename_const_nodes(node.arg, renames))
-    elseif node isa AbsNode
-        return AbsNode(node.name, _rename_const_nodes(node.body, renames))
-    elseif node isa LetNode
-        return LetNode(node.name, _rename_const_nodes(node.value, renames), _rename_const_nodes(node.body, renames))
+    end
+    for (index, child) in pairs(children(node))
+        setchild!(node, index, _rename_const_nodes(child, renames))
     end
     return node
 end
@@ -989,16 +1339,41 @@ function _merge_replacement_consts!(
     result_local_const_types::Dict{Symbol,TyLike},
     current_local_consts::Dict{Symbol,Any},
     current_local_const_types::Dict{Symbol,TyLike},
+    ;
+    reserved_consts::AbstractDict{Symbol,<:Any}=Dict{Symbol,Any}(),
+    reserved_const_types::AbstractDict{Symbol,<:TyLike}=Dict{Symbol,TyLike}(),
 )
     used = _collect_const_names!(Set{Symbol}(), replacement.root)
-    occupied = union(Set(keys(current_local_const_types)), Set(keys(result_local_const_types)))
+    occupied = union(
+        Set(keys(current_local_const_types)),
+        Set(keys(result_local_const_types)),
+        Set(keys(reserved_const_types)),
+    )
     renames = Dict{Symbol,Symbol}()
     for name in sort!(collect(used))
         haskey(result_local_const_types, name) || continue
         haskey(result_local_consts, name) || continue
         target_name = name
-        if haskey(current_local_const_types, name) &&
-                !_same_const_binding(name, result_local_consts, result_local_const_types, current_local_consts, current_local_const_types)
+        if !haskey(current_local_const_types, name) &&
+                haskey(reserved_const_types, name) &&
+                _same_const_binding(
+                    name,
+                    result_local_consts,
+                    result_local_const_types,
+                    reserved_consts,
+                    reserved_const_types,
+                )
+            continue
+        elseif (
+            haskey(current_local_const_types, name) &&
+            !_same_const_binding(
+                name,
+                result_local_consts,
+                result_local_const_types,
+                current_local_consts,
+                current_local_const_types,
+            )
+        ) || (!haskey(current_local_const_types, name) && haskey(reserved_const_types, name))
             target_name = _fresh_replacement_const_name(occupied, name)
             push!(occupied, target_name)
             renames[name] = target_name
@@ -1016,7 +1391,15 @@ function apply(m::SubtreeReplacementMutation, tree::AstTree, site::Site, env::Mu
     result isa GenerationResult || return Err(ArgumentError("replacement generator must return GenerationResult or Err"))
 
     replacement = deepcopy(result.tree)
-    _merge_replacement_consts!(replacement, copy(result.local_consts), copy(result.local_const_types), ctx.local_consts, ctx.local_consts_ty)
+    _merge_replacement_consts!(
+        replacement,
+        copy(result.local_consts),
+        copy(result.local_const_types),
+        ctx.local_consts,
+        ctx.local_consts_ty;
+        reserved_consts=ctx.global_consts,
+        reserved_const_types=ctx.global_consts_ty,
+    )
 
     _replace_site!(tree, site, replacement)
     return tree
@@ -1737,6 +2120,10 @@ function _default_mutations()
         BetaReduceMutation(),
         EtaExpandMutation(),
         EtaReduceMutation(),
+        LetHoistMutation(),
+        LetSinkMutation(),
+        LetPruneMutation(),
+        SourceBindingInsertionMutation(),
     ]
 end
 
@@ -1764,6 +2151,7 @@ Returns `Err(MaxTryReachedErr())` if no valid mutation can be found within `max_
 - `global_consts`: optional runtime values for global constants used by generated replacements
 - `const_symfactory`: per-call deterministic local-constant symbol factory (default: `ConstSymbolFactory()`)
 - `tyfactory`, `symfactory`: local factories used by type inference and CSE
+- `type_inference`: four-argument callable used for site typing and final validation
 
 ## Optional policies (off by default)
 - `bloat_policy::BloatPolicy`
@@ -1783,6 +2171,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     local_consts_ty::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     local_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
     tyfactory=newtyvar,
+    type_inference=_default_mutation_inference,
     symfactory=SymbolGenerator(),
     const_symfactory::ConstSymbolFactory=ConstSymbolFactory(),
     bloat_policy::BloatPolicy=BloatPolicy(),
@@ -1807,6 +2196,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         tyfactory=tyfactory,
         symfactory=symfactory,
         const_symfactory=const_symfactory,
+        type_inference=type_inference,
     )
     env = MutationEnv(
         rng,
@@ -1842,6 +2232,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
             tyfactory=tyfactory,
             symfactory=symfactory,
             const_symfactory=const_symfactory,
+            type_inference=type_inference,
         )
 
         choice = choose_pair(chooser, mutations, provider, current_tree, base_type_ctx, env, base_ctx)
@@ -1867,7 +2258,13 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
 
         prune_consts && prune_local_consts!(attempt_tree, attempt_local_consts, attempt_local_consts_ty)
         attempt_type_ctx = merge(global_consts_ty, attempt_local_consts_ty)
-        inferred = infer(attempt_tree, attempt_type_ctx, tyfactory)
+        inferred = _run_mutation_inference(
+            attempt_ctx,
+            attempt_tree,
+            attempt_type_ctx,
+            tyfactory,
+            nothing,
+        )
         if inferred isa Err
             _update_stat!(env, m, false)
             record!(recorder, typeof(m), :infer_err; err_type=typeof(inferred.value))
@@ -1903,6 +2300,10 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     return Err(MaxTryReachedErr())
 end
 
+include("ScopedRewrite.jl")
+include("BindingInsertion.jl")
+include("Graft.jl")
+include("ProductPacking.jl")
 include("Population.jl")
 
 ########################################################

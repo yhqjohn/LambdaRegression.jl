@@ -28,11 +28,19 @@ include("generate/CanonicalGeneration.jl")
 using .CanonicalGeneration
 export CanonicalGeneration
 
+include("procedural/Procedural.jl")
+using .Procedural
+export Procedural
+
 include("mutate/Mutations.jl")
 using .Mutations
 export Mutations
 using .Mutations: mutate_tree
 export mutate_tree
+
+include("procedural/ProceduralMutations.jl")
+using .ProceduralMutations
+export ProceduralMutations
 #
 include("regression/Regression.jl")
 using .Regression
