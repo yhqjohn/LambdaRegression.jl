@@ -1,32 +1,20 @@
 """
     Procedural
 
-Optional procedural-like syntax layered over the core lambda AST. The core AST does
-not depend on this module: consumers may construct [`ScopeNode`](@ref) and
-[`FunctionDefNode`](@ref), inspect their lexical child contexts, infer and evaluate
-them natively, or lower them to ordinary `AbsNode`/`AppNode` trees for compatibility
-with core-only consumers.
+First-class recursive functions layered over the core lambda AST. The core AST
+does not depend on this module. Consumers may construct [`FunctionDefNode`](@ref),
+inspect its lexical self binder, infer and evaluate it natively, or lower it to
+ordinary `AbsNode`/`AppNode` trees for core-only consumers.
 
-`ScopeNode([e₁, e₂], body)` is a sequential, maximally-generalising scope. The first
-right-hand side sees only the outer context, the second also sees binding 1, and the
-body sees both bindings. Its exact lowering is:
+`ScopeNode` is retained as a compatibility form approaching deprecation. It is
+strictly equivalent to a sequential HM let-like lambda/application spine, is
+not injected into default populations, and should not receive new population
+algorithms. Compatibility callers may still construct, infer, evaluate, and
+lower existing Scope terms.
 
-```text
-{ x = e₁; y = e₂; body }
-≡ (λ0. (λ1. body) e₂) e₁
-```
-
-Pretty printing keeps every bound occurrence as its exact De Bruijn `#i` and
-adds only cyclic display names to binders. A recursive abstraction is shown as
-`fn f(x). body`; nested definitions advance through `g`, `h`, and so on.
-
-Binding identity is preserved across lowering. Scope binders and their lowering
-abstractions occupy the same lexical positions, while self-free FunctionDef lowering
-removes the unused self slot and rebases outer De Bruijn indices by one. Lowering
-chooses deterministic fresh display names that cannot capture named `VarNode`s in the
-source term. Use [`child_role`](@ref) and
-[`visible_binders`](@ref) when a traversal or generator needs the context of one
-child without knowing the node layout.
+Pretty printing keeps bound occurrences as exact De Bruijn `#i` values and adds
+only display names. Use [`child_role`](@ref) and [`visible_binders`](@ref) when a
+FunctionDef-aware traversal needs the context of its body.
 
 `FunctionDefNode(body)` gives `body` one anonymous monomorphic self binder at index
 `#0`. If that binder is referenced, lowering emits `Y (λself. body)`; otherwise
@@ -36,20 +24,20 @@ finite core `Y` term; pass `fixed_point=` to [`lower_procedural`](@ref),
 [`infer_procedural`](@ref), or [`reduce_procedural!`](@ref) to inject a different
 closed witness or a zero-argument factory returning one.
 
-`infer_procedural` additionally verifies that every nested FunctionDef resolves,
+`infer_procedural` verifies that every nested FunctionDef resolves,
 modulo equi-recursive `μ`, to a function-headed type. A non-function definition
 returns `Err(NonFunctionDefinitionError(...))`. Legacy `LetNode`s are lowered to
-the same HM let-like application used by Scope rather than passed to the core
-adapter unchanged. When `meta` is supplied, inferred bounds are keyed by nodes
-from the original input, not by temporary lowering nodes.
+the same HM let-like application rather than passed to the core adapter unchanged.
+When `meta` is supplied, inferred bounds are keyed by nodes from the original
+input, not by temporary lowering nodes.
 
 # Quick start
 
 ```julia
 using LambdaRegression: Procedural
-using LambdaRegression.ASTs.NodeASTs: AstNode, AstTree, ConstNode, IndexNode
+using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
 
-term = Procedural.ScopeNode(AstNode[ConstNode(:value)], IndexNode(0))
+term = Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0)))
 core = Procedural.lower_procedural(AstTree(term))
 ty = Procedural.infer_procedural(AstTree(term), type_context)
 prepared = Procedural.prepare_procedural(term)
@@ -65,9 +53,8 @@ destructive compatibility/oracle path: it replaces the root by its lowering and
 delegates to normal-order beta reduction. For pure primitives and terminating
 programs the two paths are required to agree on the resulting value, but their
 step counts are intentionally not equal: native execution skips the administrative
-β steps that encode and unfold `Y`. Near a finite step limit, compare the classified
-resource failure rather than requiring the same numeric cutoff. Initial random `Scope` generation is
-outside this module's default behaviour; generation providers opt in explicitly.
+β steps that encode and unfold `Y`. Near a finite step limit, compare the
+classified resource failure rather than requiring the same numeric cutoff.
 
 # FunctionDef generation
 
@@ -206,12 +193,14 @@ include("contextual.jl")
 include("observations.jl")
 include("evaluation.jl")
 include("lowering.jl")
+include("ProceduralCrossoverSnapshot.jl")
 include("generation.jl")
 
 export ScopeNode, FunctionDefNode
 export NonFunctionDefinitionError
 export BinderId, child_role, visible_binders
 export functiondef_recursion_observations, functiondef_recursion_summary
+export obvious_functiondef_loop_reason
 export fixed_point_witness, lower_procedural, infer_procedural, reduce_procedural!
 export PreparedProcedural, prepare_procedural, run_procedural, evaluate_procedural
 export ProceduralEvaluationError, ProceduralStepLimitError, ProceduralNonValueError

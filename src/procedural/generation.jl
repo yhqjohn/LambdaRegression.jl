@@ -21,9 +21,15 @@ end
     DirectKnotFilter()
 
 Reject a body that is exactly `self`, a finite eta-forwarding prefix such as
-`λx. self x`, or a recursive call whose argument hides a safe-list case outside
-its success guard. The filter is deliberately syntactic and total; richer loop
-analysis and runtime limits remain separate injectable policies.
+`λx. self x`, an unconditional recursive call with every function argument
+unchanged in a strict expression context, or a recursive call whose argument
+hides a safe-list case outside its success guard. Nested lambda/FunctionDef
+values are not assumed to execute. A self call in a safe-list fallback is also
+rejected because the
+fallback is selected only after the source is empty and cannot establish a
+structurally smaller recursive argument. The filter is deliberately syntactic
+and total; richer loop analysis and runtime limits remain separate injectable
+policies.
 """
 struct DirectKnotFilter end
 
@@ -58,6 +64,8 @@ function (filter::DirectKnotFilter)(candidate::FunctionDefCandidate)
     body = candidate.body
     _is_direct_self_derivation(body, candidate.self_index) && return false
     _is_eta_forwarding_derivation(body, candidate.self_index) && return false
+    _is_unconditional_self_call_derivation(body, candidate.self_index) && return false
+    _has_unchanged_self_call_derivation(body, candidate.self_index) && return false
     _has_unguarded_safe_list_recursive_derivation(body, candidate.self_index) && return false
     return true
 end
@@ -184,6 +192,126 @@ end
 _is_eta_forwarding_derivation(derivation::CG.CoreDerivation, self_index::Int) =
     _is_eta_forwarding_signature(CG.derivation_signature(derivation), self_index)
 
+function _is_unconditional_self_call_derivation(
+    derivation::CG.CoreDerivation,
+    self_index::Int,
+)
+    current = derivation
+    lambda_count = 0
+    while current isa CG.LambdaDerivation
+        lambda_count += 1
+        current = current.body
+    end
+    lambda_count > 0 || return false
+    if current isa CG.ScopeApplicationDerivation
+        return current.index == self_index + lambda_count && !isempty(current.args)
+    end
+    return _is_unconditional_self_call_signature(
+        CG.derivation_signature(derivation),
+        self_index,
+    )
+end
+
+function _has_unchanged_self_call_derivation(
+    derivation::CG.CoreDerivation,
+    self_index::Int,
+)
+    current = derivation
+    lambda_count = 0
+    while current isa CG.LambdaDerivation
+        lambda_count += 1
+        current = current.body
+    end
+    lambda_count > 0 || return false
+    parameter_indices = collect((lambda_count - 1):-1:0)
+    return _has_unchanged_self_call_derivation(
+        current,
+        self_index + lambda_count,
+        parameter_indices,
+    )
+end
+
+_has_unchanged_self_call_derivation(
+    ::Union{CG.VariableDerivation,CG.ConstantDerivation},
+    self_index::Int,
+    parameter_indices::Vector{Int},
+) = false
+
+function _has_unchanged_self_call_derivation(
+    ::CG.LambdaDerivation,
+    self_index::Int,
+    parameter_indices::Vector{Int},
+)
+    return false
+end
+
+function _has_unchanged_self_call_derivation(
+    derivation::CG.ScopeApplicationDerivation,
+    self_index::Int,
+    parameter_indices::Vector{Int},
+)
+    if derivation.index == self_index &&
+       length(derivation.args) == length(parameter_indices) &&
+       all(zip(derivation.args, parameter_indices)) do (argument, expected)
+           argument isa CG.VariableDerivation && argument.index == expected
+       end
+        return true
+    end
+    return any(derivation.args) do argument
+        _has_unchanged_self_call_derivation(
+            argument,
+            self_index,
+            parameter_indices,
+        )
+    end
+end
+
+function _has_unchanged_self_call_derivation(
+    derivation::CG.HeadApplicationDerivation,
+    self_index::Int,
+    parameter_indices::Vector{Int},
+)
+    return any(derivation.args) do argument
+        _has_unchanged_self_call_derivation(
+            argument,
+            self_index,
+            parameter_indices,
+        )
+    end
+end
+
+function _has_unchanged_self_call_derivation(
+    derivation::CG.SafeListAccessDerivation,
+    self_index::Int,
+    parameter_indices::Vector{Int},
+)
+    return _has_unchanged_self_call_derivation(
+        derivation.source,
+        self_index,
+        parameter_indices,
+    ) || _has_unchanged_self_call_derivation(
+        derivation.body,
+        self_index + 2,
+        parameter_indices .+ 2,
+    ) || _has_unchanged_self_call_derivation(
+        derivation.fallback,
+        self_index,
+        parameter_indices,
+    )
+end
+
+function _has_unchanged_self_call_derivation(
+    derivation::CG.CoreDerivation,
+    self_index::Int,
+    parameter_indices::Vector{Int},
+)
+    return _has_unchanged_self_call_signature(
+        CG.derivation_signature(derivation),
+        self_index,
+        parameter_indices,
+    )
+end
+
 _contains_safe_list_access(::CG.VariableDerivation) = false
 _contains_safe_list_access(::CG.ConstantDerivation) = false
 _contains_safe_list_access(derivation::CG.LambdaDerivation) =
@@ -260,6 +388,9 @@ function _has_unguarded_safe_list_recursive_derivation(
         derivation.body,
         self_index + 2,
         safe_list_depth + 1,
+    ) || _derivation_has_self_call(
+        derivation.fallback,
+        self_index,
     ) || _has_unguarded_safe_list_recursive_derivation(
         derivation.fallback,
         self_index,
@@ -333,6 +464,9 @@ function _has_unguarded_safe_list_recursive_argument(
             signature[6],
             self_index + 2,
             safe_list_depth + 1,
+        ) || _signature_has_self_call(
+            signature[7],
+            self_index,
         ) || _has_unguarded_safe_list_recursive_argument(
             signature[7],
             self_index,
@@ -345,6 +479,66 @@ function _has_unguarded_safe_list_recursive_argument(
             self_index + 1,
             safe_list_depth,
         )
+    end
+    return false
+end
+
+function _has_unchanged_self_call_signature(
+    signature,
+    self_index::Int,
+    parameter_indices::Vector{Int},
+)
+    signature isa Tuple || return false
+    isempty(signature) && return false
+    tag = signature[1]
+    if tag === :lambda
+        return false
+    elseif tag === :scope_application
+        length(signature) >= 4 || return false
+        arguments = signature[4]
+        if signature[2] == self_index &&
+           length(arguments) == length(parameter_indices) &&
+           all(zip(arguments, parameter_indices)) do (argument, expected)
+               argument isa Tuple && length(argument) >= 2 &&
+                   argument[1] === :var && argument[2] == expected
+           end
+            return true
+        end
+        return any(
+            argument -> _has_unchanged_self_call_signature(
+                argument,
+                self_index,
+                parameter_indices,
+            ),
+            arguments,
+        )
+    elseif tag === :head
+        length(signature) >= 5 || return false
+        return any(
+            argument -> _has_unchanged_self_call_signature(
+                argument,
+                self_index,
+                parameter_indices,
+            ),
+            signature[5],
+        )
+    elseif tag === :safe_list_access
+        length(signature) >= 7 || return false
+        return _has_unchanged_self_call_signature(
+            signature[5],
+            self_index,
+            parameter_indices,
+        ) || _has_unchanged_self_call_signature(
+            signature[6],
+            self_index + 2,
+            parameter_indices .+ 2,
+        ) || _has_unchanged_self_call_signature(
+            signature[7],
+            self_index,
+            parameter_indices,
+        )
+    elseif tag === :function_def
+        return false
     end
     return false
 end
@@ -367,6 +561,20 @@ function _is_eta_forwarding_signature(signature, self_index::Int)
         argument isa Tuple && length(argument) >= 2 &&
             argument[1] === :var && argument[2] == expected
     end
+end
+
+function _is_unconditional_self_call_signature(signature, self_index::Int)
+    current = signature
+    lambda_count = 0
+    while current isa Tuple && length(current) >= 3 && current[1] === :lambda
+        lambda_count += 1
+        current = current[3]
+    end
+    lambda_count > 0 || return false
+    return current isa Tuple && length(current) >= 4 &&
+        current[1] === :scope_application &&
+        current[2] == self_index + lambda_count &&
+        !isempty(current[4])
 end
 
 struct FunctionDefFuel <: CG.AbstractGenerationRequirement

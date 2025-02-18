@@ -326,6 +326,7 @@ end
 @testitem "Procedural DirectKnotFilter tracks the exact recursive binder" begin
     using Test
     using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: FloatTy, Ty, TyFun, TyList
 
     CG = CanonicalGeneration
@@ -356,8 +357,35 @@ end
     filter = Procedural.DirectKnotFilter()
     @test !filter(Procedural.FunctionDefCandidate(F, direct, base, 0))
     @test !filter(Procedural.FunctionDefCandidate(F, eta, base, 0))
-    @test filter(Procedural.FunctionDefCandidate(F, changed, base, 0))
+    @test !filter(Procedural.FunctionDefCandidate(F, changed, base, 0))
     @test filter(Procedural.FunctionDefCandidate(F, CG.VariableDerivation(1, F), base, 0))
+    fadd_head = CG.HeadEntry(
+        :FADD,
+        :constant,
+        TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
+        CG.CoreProductive(),
+        CG.WeightBucket(:constant),
+    )
+    wrapped_unchanged_derivation = CG.LambdaDerivation(
+        FloatTy,
+        CG.HeadApplicationDerivation(
+            fadd_head,
+            CG.CoreDerivation[
+                CG.ScopeApplicationDerivation(
+                    1,
+                    F,
+                    CG.CoreDerivation[CG.VariableDerivation(0, FloatTy)],
+                ),
+                one,
+            ],
+        ),
+    )
+    @test !filter(Procedural.FunctionDefCandidate(
+        F,
+        wrapped_unchanged_derivation,
+        base,
+        0,
+    ))
 
     ListFloat = TyList(FloatTy)
     ListF = TyFun(ListFloat, FloatTy)
@@ -380,6 +408,65 @@ end
     candidate = Procedural.FunctionDefCandidate(ListF, safe, list_base, 0)
     @test CG.derivation_uses_scope_binder(safe, 0)
     @test filter(candidate)
+
+    fallback_self = CG.ScopeApplicationDerivation(
+        1,
+        ListF,
+        CG.CoreDerivation[CG.VariableDerivation(0, ListFloat)],
+    )
+    unsafe_fallback = CG.LambdaDerivation(
+        ListFloat,
+        CG.SafeListAccessDerivation(
+            CG.VariableDerivation(0, ListFloat),
+            ListFloat,
+            safe_body,
+            fallback_self,
+            FloatTy,
+        ),
+    )
+    @test !filter(Procedural.FunctionDefCandidate(
+        ListF,
+        unsafe_fallback,
+        list_base,
+        0,
+    ))
+
+    direct_node = Procedural.FunctionDefNode(IndexNode(0))
+    eta_node = Procedural.FunctionDefNode(AbsNode(
+        :x,
+        AppNode(IndexNode(1), IndexNode(0)),
+    ))
+    changed_node = Procedural.FunctionDefNode(AbsNode(
+        :x,
+        ConstNode(:ONE),
+    ))
+    redirected_node = Procedural.FunctionDefNode(AbsNode(
+        :x,
+        AppNode(IndexNode(1), ConstNode(:ONE)),
+    ))
+    wrapped_unchanged = Procedural.FunctionDefNode(AbsNode(
+        :x,
+        AppNode(
+            AppNode(ConstNode(:FADD), AppNode(IndexNode(1), IndexNode(0))),
+            ConstNode(:ZERO),
+        ),
+    ))
+    deferred_unchanged = Procedural.FunctionDefNode(AbsNode(
+        :x,
+        AppNode(
+            ConstNode(:K),
+            AbsNode(:y, AppNode(IndexNode(2), IndexNode(1))),
+        ),
+    ))
+    @test Procedural.obvious_functiondef_loop_reason(direct_node) === :direct_self
+    @test Procedural.obvious_functiondef_loop_reason(eta_node) ===
+        :eta_self_forwarding
+    @test Procedural.obvious_functiondef_loop_reason(changed_node) === nothing
+    @test Procedural.obvious_functiondef_loop_reason(redirected_node) ===
+        :unconditional_self_call
+    @test Procedural.obvious_functiondef_loop_reason(wrapped_unchanged) ===
+        :unchanged_self_call
+    @test Procedural.obvious_functiondef_loop_reason(deferred_unchanged) === nothing
 end
 
 @testitem "Procedural DirectKnotFilter honors custom derivation signatures" begin

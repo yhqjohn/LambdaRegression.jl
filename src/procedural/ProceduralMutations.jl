@@ -92,7 +92,7 @@ import ..Procedural
 export FunctionDefMutation, FunctionDefScope, generate_functiondef_replacement
 export DefaultFunctionDefMutationGenerator
 export mutate_procedural
-export ProceduralTypedSubtreeSwapCrossover, AutoTypedCrossover
+export FunctionDefTypedSubtreeSwapCrossover, AutoTypedCrossover
 
 const _FUNCTIONDEF_MUTATION_MODES = (:finite_body, :recursive_body, :remove)
 const _FUNCTIONDEF_GENERATION_CONTEXT_KEYS = (

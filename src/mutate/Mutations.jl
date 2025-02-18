@@ -127,6 +127,15 @@ receives `(tree, type_ctx, tyfactory, meta_or_nothing)`. Omitting it preserves t
 ordinary core `infer` path; procedural layers can inject their lowering-aware
 checker without coupling this module to that AST extension.
 
+## Direct composition
+
+`UnaryCompositionMutation()` wraps a selected `S : T` with a monomorphic global
+endomorphism `H : T → T`. It is the low-cost direct move for forms such as
+`SQR(x)` or `TSCALE(head)`. `BinaryCompositionMutation()` preserves `S` as one
+argument of a compatible curried binary global and generates the other sibling.
+Use their site-selection policies and `WeightedPairChooser` weights to change
+routing without changing either rewrite.
+
 ## Constant mutation policies
 
 `ScalarConstMutation` and `ArrayConstMutation` keep the legacy `σ` constructor
@@ -402,7 +411,7 @@ import ..ASTs.NodeASTs: apply_node!, shift_free_variables!
 using ..ASTs.Contexts: new_constant!, ConstSymbolFactory
 using ..Trees: traverse, PointerState, StackState, getstate, Break, setroot!, setchild!, children
 
-export mutate_tree
+export mutate_tree, default_mutations
 export AbstractMutation, required_site_kinds, is_site_eligible, apply
 export AbstractSiteProvider, IndexedProvider
 export AbstractPairChooser, WeightedPairChooser
@@ -411,9 +420,11 @@ export MutationAttemptRecorder, mutation_recorder_summary
 export prune_local_consts!
 export ConstMutation, ScalarConstMutation, BoolConstMutation, ArrayConstMutation, ConstValueMutationPolicy
 export PointMutation
-export SubtreeReplacementMutation
+export SubtreeReplacementMutation, ContextualExpansionMutation
+export UnaryCompositionMutation, BinaryCompositionMutation
 export AbstractSiteLockPolicy, DefaultSiteLockPolicy
 export AbstractSiteSelectionPolicy, ExponentialSiteSelectionPolicy, PathSiteSelectionPolicy
+export LocalCallSiteSelectionPolicy
 export AbstractReplacementGenerator, CanonicalReplacementGenerator, ScopedReplacementGenerator
 export is_site_locked, site_selection_weight, generate_replacement
 export BetaReduceMutation, EtaReduceMutation, EtaExpandMutation, CSEMutation
@@ -595,8 +606,17 @@ mutable struct AdaptivePolicy
     enabled::Bool
     ewma_alpha::Float64
     floor::Float64
+    function AdaptivePolicy(enabled::Bool, ewma_alpha::Float64, floor::Float64)
+        isfinite(ewma_alpha) && 0 < ewma_alpha <= 1 ||
+            throw(ArgumentError("ewma_alpha must be finite and in (0, 1]"))
+        isfinite(floor) && 0 <= floor <= 1 ||
+            throw(ArgumentError("adaptive floor must be finite and in [0, 1]"))
+        return new(enabled, ewma_alpha, floor)
+    end
 end
-AdaptivePolicy(; enabled::Bool=false, ewma_alpha::Float64=0.2, floor::Float64=0.05) = AdaptivePolicy(enabled, ewma_alpha, floor)
+function AdaptivePolicy(; enabled::Bool=false, ewma_alpha::Float64=0.2, floor::Float64=0.05)
+    return AdaptivePolicy(enabled, ewma_alpha, floor)
+end
 
 """
     BloatPolicy(; enabled=false, max_nodes=200, max_nodes_delta=40)
@@ -613,8 +633,15 @@ mutable struct BloatPolicy
     enabled::Bool
     max_nodes::Int
     max_nodes_delta::Int
+    function BloatPolicy(enabled::Bool, max_nodes::Int, max_nodes_delta::Int)
+        max_nodes > 0 || throw(ArgumentError("max_nodes must be positive"))
+        max_nodes_delta >= 0 || throw(ArgumentError("max_nodes_delta must be non-negative"))
+        return new(enabled, max_nodes, max_nodes_delta)
+    end
 end
-BloatPolicy(; enabled::Bool=false, max_nodes::Int=200, max_nodes_delta::Int=40) = BloatPolicy(enabled, max_nodes, max_nodes_delta)
+function BloatPolicy(; enabled::Bool=false, max_nodes::Int=200, max_nodes_delta::Int=40)
+    return BloatPolicy(enabled, max_nodes, max_nodes_delta)
+end
 
 mutable struct MutationStat
     ewma_success::Float64
@@ -686,6 +713,13 @@ end
     return nothing
 end
 
+"""
+    mutation_recorder_summary(rec; topk=8)
+
+Summarize mutation outcomes by operator. When the recorder was constructed with
+`record_error_types=true`, `error_types` contains the most frequent concrete
+failure types; otherwise it is `nothing`.
+"""
 function mutation_recorder_summary(rec::MutationAttemptRecorder; topk::Int=8)
     totals = (;
         (r => rec.totals[i] for (i, r) in pairs(MUTATION_REASONS))...,
@@ -701,7 +735,17 @@ function mutation_recorder_summary(rec::MutationAttemptRecorder; topk::Int=8)
             counts=(; (r => counts[i] for (i, r) in pairs(MUTATION_REASONS))...,),
         ))
     end
-    return (; totals, per_mutation=per)
+    error_types = if rec.by_error_type === nothing
+        nothing
+    else
+        errors = collect(rec.by_error_type)
+        sort!(errors; by=kv -> (-kv[2], string(kv[1])))
+        [
+            (; error_type=errors[j][1], count=errors[j][2])
+            for j in 1:min(topk, length(errors))
+        ]
+    end
+    return (; totals, per_mutation=per, error_types)
 end
 
 function _stat(env::MutationEnv, m::AbstractMutation)
@@ -736,9 +780,11 @@ function _weighted_choice(rng::AbstractRNG, items::Vector, weights::Vector{Float
     @assert length(items) == length(weights)
     total = 0.0
     for w in weights
+        isfinite(w) && w >= 0 || throw(ArgumentError("selection weights must be finite and non-negative"))
         w > 0 || continue
         total += w
     end
+    isfinite(total) || throw(ArgumentError("selection weight sum must be finite"))
     total > 0 || return Err(NoEligibleMutationErr())
     r = rand(rng) * total
     acc = 0.0
@@ -771,9 +817,11 @@ function _binder_types(scope, meta)::Vector{Ty}
     tys = Ty[]
     for abs in scope.abstractions
         haskey(meta, abs) || continue
-        abs_ty = meta[abs][1]
+        raw_abs_ty = meta[abs][1]
+        raw_abs_ty isa Ty || continue
+        abs_ty = TypeSystem.prune(raw_abs_ty)
         abs_ty isa TyFun || continue
-        push!(tys, abs_ty.arg)
+        push!(tys, TypeSystem.prune(abs_ty.arg))
     end
     return tys
 end
@@ -840,7 +888,8 @@ function _collect_sites(tree::AstTree, meta::Dict{AstNode,Tuple{TyLike,TyLike}},
         stack = getstate(bag, StackState{AstNode})
         scope = getstate(bag, ScopeState)
         haskey(meta, node) || return nothing
-        raw_node_ty = meta[node][1]
+        meta_node_ty = meta[node][1]
+        raw_node_ty = meta_node_ty isa Ty ? TypeSystem.prune(meta_node_ty) : meta_node_ty
         raw_binder_types = _binder_types(scope, meta)
         kind = _site_kind(node, ctx)
         path =
@@ -888,6 +937,15 @@ function prepare!(p::IndexedProvider, tree::AstTree, type_ctx::Dict{Symbol,<:TyL
     factory = haskey(ctx, :tyfactory) ? ctx.tyfactory : newtyvar
     ty = _run_mutation_inference(ctx, tree, type_ctx, factory, meta)
     ty isa Err && return ty
+    if ty isa Ty
+        target_copy = TypeSystem._query_copy(
+            env.target_ty,
+            factory,
+            Dict{TypeSystem.TyVar,TypeSystem.TyVar}(),
+        )
+        matched = TypeSystem.unify!(ty, target_copy)
+        matched isa Err && return matched
+    end
     env.meta = meta
     p.sites_all = _collect_sites(tree, meta, ctx, env.target_ty)
     for s in p.sites_all
@@ -942,6 +1000,13 @@ Notes
 struct WeightedPairChooser <: AbstractPairChooser
     weights::Dict{Type,Float64}
     cache_eligibility::Bool
+    function WeightedPairChooser(weights::Dict{Type,Float64}, cache_eligibility::Bool)
+        for weight in values(weights)
+            isfinite(weight) && weight >= 0 ||
+                throw(ArgumentError("mutation weights must be finite and non-negative"))
+        end
+        return new(weights, cache_eligibility)
+    end
 end
 
 function _normalize_mutation_weights(weights)
@@ -953,7 +1018,11 @@ function _normalize_mutation_weights(weights)
         weight isa Real || throw(ArgumentError(
             "mutation weights must be real, got $(repr(weight))",
         ))
-        normalized[mutation_type] = Float64(weight)
+        normalized_weight = Float64(weight)
+        isfinite(normalized_weight) && normalized_weight >= 0 || throw(ArgumentError(
+            "mutation weights must be finite and non-negative, got $(repr(weight))",
+        ))
+        normalized[mutation_type] = normalized_weight
     end
     return normalized
 end
@@ -1010,9 +1079,11 @@ function _eligible_sites(m::AbstractMutation, provider::AbstractSiteProvider, en
     for s in candidates
         is_site_eligible(m, s, env, ctx) || continue
         w = site_weight(m, s, env, ctx)
+        w isa Real && isfinite(w) && w >= 0 ||
+            throw(ArgumentError("site_weight must return a finite non-negative real"))
         w > 0 || continue
         push!(eligible, s)
-        push!(weights, w)
+        push!(weights, Float64(w))
     end
     res = (eligible, weights)
     env.cache_eligibility && (env.eligibility_cache[m] = res)
@@ -1039,7 +1110,12 @@ function choose_pair(chooser::WeightedPairChooser,
             push!(payloads, (m, eligible, wts))
             continue
         end
-        mass = _mutation_weight(chooser, m, base_weight(m, ctx)) * sum(wts) * _success_hint(env, m)
+        coarse_weight = _mutation_weight(chooser, m, base_weight(m, ctx))
+        isfinite(coarse_weight) && coarse_weight >= 0 ||
+            throw(ArgumentError("mutation base weight must be finite and non-negative"))
+        mass = coarse_weight * sum(wts) * _success_hint(env, m)
+        isfinite(mass) && mass >= 0 ||
+            throw(ArgumentError("mutation selection mass must be finite and non-negative"))
         push!(masses, mass)
         push!(payloads, (m, eligible, wts))
     end
@@ -1165,6 +1241,49 @@ end
 
 site_selection_weight(policy::PathSiteSelectionPolicy, site::Site, ::MutationEnv, ::NamedTuple) =
     site.path == policy.path ? 1.0 : 0.0
+
+"""
+    LocalCallSiteSelectionPolicy(base=ExponentialSiteSelectionPolicy(); multiplier=16)
+
+Multiply the base weight of an application whose left spine is headed by a
+local `IndexNode`. This is a generic higher-order call-result preference: it
+does not distinguish ordinary function arguments from recursive self binders.
+"""
+struct LocalCallSiteSelectionPolicy{P<:AbstractSiteSelectionPolicy} <: AbstractSiteSelectionPolicy
+    base::P
+    multiplier::Float64
+end
+
+function LocalCallSiteSelectionPolicy(
+    base::AbstractSiteSelectionPolicy=ExponentialSiteSelectionPolicy();
+    multiplier::Real=16.0,
+)
+    value = Float64(multiplier)
+    isfinite(value) && value >= 0 || throw(ArgumentError(
+        "local-call multiplier must be finite and non-negative",
+    ))
+    return LocalCallSiteSelectionPolicy(base, value)
+end
+
+function _application_spine_head(node::AstNode)
+    current = node
+    while current isa AppNode
+        current = current.func
+    end
+    return current
+end
+
+function site_selection_weight(
+    policy::LocalCallSiteSelectionPolicy,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+)
+    weight = site_selection_weight(policy.base, site, env, ctx)
+    site.node isa AppNode || return weight
+    return _application_spine_head(site.node) isa IndexNode ?
+        weight * policy.multiplier : weight
+end
 
 site_selection_weight(::AbstractSiteSelectionPolicy, ::Site, ::MutationEnv, ::NamedTuple) = 1.0
 
@@ -1402,6 +1521,339 @@ function apply(m::SubtreeReplacementMutation, tree::AstTree, site::Site, env::Mu
     )
 
     _replace_site!(tree, site, replacement)
+    return tree
+end
+
+"""
+    ContextualExpansionMutation(; site_selection, replacement_generator, generation_kwargs)
+
+Grow a selected `S : A` into the typed let-like context
+`(λseed. C[seed]) S`, where the injected scoped generator constructs
+`C[seed] : A` and must use the new innermost binder. This supplies a bounded
+composition step that ordinary finite witness generation and plain subtree
+replacement do not provide on their own.
+
+The generated context sees `seed` as De Bruijn index zero followed by the
+binders already visible at the selected site. Procedural generators remain
+injectable, but contexts whose use of `seed` is hidden below a non-core binder
+are conservatively rejected; final injected inference is still authoritative.
+"""
+struct ContextualExpansionMutation <: AbstractMutation
+    site_selection::AbstractSiteSelectionPolicy
+    replacement_generator::AbstractReplacementGenerator
+    generation_kwargs::NamedTuple
+end
+
+function ContextualExpansionMutation(;
+    site_selection::AbstractSiteSelectionPolicy=ExponentialSiteSelectionPolicy(),
+    replacement_generator::AbstractReplacementGenerator=CanonicalReplacementGenerator(),
+    generation_kwargs::NamedTuple=(;
+        sampling_depth_limit=2,
+        sampling_node_budget=24,
+        guarded_expansion_depth=0,
+    ),
+)
+    return ContextualExpansionMutation(
+        site_selection,
+        replacement_generator,
+        generation_kwargs,
+    )
+end
+
+required_site_kinds(::ContextualExpansionMutation) = Symbol[:any]
+base_weight(::ContextualExpansionMutation, ::NamedTuple) = 0.08
+
+function is_site_eligible(
+    mutation::ContextualExpansionMutation,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+)
+    _generation_closed_type(site.ty) || return false
+    return site_selection_weight(mutation.site_selection, site, env, ctx) > 0
+end
+
+site_weight(
+    mutation::ContextualExpansionMutation,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+) = site_selection_weight(mutation.site_selection, site, env, ctx)
+
+function _uses_context_binder(node::AstNode, depth::Int=0)::Bool
+    if node isa IndexNode
+        return node.index == depth
+    elseif node isa AbsNode
+        return _uses_context_binder(node.body, depth + 1)
+    elseif node isa AppNode
+        return _uses_context_binder(node.func, depth) ||
+               _uses_context_binder(node.arg, depth)
+    end
+    return false
+end
+
+function apply(
+    mutation::ContextualExpansionMutation,
+    tree::AstTree,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+)
+    context_site = Site(
+        site.path,
+        site.node,
+        site.parent,
+        site.child_index,
+        site.depth + 1,
+        site.kind,
+        site.ty,
+        Ty[site.binder_types; site.ty],
+    )
+    result = generate_replacement(
+        mutation.replacement_generator,
+        context_site,
+        env,
+        ctx,
+        mutation.generation_kwargs,
+    )
+    result isa Err && return result
+    result isa GenerationResult || return Err(ArgumentError(
+        "context generator must return GenerationResult or Err",
+    ))
+
+    context = deepcopy(result.tree)
+    _uses_context_binder(context.root) || return Err(NoEligibleSiteErr())
+    context.root == IndexNode(0) && return Err(NoEligibleSiteErr())
+    _merge_replacement_consts!(
+        context,
+        copy(result.local_consts),
+        copy(result.local_const_types),
+        ctx.local_consts,
+        ctx.local_consts_ty;
+        reserved_consts=ctx.global_consts,
+        reserved_const_types=ctx.global_consts_ty,
+    )
+
+    expanded = AstTree(AppNode(
+        AbsNode(:seed, context.root),
+        deepcopy(site.node),
+    ))
+    _replace_site!(tree, site, expanded)
+    return tree
+end
+
+"""
+    UnaryCompositionMutation(; site_selection)
+
+Wrap a selected closed-typed subtree `S : T` with a monomorphic global
+endomorphism `H : T → T`, producing `H S`. This is the direct bounded
+neighborhood for productive unary operators such as square, square root, or a
+shape-specific tensor transform. Polymorphic and local heads remain outside
+this operator; final injected inference still validates the complete tree.
+"""
+struct UnaryCompositionMutation{S} <: AbstractMutation
+    site_selection::S
+end
+
+UnaryCompositionMutation(;
+    site_selection::AbstractSiteSelectionPolicy=ExponentialSiteSelectionPolicy(
+        scope_bias=0.0,
+        path_bias=-0.02,
+    ),
+) = UnaryCompositionMutation(site_selection)
+
+required_site_kinds(::UnaryCompositionMutation) = Symbol[:any]
+base_weight(::UnaryCompositionMutation, ::NamedTuple) = 0.08
+
+function _unary_composition_options(site::Site, ctx::NamedTuple)
+    _generation_closed_type(site.ty) || return Symbol[]
+    haskey(ctx, :global_consts) || return Symbol[]
+    haskey(ctx, :global_consts_ty) || return Symbol[]
+    options = Symbol[]
+    for name in sort!(collect(keys(ctx.global_consts_ty)))
+        haskey(ctx.global_consts, name) || continue
+        raw = ctx.global_consts_ty[name]
+        raw isa Ty || continue
+        arrow = TypeSystem.prune(raw)
+        arrow isa TyFun || continue
+        argument_ty = TypeSystem.prune(arrow.arg)
+        result_ty = TypeSystem.prune(arrow.res)
+        argument_ty isa Ty && result_ty isa Ty || continue
+        _same_composition_type(argument_ty, site.ty) || continue
+        _same_composition_type(result_ty, site.ty) || continue
+        push!(options, name)
+    end
+    return options
+end
+
+function is_site_eligible(
+    mutation::UnaryCompositionMutation,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+)
+    site_selection_weight(mutation.site_selection, site, env, ctx) > 0 || return false
+    return !isempty(_unary_composition_options(site, ctx))
+end
+
+site_weight(
+    mutation::UnaryCompositionMutation,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+) = site_selection_weight(mutation.site_selection, site, env, ctx)
+
+function apply(
+    ::UnaryCompositionMutation,
+    tree::AstTree,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+)
+    options = _unary_composition_options(site, ctx)
+    isempty(options) && return Err(NoEligibleSiteErr())
+    wrapped = AppNode(ConstNode(rand(env.rng, options)), deepcopy(site.node))
+    _replace_site!(tree, site, AstTree(wrapped))
+    return tree
+end
+
+"""
+    BinaryCompositionMutation(; site_selection, replacement_generator, generation_kwargs)
+
+Compose an existing closed-typed subtree `S : T` with one generated sibling
+through a monomorphic curried global head. A candidate head has type
+`A → B → T`; when `S` matches `A` the rewrite is `H S G`, and when it
+matches `B` the rewrite is `H G S`. `G` is generated under the exact lexical
+scope visible at `S`.
+
+This is a semantic search move for preserving one useful branch while adding a
+second typed branch. It does not recognize operator names or algebraic laws;
+noncommutative heads retain independently selectable left/right orientations.
+Polymorphic heads are deliberately excluded until their instantiation contract
+can be represented without leaking query-local metas.
+"""
+struct BinaryCompositionMutation{S,G} <: AbstractMutation
+    site_selection::S
+    replacement_generator::G
+    generation_kwargs::NamedTuple
+end
+
+function BinaryCompositionMutation(;
+    site_selection::AbstractSiteSelectionPolicy=ExponentialSiteSelectionPolicy(),
+    replacement_generator::AbstractReplacementGenerator=CanonicalReplacementGenerator(),
+    generation_kwargs::NamedTuple=(;
+        sampling_depth_limit=2,
+        sampling_node_budget=24,
+        guarded_expansion_depth=0,
+    ),
+)
+    return BinaryCompositionMutation(
+        site_selection,
+        replacement_generator,
+        generation_kwargs,
+    )
+end
+
+required_site_kinds(::BinaryCompositionMutation) = Symbol[:any]
+base_weight(::BinaryCompositionMutation, ::NamedTuple) = 0.08
+
+_same_composition_type(left::Ty, right::Ty) =
+    iscompatible(left, right) && iscompatible(right, left)
+
+function _binary_composition_options(site::Site, ctx::NamedTuple)
+    _generation_closed_type(site.ty) || return NamedTuple[]
+    haskey(ctx, :global_consts) || return NamedTuple[]
+    haskey(ctx, :global_consts_ty) || return NamedTuple[]
+    options = NamedTuple[]
+    for name in sort!(collect(keys(ctx.global_consts_ty)))
+        haskey(ctx.global_consts, name) || continue
+        raw = ctx.global_consts_ty[name]
+        raw isa Ty || continue
+        first_arrow = TypeSystem.prune(raw)
+        first_arrow isa TyFun || continue
+        second_arrow = TypeSystem.prune(first_arrow.res)
+        second_arrow isa TyFun || continue
+        result_ty = TypeSystem.prune(second_arrow.res)
+        result_ty isa Ty || continue
+        _same_composition_type(result_ty, site.ty) || continue
+
+        left_ty = TypeSystem.prune(first_arrow.arg)
+        right_ty = TypeSystem.prune(second_arrow.arg)
+        if left_ty isa Ty && _generation_closed_type(right_ty) &&
+                _same_composition_type(left_ty, site.ty)
+            push!(options, (; name, sibling_ty=right_ty, seed_first=true))
+        end
+        if right_ty isa Ty && _generation_closed_type(left_ty) &&
+                _same_composition_type(right_ty, site.ty)
+            push!(options, (; name, sibling_ty=left_ty, seed_first=false))
+        end
+    end
+    return options
+end
+
+function is_site_eligible(
+    mutation::BinaryCompositionMutation,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+)
+    site_selection_weight(mutation.site_selection, site, env, ctx) > 0 || return false
+    return !isempty(_binary_composition_options(site, ctx))
+end
+
+site_weight(
+    mutation::BinaryCompositionMutation,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+) = site_selection_weight(mutation.site_selection, site, env, ctx)
+
+function apply(
+    mutation::BinaryCompositionMutation,
+    tree::AstTree,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+)
+    options = _binary_composition_options(site, ctx)
+    isempty(options) && return Err(NoEligibleSiteErr())
+    option = rand(env.rng, options)
+    sibling_site = Site(
+        site.path,
+        site.node,
+        site.parent,
+        site.child_index,
+        site.depth,
+        site.kind,
+        option.sibling_ty,
+        site.binder_types,
+    )
+    result = generate_replacement(
+        mutation.replacement_generator,
+        sibling_site,
+        env,
+        ctx,
+        mutation.generation_kwargs,
+    )
+    result isa Err && return result
+    result isa GenerationResult || return Err(ArgumentError(
+        "binary composition generator must return GenerationResult or Err",
+    ))
+
+    sibling = deepcopy(result.tree)
+    _merge_replacement_consts!(
+        sibling,
+        copy(result.local_consts),
+        copy(result.local_const_types),
+        ctx.local_consts,
+        ctx.local_consts_ty;
+        reserved_consts=ctx.global_consts,
+        reserved_const_types=ctx.global_consts_ty,
+    )
+    seed = deepcopy(site.node)
+    left, right = option.seed_first ? (seed, sibling.root) : (sibling.root, seed)
+    composed = AppNode(AppNode(ConstNode(option.name), left), right)
+    _replace_site!(tree, site, AstTree(composed))
     return tree
 end
 
@@ -2021,7 +2473,7 @@ Inverse commuting conversion for `COND` (push application into both branches):
 
 `(COND b f g) x`  ↦  `COND b (f x) (g x)`
 
-This can increase tree size; it is *not* enabled by default in `_default_mutations()`.
+This can increase tree size; it is *not* enabled by default in `default_mutations()`.
 
 Eligibility: matches the literal application spine `(((COND b) f) g) x`.
 """
@@ -2110,7 +2562,8 @@ function _count_nodes(tree::AstTree)
     return c
 end
 
-function _default_mutations()
+"""Return a fresh authoritative baseline mutation set."""
+function default_mutations()
     return AbstractMutation[
         ScalarConstMutation(),
         BoolConstMutation(),
@@ -2159,7 +2612,7 @@ Returns `Err(MaxTryReachedErr())` if no valid mutation can be found within `max_
 """
 function mutate_tree(tree::AstTree, target_ty::Ty;
     rng::AbstractRNG=MersenneTwister(2000),
-    mutations::Vector{<:AbstractMutation}=_default_mutations(),
+    mutations::Vector{<:AbstractMutation}=default_mutations(),
     chooser::AbstractPairChooser=WeightedPairChooser(),
     provider::AbstractSiteProvider=IndexedProvider(),
     max_try::Int=20,
@@ -2254,6 +2707,17 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
                 record!(recorder, typeof(m), :apply_err; err_type=typeof(mutated.value))
             end
             continue
+        end
+
+        if bloat_policy.enabled
+            before_nodes = length(current_tree)
+            after_nodes = length(attempt_tree)
+            if after_nodes > bloat_policy.max_nodes ||
+               after_nodes - before_nodes > bloat_policy.max_nodes_delta
+                _update_stat!(env, m, false)
+                record!(recorder, typeof(m), :bloat_exceeded; err_type=BloatExceededErr)
+                continue
+            end
         end
 
         prune_consts && prune_local_consts!(attempt_tree, attempt_local_consts, attempt_local_consts_ty)
@@ -3506,7 +3970,7 @@ end
     local_consts_ty = Dict{Symbol,TyLike}(name => FloatTy)
     tree = AstTree(ConstNode(name))
 
-    rec = MutationAttemptRecorder()
+    rec = MutationAttemptRecorder(record_error_types=true)
     mutated = mutate_tree(
         tree,
         FloatTy;
@@ -3530,6 +3994,304 @@ end
     @test length(s.per_mutation) >= 1
     @test s.per_mutation[1].mutation_type == BoolConstMutation
     @test s.per_mutation[1].counts.apply_err == 7
+    @test s.error_types == [(
+        error_type=LambdaRegression.Mutations.UnsupportedConstTyErr,
+        count=7,
+    )]
+end
+
+@testitem "Mutations ContextualExpansionMutation composes around an existing subtree" setup=[MutBaseImports] begin
+    using LambdaRegression.CanonicalGeneration: GenerationResult
+    using LambdaRegression.Mutations: ContextualExpansionMutation, PathSiteSelectionPolicy
+    using LambdaRegression.Mutations: AbstractReplacementGenerator, generate_replacement
+    using LambdaRegression.TypeSystem: FADD, get_type_ctx
+
+    struct AddSeedContext <: AbstractReplacementGenerator end
+    function LambdaRegression.Mutations.generate_replacement(
+        ::AddSeedContext,
+        site::LambdaRegression.Mutations.Site,
+        ::LambdaRegression.Mutations.MutationEnv,
+        ctx::NamedTuple,
+        ::NamedTuple,
+    )
+        @test site.binder_types == [FloatTy, FloatTy]
+        body = AppNode(
+            AppNode(ConstNode(:FADD), IndexNode(0)),
+            IndexNode(1),
+        )
+        return GenerationResult(
+            AstTree(body),
+            site.ty,
+            copy(ctx.local_consts),
+            copy(ctx.local_consts_ty),
+            Dict{Symbol,Any}(),
+        )
+    end
+
+    tree = AstTree(AbsNode(:x, IndexNode(0)))
+    target_ty = TyFun(FloatTy, FloatTy)
+    global_consts = Dict{Symbol,Any}(:FADD => FADD)
+    global_consts_ty = get_type_ctx(global_consts)
+    mutation = ContextualExpansionMutation(
+        site_selection=PathSiteSelectionPolicy(Int[1]),
+        replacement_generator=AddSeedContext(),
+    )
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(555),
+        global_consts,
+        global_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(
+            weights=Dict{Type,Float64}(ContextualExpansionMutation => 1.0),
+        ),
+        provider=IndexedProvider(),
+        max_try=1,
+    )
+
+    @test mutated isa AstTree
+    @test length(mutated) > length(tree)
+    @test mutated.root.body == AppNode(
+        AbsNode(
+            :seed,
+            AppNode(
+                AppNode(ConstNode(:FADD), IndexNode(0)),
+                IndexNode(1),
+            ),
+        ),
+        IndexNode(0),
+    )
+    @test iscompatible(infer(mutated, global_consts_ty), target_ty)
+end
+
+@testitem "Mutations UnaryCompositionMutation wraps a typed endomorphism" setup=[MutBaseImports] begin
+    using LambdaRegression.Mutations: PathSiteSelectionPolicy, UnaryCompositionMutation
+    using LambdaRegression.TypeSystem: SQR, get_type_ctx
+
+    tree = AstTree(AbsNode(:x, IndexNode(0)))
+    target_ty = TyFun(FloatTy, FloatTy)
+    globals = Dict{Symbol,Any}(:SQR => SQR)
+    mutation = UnaryCompositionMutation(
+        site_selection=PathSiteSelectionPolicy(Int[1]),
+    )
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(2000),
+        global_consts=globals,
+        global_consts_ty=get_type_ctx(globals),
+        mutations=[mutation],
+        chooser=WeightedPairChooser(
+            weights=Dict{Type,Float64}(UnaryCompositionMutation => 1.0),
+        ),
+        provider=IndexedProvider(),
+        max_try=1,
+    )
+
+    @test mutated isa AstTree
+    @test mutated.root.body == AppNode(ConstNode(:SQR), IndexNode(0))
+    @test iscompatible(infer(mutated, get_type_ctx(globals)), target_ty)
+end
+
+@testitem "Mutations BinaryCompositionMutation preserves a typed seed branch" setup=[MutBaseImports] begin
+    using LambdaRegression.CanonicalGeneration: GenerationResult
+    using LambdaRegression.Mutations:
+        AbstractReplacementGenerator,
+        BinaryCompositionMutation,
+        PathSiteSelectionPolicy
+    using LambdaRegression.TypeSystem: FADD, SQR, get_type_ctx
+
+    struct OneSibling <: AbstractReplacementGenerator end
+    function LambdaRegression.Mutations.generate_replacement(
+        ::OneSibling,
+        site::LambdaRegression.Mutations.Site,
+        ::LambdaRegression.Mutations.MutationEnv,
+        ::NamedTuple,
+        ::NamedTuple,
+    )
+        @test site.ty === FloatTy
+        return GenerationResult(
+            AstTree(ConstNode(:ONE)),
+            FloatTy,
+            Dict{Symbol,Any}(),
+            Dict{Symbol,TyLike}(),
+            Dict{Symbol,Any}(),
+        )
+    end
+
+    tree = AstTree(AbsNode(:x, AppNode(ConstNode(:SQR), IndexNode(0))))
+    target_ty = TyFun(FloatTy, FloatTy)
+    global_consts = Dict{Symbol,Any}(:FADD => FADD, :SQR => SQR, :ONE => 1.0)
+    global_consts_ty = get_type_ctx(global_consts)
+    mutation = BinaryCompositionMutation(
+        site_selection=PathSiteSelectionPolicy(Int[1]),
+        replacement_generator=OneSibling(),
+    )
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(1111),
+        global_consts,
+        global_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(
+            weights=Dict{Type,Float64}(BinaryCompositionMutation => 1.0),
+        ),
+        provider=IndexedProvider(),
+        max_try=1,
+    )
+
+    @test mutated isa AstTree
+    names = Symbol[node.name for node in mutated if node isa ConstNode]
+    @test :FADD in names
+    @test :SQR in names
+    @test :ONE in names
+    @test length(mutated) == length(tree) + 4
+    @test iscompatible(infer(mutated, global_consts_ty), target_ty)
+end
+
+@testitem "Mutations target-grounded sites compose inside FunctionDef" setup=[MutBaseImports] begin
+    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression.Mutations:
+        BinaryCompositionMutation,
+        PathSiteSelectionPolicy,
+        ScopedReplacementGenerator
+    using LambdaRegression.TypeSystem:
+        FADD,
+        UNCONS_CASE,
+        TyList,
+        get_type_ctx
+
+    on_item = AbsNode(
+        :head,
+        AbsNode(:tail, AppNode(IndexNode(3), IndexNode(0))),
+    )
+    fallback = AppNode(
+        AppNode(ConstNode(:FADD), ConstNode(:ONE)),
+        ConstNode(:ONE),
+    )
+    tree = AstTree(Procedural.FunctionDefNode(AbsNode(
+        :series,
+        AppNode(
+            AppNode(
+                AppNode(ConstNode(:UNCONS_CASE), IndexNode(0)),
+                on_item,
+            ),
+            fallback,
+        ),
+    )))
+    target_ty = TyFun(TyList(FloatTy), FloatTy)
+    global_consts = Dict{Symbol,Any}(
+        :UNCONS_CASE => UNCONS_CASE,
+        :FADD => FADD,
+        :ONE => 1.0,
+        :ZERO => 0.0,
+    )
+    global_consts_ty = get_type_ctx(global_consts)
+    mutation = BinaryCompositionMutation(
+        site_selection=PathSiteSelectionPolicy(Int[1, 1, 1, 2, 1, 1]),
+        replacement_generator=ScopedReplacementGenerator(
+            Procedural.generate_procedural_scoped;
+            include_local_consts=true,
+        ),
+        generation_kwargs=(;
+            providers=(
+                CanonicalGeneration.default_head_providers()...,
+                CanonicalGeneration.SafeListAccessProvider(),
+            ),
+            sampling_depth_limit=3,
+            sampling_node_budget=24,
+            guarded_expansion_depth=1,
+        ),
+    )
+    checker = (candidate, ctx, factory, meta) ->
+        Procedural.infer_procedural(candidate, ctx; factory, meta)
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(1),
+        global_consts,
+        global_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(
+            weights=Dict{Type,Float64}(BinaryCompositionMutation => 1.0),
+        ),
+        provider=IndexedProvider(),
+        max_try=5,
+        type_inference=checker,
+    )
+
+    @test mutated isa AstTree
+    inferred = Procedural.infer_procedural(mutated, global_consts_ty)
+    @test !(inferred isa Err)
+    @test iscompatible(inferred, target_ty)
+    @test count(
+        node -> node isa ConstNode && node.name === :FADD,
+        mutated,
+    ) >= 2
+end
+
+_default_mutations() = default_mutations()
+
+@testitem "Mutations bloat policy rejects growth transactionally" setup=[MutBaseImports] begin
+    struct DeterministicGrowMutation <: LambdaRegression.Mutations.AbstractMutation end
+    function LambdaRegression.Mutations.apply(
+        ::DeterministicGrowMutation,
+        tree::AstTree,
+        ::LambdaRegression.Mutations.Site,
+        ::Any,
+        ::NamedTuple,
+    )
+        tree.root = AppNode(AbsNode(:ignored, tree.root), ConstNode(:k))
+        return tree
+    end
+
+    parent = AstTree(ConstNode(:k))
+    local_consts = Dict{Symbol,Any}(:k => 1.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy)
+    original_consts = copy(local_consts)
+    original_types = copy(local_consts_ty)
+    recorder = MutationAttemptRecorder()
+
+    result = mutate_tree(
+        parent,
+        FloatTy;
+        rng=MersenneTwister(2000),
+        local_consts=local_consts,
+        local_consts_ty=local_consts_ty,
+        mutations=[DeterministicGrowMutation()],
+        chooser=WeightedPairChooser(weights=Dict{DataType,Float64}(DeterministicGrowMutation => 1.0)),
+        provider=IndexedProvider(),
+        max_try=2,
+        prune_consts=false,
+        bloat_policy=LambdaRegression.Mutations.BloatPolicy(enabled=true, max_nodes=1, max_nodes_delta=0),
+        recorder=recorder,
+    )
+
+    @test result isa Err
+    @test parent == AstTree(ConstNode(:k))
+    @test local_consts == original_consts
+    @test local_consts_ty == original_types
+    summary = mutation_recorder_summary(recorder)
+    @test summary.totals.bloat_exceeded == 2
+    @test summary.totals.max_try_exhausted == 1
+end
+
+@testitem "Mutations policies reject invalid numeric configuration" setup=[MutBaseImports] begin
+    @test_throws ArgumentError WeightedPairChooser(
+        weights=Dict{DataType,Float64}(ScalarConstMutation => NaN),
+    )
+    @test_throws ArgumentError LambdaRegression.Mutations.BloatPolicy(max_nodes=0)
+    @test_throws ArgumentError LambdaRegression.Mutations.BloatPolicy(max_nodes_delta=-1)
+    @test_throws ArgumentError LambdaRegression.Mutations.BloatPolicy(true, 0, 0)
+    @test_throws ArgumentError LambdaRegression.Mutations.AdaptivePolicy(ewma_alpha=0.0)
+    @test_throws ArgumentError LambdaRegression.Mutations.AdaptivePolicy(floor=Inf)
+    @test_throws ArgumentError LambdaRegression.Mutations.AdaptivePolicy(true, 2.0, 0.1)
+    @test_throws ArgumentError LambdaRegression.Mutations.WeightedPairChooser(
+        Dict{Type,Float64}(ScalarConstMutation => Inf),
+        false,
+    )
 end
 
 end # module Mutations

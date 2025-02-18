@@ -106,3 +106,129 @@ function functiondef_recursion_summary(term::Union{AstNode,AstTree})
         self_calls=sum(item -> item.self_calls, observations; init=0),
     )
 end
+
+function _functiondef_obvious_loop_reason(node::FunctionDefNode)
+    body = node.body
+    body isa IndexNode && body.index == 0 && return :direct_self
+
+    lambda_count = 0
+    current = body
+    while current isa AbsNode
+        lambda_count += 1
+        current = current.body
+    end
+    if lambda_count > 0 && current isa AppNode
+        head, reverse_arguments = _application_spine(current)
+        if head isa IndexNode && head.index == lambda_count &&
+           length(reverse_arguments) == lambda_count &&
+           all(enumerate(reverse_arguments)) do (position, argument)
+               argument isa IndexNode && argument.index == position - 1
+           end
+            return :eta_self_forwarding
+        end
+        head isa IndexNode && head.index == lambda_count &&
+            !isempty(reverse_arguments) && return :unconditional_self_call
+    end
+    _functiondef_unchanged_self_call(node) && return :unchanged_self_call
+    return nothing
+end
+
+function _has_unchanged_self_call_node(
+    node::AstNode,
+    self_index::Int,
+    parameter_indices::Vector{Int},
+)
+    if node isa AppNode
+        head, reverse_arguments = _application_spine(node)
+        if head isa IndexNode && head.index == self_index &&
+           length(reverse_arguments) == length(parameter_indices) &&
+           all(zip(reverse_arguments, parameter_indices)) do (argument, expected)
+               argument isa IndexNode && argument.index == expected
+           end
+            return true
+        end
+        return _has_unchanged_self_call_node(
+            node.func,
+            self_index,
+            parameter_indices,
+        ) || _has_unchanged_self_call_node(
+            node.arg,
+            self_index,
+            parameter_indices,
+        )
+    elseif node isa AbsNode
+        return false
+    elseif node isa LetNode
+        return _has_unchanged_self_call_node(
+            node.value,
+            self_index,
+            parameter_indices,
+        ) || _has_unchanged_self_call_node(
+            node.body,
+            self_index + 1,
+            parameter_indices .+ 1,
+        )
+    elseif node isa ScopeNode
+        for (offset, binding) in enumerate(node.bindings)
+            _has_unchanged_self_call_node(
+                binding,
+                self_index + offset - 1,
+                parameter_indices .+ (offset - 1),
+            ) && return true
+        end
+        return _has_unchanged_self_call_node(
+            node.body,
+            self_index + length(node.bindings),
+            parameter_indices .+ length(node.bindings),
+        )
+    elseif node isa FunctionDefNode
+        return false
+    end
+    return any(children(node)) do child
+        _has_unchanged_self_call_node(child, self_index, parameter_indices)
+    end
+end
+
+function _functiondef_unchanged_self_call(node::FunctionDefNode)
+    current = node.body
+    lambda_count = 0
+    while current isa AbsNode
+        lambda_count += 1
+        current = current.body
+    end
+    lambda_count > 0 || return false
+    return _has_unchanged_self_call_node(
+        current,
+        lambda_count,
+        collect(0:(lambda_count - 1)),
+    )
+end
+
+function _obvious_functiondef_loop_reason(node::AstNode)
+    if node isa FunctionDefNode
+        reason = _functiondef_obvious_loop_reason(node)
+        reason === nothing || return reason
+    end
+    for child in children(node)
+        reason = _obvious_functiondef_loop_reason(child)
+        reason === nothing || return reason
+    end
+    return nothing
+end
+
+"""
+    obvious_functiondef_loop_reason(term) -> Union{Nothing,Symbol}
+
+Return a stable reason for the deliberately small set of syntactically certain
+FunctionDef loops recognized after arbitrary variation: `:direct_self` and
+finite `:eta_self_forwarding`, `:unconditional_self_call` for a body that is
+only a self call after its lambda prefix, plus `:unchanged_self_call` when a
+recursive call reuses every function argument unchanged in a strict expression
+context outside nested lambda or FunctionDef values.
+`nothing` means only that this cheap filter found no such shape; it is not a
+termination proof.
+"""
+obvious_functiondef_loop_reason(node::AstNode) =
+    _obvious_functiondef_loop_reason(node)
+obvious_functiondef_loop_reason(tree::AstTree) =
+    obvious_functiondef_loop_reason(tree.root)

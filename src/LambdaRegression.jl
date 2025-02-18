@@ -46,6 +46,12 @@ include("regression/Regression.jl")
 using .Regression
 export Regression
 using .Regression: Regressor, SupervisedDataset, FitResult, fit!, default_config, default_components, default_regressor
+using .Regression: PreparedDefaultEvaluator, prepare_default_evaluator, evaluate_default
+using .Regression: TensorSchema, TensorSeries, SeriesTask, series_task
+using .Regression: series_mse, series_components, series_regressor
 export Regressor, SupervisedDataset, FitResult, fit!, default_config, default_components, default_regressor
+export PreparedDefaultEvaluator, prepare_default_evaluator, evaluate_default
+export TensorSchema, TensorSeries, SeriesTask, series_task
+export series_mse, series_components, series_regressor
 
 end # module LambdaRegression

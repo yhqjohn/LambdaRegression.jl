@@ -15,10 +15,11 @@ using TestItems
 
 using ...Utils: Err
 using ...TypeSystem:
-    Ty, TyLike, TyFun, TyRigid, TyScheme, _inst, collect_free_vars, generalize,
+    Ty, TyLike, TyVar, TyFun, TyRigid, TyScheme, _inst, collect_free_vars, generalize,
     infer, iscompatible, isequal_mu, make_tyvar_factory, semantic_typekey
 using ...ASTs.NodeASTs:
-    AstTree, AstNode, AbsNode, AppNode, ConstNode, IndexNode, ScopeState, VarNode, children
+    AstTree, AstNode, AbsNode, AppNode, ConstNode, IndexNode, LetNode,
+    ScopeState, VarNode, children
 using ...ASTs.Contexts: ConstSymbolFactory
 using ...Trees: traverse, PointerState, getstate, setroot!, setchild!
 import ..Mutations: _application_roles_stable, _resolve_scoped, _retained_application_ancestors
@@ -27,7 +28,9 @@ export AbstractCrossoverSelectionPolicy, UniformCrossoverSelectionPolicy
 export CrossoverSite, PathCrossoverSelectionPolicy
 export crossover_site_weight, crossover_pair_weight
 export TypedSubtreeSwapCrossover, CrossoverPairPoolExhaustedErr
-export NoEligibleCrossoverPairErr, UnsupportedCrossoverNodeErr
+export NoEligibleCrossoverPairErr
+export CrossoverAnswerBudgetExhaustedErr
+export recombine
 
 struct TargetTypeMismatchErr
     a::Ty
@@ -46,34 +49,22 @@ end
 struct CrossoverMaxTryReachedErr
     max_try::Int
 end
-struct UnsupportedCrossoverNodeErr
-    path::Vector{Int}
-    node_type::DataType
-end
-
-function _unsupported_crossover_node(
-    node::AstNode,
-    path::Vector{Int}=Int[],
-)::Union{Nothing,UnsupportedCrossoverNodeErr}
-    if node isa ConstNode || node isa VarNode || node isa IndexNode
-        return nothing
-    elseif node isa AbsNode
-        return _unsupported_crossover_node(node.body, [path; 1])
-    elseif node isa AppNode
-        unsupported = _unsupported_crossover_node(node.func, [path; 1])
-        unsupported === nothing || return unsupported
-        return _unsupported_crossover_node(node.arg, [path; 2])
+struct CrossoverAnswerBudgetExhaustedErr
+    limit::Int
+    function CrossoverAnswerBudgetExhaustedErr(limit::Int)
+        limit >= 1 || throw(ArgumentError("answer budget must be positive"))
+        return new(limit)
     end
-    return UnsupportedCrossoverNodeErr(path, typeof(node))
 end
-
 """
     CrossoverSite
 
 Attempt-local read-only routing view for one typed subtree. `path` is the child
 path from the root, `depth` is its visible binder count, `ty` is its inferred
 type, `binder_types` is ordered outermost to innermost, and `capture_levels`
-contains only external De Bruijn levels actually used by the subtree.
+contains only external De Bruijn levels actually used by the subtree. `offer`
+is the reusable upper-bound scheme recorded by inference, while `ty` remains
+the site's demand (the instantiated lower-bound type).
 """
 struct CrossoverSite
     path::Vector{Int}
@@ -81,7 +72,29 @@ struct CrossoverSite
     ty::Ty
     binder_types::Vector{Union{Nothing,TyLike}}
     capture_levels::Vector{Int}
+    offer::TyLike
 end
+
+# Preserve the original five-argument construction convention. Sites produced
+# by `_collect_sites` below use the authoritative upper-bound metadata.
+CrossoverSite(
+    path::Vector{Int},
+    depth::Int,
+    ty::Ty,
+    binder_types::Vector{Union{Nothing,TyLike}},
+    capture_levels::Vector{Int},
+) = CrossoverSite(path, depth, ty, binder_types, capture_levels, ty)
+
+# Accept the natural explicit `(demand, offer, binders, captures)` spelling as
+# well; the stored field order keeps the old positional fields stable.
+CrossoverSite(
+    path::Vector{Int},
+    depth::Int,
+    demand::Ty,
+    offer::TyLike,
+    binder_types::Vector{Union{Nothing,TyLike}},
+    capture_levels::Vector{Int},
+) = CrossoverSite(path, depth, demand, binder_types, capture_levels, offer)
 
 """
 Policy hook for weighting crossover sites and compatible site pairs.
@@ -132,6 +145,14 @@ crossover_pair_weight(
     ::CrossoverSite,
     ::CrossoverSite,
 ) = 1.0
+
+# Built-in policies have factorized pair mass: all pair-specific mass is one,
+# while exact paths are expressed by site weights. Custom policies may encode
+# arbitrary sparse pair relations and therefore require complete pair-weight
+# enumeration before proposal sampling.
+_crossover_pair_weights_factorized(::AbstractCrossoverSelectionPolicy) = false
+_crossover_pair_weights_factorized(::UniformCrossoverSelectionPolicy) = true
+_crossover_pair_weights_factorized(::PathCrossoverSelectionPolicy) = true
 
 function _checked_crossover_weight(weight)::Float64
     value = Float64(weight)
@@ -214,7 +235,10 @@ end
 
 function _collect_sites(tree::AstTree, type_ctx::Dict{Symbol,<:TyLike}; tyfactory)
     meta = Dict{AstNode,Tuple{TyLike,TyLike}}()
-    inferred = infer(tree, type_ctx, tyfactory, meta)
+    # Inference may link monomorphic `TyVar`s stored in a context. Site
+    # collection is observational, so isolate the complete graph while
+    # preserving sharing among context entries.
+    inferred = infer(tree, _detached_type_ctx(type_ctx), tyfactory, meta)
     inferred isa Err && return inferred
     binder_types_by_abstraction = _collect_binder_types(tree, meta)
     capture_levels_by_node = _capture_level_map(tree)
@@ -248,6 +272,7 @@ function _collect_sites(tree::AstTree, type_ctx::Dict{Symbol,<:TyLike}; tyfactor
             node_ty,
             binder_types,
             capture_levels_by_node[node],
+            meta[node][2],
         ))
         return nothing
     end
@@ -438,6 +463,36 @@ function _contextual_node_key(
             _contextual_node_key(app.func, local_consts, local_consts_ty, slots, payloads),
             _contextual_node_key(app.arg, local_consts, local_consts_ty, slots, payloads),
         )
+    elseif node isa LetNode
+        let_node = node::LetNode
+        return (
+            :let,
+            _contextual_node_key(
+                let_node.value,
+                local_consts,
+                local_consts_ty,
+                slots,
+                payloads,
+            ),
+            _contextual_node_key(
+                let_node.body,
+                local_consts,
+                local_consts_ty,
+                slots,
+                payloads,
+            ),
+        )
+    elseif node isa FunctionDefNode
+        return (
+            :function_def,
+            _contextual_node_key(
+                node.body,
+                local_consts,
+                local_consts_ty,
+                slots,
+                payloads,
+            ),
+        )
     end
     throw(ArgumentError("unsupported crossover node $(typeof(node))"))
 end
@@ -519,7 +574,8 @@ end
 """
     TypedSubtreeSwapCrossover(; max_try=40, require_same_depth=true,
         require_compatible_binders=true, min_sites=2, allow_root=true,
-        selection=UniformCrossoverSelectionPolicy()) <: AbstractCrossover
+        selection=UniformCrossoverSelectionPolicy(),
+        max_open_answers_per_pair=8) <: AbstractCrossover
 
 Type-safe subtree swap crossover between two individuals.
 
@@ -530,6 +586,9 @@ This operator:
 - remaps donor-local constants into the recipient's local constant pool using a
   per-call `ConstSymbolFactory` (no `gensym`),
 - validates the offspring types using `infer` + `iscompatible`.
+
+For contextually open donor sites, `max_open_answers_per_pair` bounds the
+number of retrieval witnesses consumed for one site pair (default `8`).
 
 When different depths are allowed, captures retain their De Bruijn level. The
 binder compatibility filter checks only actually captured levels. Compatible
@@ -542,6 +601,7 @@ Thread safety:
 """
 struct TypedSubtreeSwapCrossover <: AbstractCrossover
     max_try::Int
+    max_open_answers_per_pair::Int
     require_same_depth::Bool
     require_compatible_binders::Bool
     min_sites::Int
@@ -555,11 +615,16 @@ struct TypedSubtreeSwapCrossover <: AbstractCrossover
         min_sites::Int,
         allow_root::Bool,
         selection::AbstractCrossoverSelectionPolicy,
+        max_open_answers_per_pair::Int,
     )
         max_try >= 1 || throw(ArgumentError("max_try must be positive"))
         min_sites >= 1 || throw(ArgumentError("min_sites must be positive"))
+        max_open_answers_per_pair >= 1 || throw(ArgumentError(
+            "max_open_answers_per_pair must be positive",
+        ))
         return new(
             max_try,
+            max_open_answers_per_pair,
             require_same_depth,
             require_compatible_binders,
             min_sites,
@@ -575,13 +640,31 @@ TypedSubtreeSwapCrossover(
     require_compatible_binders::Bool,
     min_sites::Int,
     allow_root::Bool,
+    ) = TypedSubtreeSwapCrossover(
+        max_try,
+        require_same_depth,
+        require_compatible_binders,
+        min_sites,
+        allow_root,
+        UniformCrossoverSelectionPolicy(),
+        8,
+    )
+
+TypedSubtreeSwapCrossover(
+    max_try::Int,
+    require_same_depth::Bool,
+    require_compatible_binders::Bool,
+    min_sites::Int,
+    allow_root::Bool,
+    selection::AbstractCrossoverSelectionPolicy,
 ) = TypedSubtreeSwapCrossover(
     max_try,
     require_same_depth,
     require_compatible_binders,
     min_sites,
     allow_root,
-    UniformCrossoverSelectionPolicy(),
+    selection,
+    8,
 )
 
 TypedSubtreeSwapCrossover(;
@@ -591,6 +674,7 @@ TypedSubtreeSwapCrossover(;
     min_sites::Int=2,
     allow_root::Bool=true,
     selection::AbstractCrossoverSelectionPolicy=UniformCrossoverSelectionPolicy(),
+    max_open_answers_per_pair::Int=8,
 ) = TypedSubtreeSwapCrossover(
     max_try,
     require_same_depth,
@@ -598,6 +682,7 @@ TypedSubtreeSwapCrossover(;
     min_sites,
     allow_root,
     selection,
+    max_open_answers_per_pair,
 )
 
 function _same_target_type(a::Ty, b::Ty)
@@ -641,16 +726,6 @@ function crossover(op::TypedSubtreeSwapCrossover,
         return Err(TargetTypeMismatchErr(a.target_ty, b.target_ty))
     global_consts_ty === nothing && return Err(MissingGlobalTypeCtxErr())
 
-    unsupported_a = _unsupported_crossover_node(a.tree.root)
-    unsupported_a === nothing || return Err(unsupported_a)
-    unsupported_b = _unsupported_crossover_node(b.tree.root)
-    unsupported_b === nothing || return Err(unsupported_b)
-
-    scoped_a = _resolve_scoped(a.tree)
-    scoped_a isa Err && return scoped_a
-    scoped_b = _resolve_scoped(b.tree)
-    scoped_b isa Err && return scoped_b
-
     tyfactory = tyfactory_ctor()
 
     # Pre-collect sites using the parents' own local type contexts.
@@ -658,6 +733,11 @@ function crossover(op::TypedSubtreeSwapCrossover,
     sites_a isa Err && return sites_a
     sites_b = _collect_sites(b.tree, merge(global_consts_ty, b.local_consts_ty); tyfactory=tyfactory)
     sites_b isa Err && return sites_b
+
+    scoped_a = _resolve_scoped(a.tree)
+    scoped_a isa Err && return scoped_a
+    scoped_b = _resolve_scoped(b.tree)
+    scoped_b isa Err && return scoped_b
 
     allow_root = op.allow_root
     sites_a2 = allow_root ? sites_a : filter(s -> !isempty(s.path), sites_a)
@@ -817,6 +897,132 @@ end
     using LambdaRegression.TypeSystem: IntTy, TyLike
     using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode, AbsNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
+end
+
+@testitem "Populations recombine is a directed closed public seam" begin
+    using Test
+    using Random
+    using LambdaRegression.Mutations.Populations:
+        Individual,
+        PathCrossoverSelectionPolicy,
+        TypedSubtreeSwapCrossover,
+        recombine
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode,
+        AppNode,
+        AstTree,
+        ConstNode,
+        IndexNode
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer
+    using LambdaRegression.Utils: Err
+
+    int_to_int = TyFun(IntTy, IntTy)
+    global_types = Dict{Symbol,TyLike}(
+        :USEF => TyFun(int_to_int, IntTy),
+        :INC => int_to_int,
+    )
+    recipient = Individual(
+        AstTree(AppNode(ConstNode(:USEF), ConstNode(:INC))),
+        IntTy,
+    )
+    donor = Individual(
+        AstTree(AbsNode(:x, IndexNode(0))),
+        int_to_int,
+    )
+    before_recipient = deepcopy(recipient)
+    before_donor = deepcopy(donor)
+    op = TypedSubtreeSwapCrossover(
+        max_try=1,
+        min_sites=1,
+        selection=PathCrossoverSelectionPolicy([2], Int[]),
+    )
+
+    run_once() = recombine(
+        op,
+        recipient,
+        donor;
+        rng=MersenneTwister(1111),
+        global_consts_ty=global_types,
+    )
+    first = run_once()
+    second = run_once()
+    @test !(first isa Err)
+    @test !(second isa Err)
+    if !(first isa Err) && !(second isa Err)
+        @test first.tree.root == AppNode(
+            ConstNode(:USEF),
+            AbsNode(:x, IndexNode(0)),
+        )
+        @test first.tree == second.tree
+        @test infer(first.tree, global_types) == IntTy
+    end
+    @test recipient.tree == before_recipient.tree
+    @test recipient.local_consts == before_recipient.local_consts
+    @test recipient.local_consts_ty == before_recipient.local_consts_ty
+    @test recipient.target_ty == before_recipient.target_ty
+    @test donor.tree == before_donor.tree
+    @test donor.local_consts == before_donor.local_consts
+    @test donor.local_consts_ty == before_donor.local_consts_ty
+    @test donor.target_ty == before_donor.target_ty
+
+    # Site analysis is observational. A monomorphic variable owned by the
+    # caller's context must not be linked while the recipient is inferred.
+    factory = LambdaRegression.TypeSystem.make_tyvar_factory()
+    caller_owned = factory(0)
+    mutable_global_types = Dict{Symbol,TyLike}(
+        :APPLY => TyFun(caller_owned, IntTy),
+        :ONE => IntTy,
+    )
+    mutable_recipient = Individual(
+        AstTree(AppNode(ConstNode(:APPLY), ConstNode(:ONE))),
+        IntTy,
+    )
+    recombine(
+        TypedSubtreeSwapCrossover(min_sites=1),
+        mutable_recipient,
+        donor;
+        rng=MersenneTwister(1234),
+        global_consts_ty=mutable_global_types,
+    )
+    @test caller_owned.instance === nothing
+end
+
+@testitem "Populations recombine skips excluded mu sites when a finite pair exists" begin
+    using Test
+    using Random
+    using LambdaRegression.ASTs.NodeASTs: AppNode, AstTree, ConstNode
+    using LambdaRegression.Mutations.Populations:
+        Individual, TypedSubtreeSwapCrossover, recombine
+    using LambdaRegression.TypeSystem:
+        IntTy, TyFun, TyLike, TyMu, infer, isequal_mu, make_tyvar_factory
+    using LambdaRegression.Utils: Err
+
+    factory = make_tyvar_factory()
+    recursive = factory(0)
+    mu_type = TyMu(recursive, TyFun(IntTy, recursive))
+    global_types = Dict{Symbol,TyLike}(
+        :WRAP => TyFun(IntTy, mu_type),
+        :ONE => IntTy,
+        :TWO => IntTy,
+    )
+    recipient = Individual(
+        AstTree(AppNode(ConstNode(:WRAP), ConstNode(:ONE))),
+        mu_type,
+    )
+    donor = Individual(AstTree(ConstNode(:TWO)), IntTy)
+
+    child = recombine(
+        TypedSubtreeSwapCrossover(max_try=8, min_sites=1),
+        recipient,
+        donor;
+        rng=MersenneTwister(8000),
+        global_consts_ty=global_types,
+    )
+    @test !(child isa Err)
+    if !(child isa Err)
+        @test child.tree.root == AppNode(ConstNode(:WRAP), ConstNode(:TWO))
+        @test isequal_mu(infer(child.tree, global_types), mu_type)
+    end
 end
 
 @testitem "Populations TypedSubtreeSwapCrossover: basic success + type stable (TyFun)" setup=[PopCrossBaseImports] begin
@@ -1059,6 +1265,9 @@ end
     @test_throws ArgumentError crossover_site_weight(policy, site, :middle)
     @test_throws ArgumentError TypedSubtreeSwapCrossover(max_try=0)
     @test_throws ArgumentError TypedSubtreeSwapCrossover(min_sites=0)
+    @test_throws ArgumentError TypedSubtreeSwapCrossover(
+        max_open_answers_per_pair=0,
+    )
     @test_throws ArgumentError TypedSubtreeSwapCrossover(
         0,
         true,
@@ -1710,14 +1919,13 @@ end
     end
 end
 
-@testitem "Populations core crossover rejects FunctionDef finitely" begin
+@testitem "Populations core crossover has no FunctionDef term adapter" begin
     using Test
     using LambdaRegression: Procedural
     using LambdaRegression.Mutations.Populations:
         Individual, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
-    using LambdaRegression.Utils: Err
 
     target_ty = TyFun(IntTy, IntTy)
     parent_a = Individual(
@@ -1725,25 +1933,12 @@ end
         target_ty,
     )
     parent_b = Individual(AstTree(AbsNode(:x, IndexNode(0))), target_ty)
-    result = try
-        crossover(
-            TypedSubtreeSwapCrossover(min_sites=1),
-            parent_a,
-            parent_b;
-            global_consts_ty=Dict{Symbol,TyLike}(),
-        )
-    catch err
-        err
-    end
-
-    @test result isa Err
-    if result isa Err
-        @test nameof(typeof(result.value)) == :UnsupportedCrossoverNodeErr
-        if nameof(typeof(result.value)) == :UnsupportedCrossoverNodeErr
-            @test isempty(result.value.path)
-            @test result.value.node_type === Procedural.FunctionDefNode
-        end
-    end
+    @test_throws MethodError crossover(
+        TypedSubtreeSwapCrossover(min_sites=1),
+        parent_a,
+        parent_b;
+        global_consts_ty=Dict{Symbol,TyLike}(),
+    )
 end
 
 @testitem "Populations crossover builds finite pairs once and rejects no-ops before copying" begin

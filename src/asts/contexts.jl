@@ -72,6 +72,9 @@ function new_constant!(context, value)
 end
 
 function new_constant!(context::ConstantsMap, value)
+    for (name, existing) in context.globals
+        isequal(existing, value) && return ConstNode(name)
+    end
     if hasvalue(context.locals, value)
         return ConstNode(context.locals(value))
     else
@@ -97,12 +100,15 @@ function new_constant!(context, value, factory::ConstSymbolFactory)
 end
 
 function new_constant!(context::ConstantsMap, value, factory::ConstSymbolFactory)
+    for (name, existing) in context.globals
+        isequal(existing, value) && return ConstNode(name)
+    end
     if hasvalue(context.locals, value)
         return ConstNode(context.locals(value))
     else
         while true
             name = _next_const_symbol!(factory)
-            haskey(context.locals, name) && continue
+            (haskey(context.globals, name) || haskey(context.locals, name)) && continue
             context.locals[name] = value
             return ConstNode(name)
         end
@@ -253,6 +259,13 @@ end
     @test tree.root.name == :c1
     @test ctx.overlay[:c1] == 6
     @test !haskey(globals, :c1)
+end
+
+@testitem "ConstantsMap deterministic insertion respects globals" setup=[ContextsBaseImports] begin
+    context = LambdaRegression.ASTs.Contexts.ConstantsMap(:c1 => 42)
+    factory = ConstSymbolFactory(prefix=:c)
+    @test new_constant!(context, 42, factory).name == :c1
+    @test new_constant!(context, 7, factory).name == :c2
 end
 
 end # module Contexts

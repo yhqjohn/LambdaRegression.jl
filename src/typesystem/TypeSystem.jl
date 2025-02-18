@@ -975,9 +975,7 @@ and receives let generalisation rather than ordinary monomorphic application.
 the body. `:fix` exposes one monomorphic self binder and equates its type with the
 body type; callers may impose additional domain constraints on the result.
 """
-function term_view(adapter, node)
-    throw(ArgumentError("no term adapter $(typeof(adapter)) for $(typeof(node))"))
-end
+function term_view end
 
 """Adapter hook applied to a fixed-point result before metadata or let generalisation."""
 constrain_fixpoint(adapter, node, ty::Ty, factory) = ty
@@ -1336,7 +1334,7 @@ SND(x) = last(x)
 # List type basic functions
 struct _NilErr end
 const NILERR = _NilErr()
-CONS(x) = l -> [x;l]
+CONS(x) = l -> vcat([x], collect(l))
 HEAD(xs) = isempty(xs) ? NILERR : xs[1]
 TAIL(xs) = isempty(xs) ? NILERR : xs[2:end]
 LENGTH(xs) = length(xs)
@@ -1354,8 +1352,20 @@ arrays:
 
 - it does not require any type-level nat arithmetic (no `n-1`),
 - it keeps the length index `n` unchanged.
+
+A dense Julia NDArray represents nested logical `TyArray` layers. For rank two
+and above, one `AMAP` therefore maps the slices along the first dimension; use
+nested `AMAP` applications to reach deeper logical layers.
 """
-AMAP(f) = xs -> map(f, xs)
+function _amap_dense_outer(f, xs::AbstractArray)
+    mapped = map(f, eachslice(xs; dims=1))
+    isempty(mapped) && return mapped
+    return first(mapped) isa AbstractArray ? stack(mapped; dims=1) : mapped
+end
+
+_amap_outer(f, xs::AbstractVector) = map(f, xs)
+_amap_outer(f, xs::AbstractArray) = _amap_dense_outer(f, xs)
+AMAP(f) = xs -> _amap_outer(f, xs)
 
 """
     AFOLDL(op) -> (init -> (xs -> acc))
@@ -1363,8 +1373,15 @@ AMAP(f) = xs -> map(f, xs)
 Curried left fold over fixed-length arrays (`TyArray`).
 
 `op` is expected to be curried: `op(acc)(x)`.
+
+As with `AMAP`, a dense rank-two-or-higher Julia array is folded over slices of
+its first dimension, which realizes one outer logical `TyArray` layer.
 """
-AFOLDL(op) = init -> xs -> foldl((acc, x) -> op(acc)(x), xs; init=init)
+_afoldl_outer(op, init, xs::AbstractVector) =
+    foldl((acc, x) -> op(acc)(x), xs; init=init)
+_afoldl_outer(op, init, xs::AbstractArray) =
+    foldl((acc, x) -> op(acc)(x), eachslice(xs; dims=1); init=init)
+AFOLDL(op) = init -> xs -> _afoldl_outer(op, init, xs)
 
 """
     LENF(xs) -> Float64
@@ -1797,6 +1814,17 @@ end
 
     lenf_ty = TypeSystem.instantiate(get_type(TypeSystem.LENF), 0)
     @test unify!(lenf_ty, A → FloatTy) === nothing
+end
+
+@testitem "TypeSystem Array HO primitives preserve dense NDArray nesting" begin
+    using Test
+    using LambdaRegression.TypeSystem: AMAP, AFOLDL
+
+    matrix = [1.0 2.0 3.0; 4.0 5.0 6.0]
+
+    @test AMAP(row -> sum(row))(matrix) == [6.0, 15.0]
+    @test AMAP(AMAP(x -> 2x))(matrix) == 2 .* matrix
+    @test AFOLDL(acc -> row -> acc .+ row)(zeros(3))(matrix) == [5.0, 7.0, 9.0]
 end
 
 # ------------------------------------------------------------

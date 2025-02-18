@@ -1,7 +1,7 @@
 """
     Mutations.Populations
 
-Population-level variation interfaces and baseline typed crossover.
+Population-level variation interfaces, typed recombination, and donor sampling.
 
 This submodule provides minimal `Individual`/`Population` containers and typed
 binary recombination. `TypedSubtreeSwapCrossover` analyzes each parent once,
@@ -9,10 +9,17 @@ routes a finite set of type- and scope-compatible site pairs without
 replacement, and returns two children only when both validate and both are
 genuine changes. Parent trees and constant dictionaries are never modified.
 
-The core operator accepts ordinary lambda AST nodes. Extension nodes such as
-`FunctionDefNode` return `Err(UnsupportedCrossoverNodeErr(...))`; implement a
-separate `AbstractCrossover` adapter when an extension has additional binders or
-typing rules.
+The directional `recombine` seam uses exact demand-from-offer retrieval,
+binder-aware transport, and complete-child validation for ordinary lambda and
+first-class `FunctionDef` terms. The older binary `crossover` seam remains
+available; `AutoTypedCrossover` composes two directional calls for the default
+Regression path. Unsupported IR nodes such as `ScopeNode` have no implicit
+compatibility route.
+
+`DonorPool` is a separate bounded sampling layer. It stores explicit fragment
+paths from caller-selected individuals and supports uniform or adaptive
+queue-like retention. Pool feedback changes only sampling weights and eviction,
+never the retrieval relation.
 
 Site routing is injectable without replacing rewrite logic:
 
@@ -85,12 +92,17 @@ using ...Utils: Err
 import ..prune_local_consts!
 
 export Individual, Population
-export AbstractCrossover, crossover
+export AbstractCrossover, crossover, recombine
 export AbstractCrossoverSelectionPolicy, UniformCrossoverSelectionPolicy
 export CrossoverSite, PathCrossoverSelectionPolicy
 export crossover_site_weight, crossover_pair_weight
 export TypedSubtreeSwapCrossover, CrossoverPairPoolExhaustedErr
-export NoEligibleCrossoverPairErr, UnsupportedCrossoverNodeErr
+export NoEligibleCrossoverPairErr
+export CrossoverAnswerBudgetExhaustedErr
+export DonorPool, DonorPoolConfig, DonorPoolOutcome, DonorPoolSelection
+export DonorPoolAttempt, EmptyDonorPoolErr
+export admit_donor!, admit_random_donors!, sample_donor, record_outcome!
+export donor_pool_stats, donor_weights, recombine_from_pool
 export prune!
 
 """
@@ -141,6 +153,26 @@ function crossover(::AbstractCrossover, ::Individual, ::Individual; rng::Abstrac
 end
 
 """
+    recombine(op::AbstractCrossover, recipient::Individual, donor::Individual;
+        rng=MersenneTwister(2000), kwargs...) -> Individual or Err
+
+Apply the one-way population recombination seam.  `recipient` supplies the
+target site and target type; `donor` supplies the fragment.  Concrete
+operators implement the semantics for the variation family they support.
+The existing [`crossover`](@ref) tuple interface remains independent of this
+directional seam.
+"""
+function recombine(
+    ::AbstractCrossover,
+    ::Individual,
+    ::Individual;
+    rng::AbstractRNG=MersenneTwister(2000),
+    kwargs...,
+)
+    error("recombine not implemented")
+end
+
+"""
     prune!(ind::Individual) -> Nothing
 
 Prune unreferenced local constants for this individual.
@@ -150,6 +182,14 @@ function prune!(ind::Individual)
     return nothing
 end
 
+include("TypedCrossoverRetrieval.jl")
+include("ScopedRetrievalSolver.jl")
+include("OpenTypedRetrieval.jl")
+include("TypedCrossoverSnapshot.jl")
+include("SnapshotOpenRetrieval.jl")
+include("TypedCrossoverTransport.jl")
 include("PopulationCrossover.jl")
+include("TypedCrossoverEngine.jl")
+include("DonorPool.jl")
 
 end # module Populations

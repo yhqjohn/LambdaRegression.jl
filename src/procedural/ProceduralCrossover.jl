@@ -3,40 +3,73 @@ using Random
 const Populations = Mutations.Populations
 
 """
-    ProceduralTypedSubtreeSwapCrossover(; max_try=40, min_sites=2, allow_root=true)
+    FunctionDefTypedSubtreeSwapCrossover(; max_try=40, min_sites=2,
+        allow_root=true, allow_capture_rebinding=true, prefer_closed=true)
 
-Binder-aware typed subtree swap for trees containing `ScopeNode` or
-`FunctionDefNode`. Sites are analyzed directly with procedural inference. A
-captured De Bruijn position may move only to a binder of the same lexical kind;
-both offspring are then re-inferred transactionally.
+Typed subtree swap for trees containing `FunctionDefNode`. Closed subtrees may
+move across arbitrary lexical depths. An open subtree may be rebound only when
+each captured De Bruijn position exists at the destination with the same binder
+kind; both offspring are then re-inferred transactionally.
+
+This is the compatibility backend used only when callers inject a custom
+procedural operator. Calls require `global_consts_ty`; missing context,
+insufficient eligible sites, exhausted finite pairs, and the `max_try` budget
+return typed `Err` values. Invalid constructor budgets throw `ArgumentError`.
+
+`ScopeNode` is a transient IR, not a population crossover representation, and
+deliberately has no child-context method in this operator.
 """
-struct ProceduralTypedSubtreeSwapCrossover <: Populations.AbstractCrossover
+struct FunctionDefTypedSubtreeSwapCrossover <: Populations.AbstractCrossover
     max_try::Int
     min_sites::Int
     allow_root::Bool
+    allow_capture_rebinding::Bool
+    prefer_closed::Bool
 
-    function ProceduralTypedSubtreeSwapCrossover(
+    function FunctionDefTypedSubtreeSwapCrossover(
         max_try::Int,
         min_sites::Int,
         allow_root::Bool,
+        allow_capture_rebinding::Bool,
+        prefer_closed::Bool,
     )
         max_try >= 1 || throw(ArgumentError("max_try must be positive"))
         min_sites >= 1 || throw(ArgumentError("min_sites must be positive"))
-        return new(max_try, min_sites, allow_root)
+        return new(
+            max_try,
+            min_sites,
+            allow_root,
+            allow_capture_rebinding,
+            prefer_closed,
+        )
     end
 end
 
-ProceduralTypedSubtreeSwapCrossover(;
+FunctionDefTypedSubtreeSwapCrossover(;
     max_try::Int=40,
     min_sites::Int=2,
     allow_root::Bool=true,
-) = ProceduralTypedSubtreeSwapCrossover(max_try, min_sites, allow_root)
+    allow_capture_rebinding::Bool=true,
+    prefer_closed::Bool=true,
+) = FunctionDefTypedSubtreeSwapCrossover(
+    max_try,
+    min_sites,
+    allow_root,
+    allow_capture_rebinding,
+    prefer_closed,
+)
 
 """
     AutoTypedCrossover(; core, procedural)
 
-Preserve the core `TypedSubtreeSwapCrossover` contract while automatically using
-the procedural operator whenever either parent contains a procedural binder.
+Binary adapter over directional typed recombination. The default path uses the
+same authoritative closed/open retrieval engine for core and `FunctionDef`
+trees, while retaining `procedural` as a compatibility backend for custom
+operators. It produces two independently sampled directed children; callers
+that require one reciprocal site pair can still use the concrete binary
+`crossover` operator directly. Calls require the same `global_consts_ty`
+context as the selected backend, and forward its classified finite-search
+failures. `ScopeNode` has no population route.
 """
 struct AutoTypedCrossover{C<:Populations.AbstractCrossover,P<:Populations.AbstractCrossover} <:
        Populations.AbstractCrossover
@@ -45,11 +78,26 @@ struct AutoTypedCrossover{C<:Populations.AbstractCrossover,P<:Populations.Abstra
 end
 
 AutoTypedCrossover(;
-    core=Populations.TypedSubtreeSwapCrossover(),
-    procedural=ProceduralTypedSubtreeSwapCrossover(),
+    core=Populations.TypedSubtreeSwapCrossover(require_same_depth=false),
+    procedural=FunctionDefTypedSubtreeSwapCrossover(),
 ) = AutoTypedCrossover(core, procedural)
 
-struct _ProceduralCrossoverSite
+function _functiondef_directional_operator(
+    core::Populations.TypedSubtreeSwapCrossover,
+    procedural::FunctionDefTypedSubtreeSwapCrossover,
+)
+    return Populations.TypedSubtreeSwapCrossover(
+        max_try=procedural.max_try,
+        max_open_answers_per_pair=core.max_open_answers_per_pair,
+        require_same_depth=core.require_same_depth,
+        require_compatible_binders=core.require_compatible_binders,
+        min_sites=procedural.min_sites,
+        allow_root=procedural.allow_root,
+        selection=core.selection,
+    )
+end
+
+struct _FunctionDefCrossoverSite
     path::Vector{Int}
     node::AstNode
     ty::Ty
@@ -57,10 +105,53 @@ struct _ProceduralCrossoverSite
     captures::Vector{Int}
 end
 
-function _contains_procedural_node(node::AstNode)
-    node isa Procedural.ScopeNode && return true
+function _contains_functiondef_node(node::AstNode)
     node isa Procedural.FunctionDefNode && return true
-    return any(_contains_procedural_node, children(node))
+    return any(_contains_functiondef_node, children(node))
+end
+
+# Crossover owns a deliberately narrower lexical protocol than the procedural
+# IR. Core binders and FunctionDef participate; ScopeNode intentionally has no
+# method and therefore cannot silently enter the population representation.
+function _crossover_child_binders(
+    node::AppNode,
+    child_index::Int;
+    path::Tuple=(),
+    outer::Tuple=(),
+)
+    child_index in (1, 2) || throw(BoundsError(children(node), child_index))
+    return outer
+end
+
+function _crossover_child_binders(
+    node::AbsNode,
+    child_index::Int;
+    path::Tuple=(),
+    outer::Tuple=(),
+)
+    child_index == 1 || throw(BoundsError(children(node), child_index))
+    return (Procedural.BinderId(:abs, path, 1), outer...)
+end
+
+function _crossover_child_binders(
+    node::LetNode,
+    child_index::Int;
+    path::Tuple=(),
+    outer::Tuple=(),
+)
+    child_index in (1, 2) || throw(BoundsError(children(node), child_index))
+    child_index == 1 && return outer
+    return (Procedural.BinderId(:let, path, 1), outer...)
+end
+
+function _crossover_child_binders(
+    node::Procedural.FunctionDefNode,
+    child_index::Int;
+    path::Tuple=(),
+    outer::Tuple=(),
+)
+    child_index == 1 || throw(BoundsError(children(node), child_index))
+    return (Procedural.BinderId(:function_def, path, 1), outer...)
 end
 
 function _captured_positions!(
@@ -73,7 +164,7 @@ function _captured_positions!(
         return result
     end
     for (child_index, child) in enumerate(children(node))
-        introduced = length(Procedural.visible_binders(
+        introduced = length(_crossover_child_binders(
             node,
             child_index;
             path=(),
@@ -84,7 +175,7 @@ function _captured_positions!(
     return result
 end
 
-function _collect_procedural_sites(
+function _collect_functiondef_sites(
     tree::AstTree,
     type_ctx::AbstractDict{Symbol,<:TyLike},
     tyfactory,
@@ -92,7 +183,7 @@ function _collect_procedural_sites(
     meta = IdDict{AstNode,Tuple{TyLike,TyLike}}()
     inferred = Procedural.infer_procedural(tree, type_ctx; factory=tyfactory, meta)
     inferred isa Err && return inferred
-    sites = _ProceduralCrossoverSite[]
+    sites = _FunctionDefCrossoverSite[]
 
     function visit(node::AstNode, path::Vector{Int}, binders::Tuple)
         if haskey(meta, node)
@@ -101,12 +192,12 @@ function _collect_procedural_sites(
                 captures = sort!(collect(_captured_positions!(Set{Int}(), node)))
                 all(position -> position < length(binders), captures) && push!(
                     sites,
-                    _ProceduralCrossoverSite(copy(path), node, ty, binders, captures),
+                    _FunctionDefCrossoverSite(copy(path), node, ty, binders, captures),
                 )
             end
         end
         for (child_index, child) in enumerate(children(node))
-            child_binders = Procedural.visible_binders(
+            child_binders = _crossover_child_binders(
                 node,
                 child_index;
                 path=Tuple(path),
@@ -121,8 +212,8 @@ function _collect_procedural_sites(
 end
 
 function _captured_kinds_fit(
-    donor::_ProceduralCrossoverSite,
-    destination::_ProceduralCrossoverSite,
+    donor::_FunctionDefCrossoverSite,
+    destination::_FunctionDefCrossoverSite,
 )
     for position in donor.captures
         position < length(destination.binders) || return false
@@ -132,10 +223,16 @@ function _captured_kinds_fit(
     return true
 end
 
-function _procedural_sites_match(left::_ProceduralCrossoverSite, right::_ProceduralCrossoverSite)
-    length(left.binders) == length(right.binders) || return false
+function _functiondef_sites_match(
+    op::FunctionDefTypedSubtreeSwapCrossover,
+    left::_FunctionDefCrossoverSite,
+    right::_FunctionDefCrossoverSite,
+)
     TypeSystem.iscompatible(left.ty, right.ty) || return false
     TypeSystem.iscompatible(right.ty, left.ty) || return false
+    if !op.allow_capture_rebinding
+        isempty(left.captures) && isempty(right.captures) || return false
+    end
     return _captured_kinds_fit(left, right) && _captured_kinds_fit(right, left)
 end
 
@@ -169,7 +266,7 @@ function _same_procedural_contextual_subtree(site_a, a, site_b, b)
 end
 
 function Populations.crossover(
-    op::ProceduralTypedSubtreeSwapCrossover,
+    op::FunctionDefTypedSubtreeSwapCrossover,
     a::Populations.Individual,
     b::Populations.Individual;
     rng::AbstractRNG=MersenneTwister(2000),
@@ -182,13 +279,13 @@ function Populations.crossover(
         return Err(Populations.TargetTypeMismatchErr(a.target_ty, b.target_ty))
     global_consts_ty === nothing && return Err(Populations.MissingGlobalTypeCtxErr())
 
-    sites_a = _collect_procedural_sites(
+    sites_a = _collect_functiondef_sites(
         a.tree,
         merge(global_consts_ty, a.local_consts_ty),
         tyfactory_ctor(),
     )
     sites_a isa Err && return sites_a
-    sites_b = _collect_procedural_sites(
+    sites_b = _collect_functiondef_sites(
         b.tree,
         merge(global_consts_ty, b.local_consts_ty),
         tyfactory_ctor(),
@@ -199,12 +296,20 @@ function Populations.crossover(
     length(sites_a) >= op.min_sites || return Err(Populations.NoEligibleCrossoverSiteErr())
     length(sites_b) >= op.min_sites || return Err(Populations.NoEligibleCrossoverSiteErr())
 
-    pairs = Tuple{_ProceduralCrossoverSite,_ProceduralCrossoverSite}[]
+    pairs = Tuple{_FunctionDefCrossoverSite,_FunctionDefCrossoverSite}[]
     for site_a in sites_a, site_b in sites_b
-        _procedural_sites_match(site_a, site_b) && push!(pairs, (site_a, site_b))
+        _functiondef_sites_match(op, site_a, site_b) && push!(pairs, (site_a, site_b))
     end
     isempty(pairs) && return Err(Populations.NoEligibleCrossoverPairErr())
-    shuffle!(rng, pairs)
+    if op.prefer_closed
+        closed = filter(pair -> isempty(pair[1].captures) && isempty(pair[2].captures), pairs)
+        open = filter(pair -> !isempty(pair[1].captures) || !isempty(pair[2].captures), pairs)
+        shuffle!(rng, closed)
+        shuffle!(rng, open)
+        pairs = vcat(closed, open)
+    else
+        shuffle!(rng, pairs)
+    end
 
     attempts = 0
     for (site_a, site_b) in Iterators.take(pairs, op.max_try)
@@ -278,7 +383,40 @@ function Populations.crossover(
     b::Populations.Individual;
     kwargs...,
 )
-    backend = _contains_procedural_node(a.tree.root) ||
-        _contains_procedural_node(b.tree.root) ? op.procedural : op.core
+    has_functiondef = _contains_functiondef_node(a.tree.root) ||
+        _contains_functiondef_node(b.tree.root)
+    if op.core isa Populations.TypedSubtreeSwapCrossover &&
+       (!has_functiondef ||
+        op.procedural isa FunctionDefTypedSubtreeSwapCrossover)
+        Populations._same_target_type(a.target_ty, b.target_ty) ||
+            return Err(Populations.TargetTypeMismatchErr(a.target_ty, b.target_ty))
+
+        core = op.core::Populations.TypedSubtreeSwapCrossover
+        formal = if has_functiondef
+            procedural = op.procedural::FunctionDefTypedSubtreeSwapCrossover
+            _functiondef_directional_operator(core, procedural)
+        else
+            core
+        end
+        child_a = Populations.recombine(
+            formal,
+            a,
+            b;
+            selection_roles=(:left, :right),
+            kwargs...,
+        )
+        child_a isa Err && return child_a
+        child_b = Populations.recombine(
+            formal,
+            b,
+            a;
+            selection_roles=(:right, :left),
+            kwargs...,
+        )
+        child_b isa Err && return child_b
+        return (child_a, child_b)
+    end
+
+    backend = has_functiondef ? op.procedural : op.core
     return Populations.crossover(backend, a, b; kwargs...)
 end

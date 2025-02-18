@@ -1,4 +1,4 @@
-@testitem "Procedural crossover is binder-aware and preserves core rejection" begin
+@testitem "FunctionDef crossover is binder-aware and Scope has no population route" begin
     using Test
     using Random
     using LambdaRegression
@@ -22,21 +22,32 @@
     )
     left_snapshot, right_snapshot = deepcopy(left.tree), deepcopy(right.tree)
 
-    core_result = crossover(
+    @test_throws MethodError crossover(
         TypedSubtreeSwapCrossover(min_sites=1),
         left,
         right;
         global_consts_ty=type_context,
     )
-    @test core_result isa Err
-    @test core_result.value isa LambdaRegression.Mutations.Populations.UnsupportedCrossoverNodeErr
 
-    op = ProceduralMutations.ProceduralTypedSubtreeSwapCrossover(
+    op = ProceduralMutations.FunctionDefTypedSubtreeSwapCrossover(
         max_try=100,
         min_sites=1,
     )
+    bounded_core = TypedSubtreeSwapCrossover(
+        max_open_answers_per_pair=2,
+        require_same_depth=false,
+    )
+    forwarded = ProceduralMutations._functiondef_directional_operator(
+        bounded_core,
+        op,
+    )
+    @test forwarded.max_open_answers_per_pair == 2
+    @test forwarded.require_same_depth == bounded_core.require_same_depth
+    @test forwarded.max_try == op.max_try
+    @test forwarded.min_sites == op.min_sites
+
     result = crossover(
-        ProceduralMutations.AutoTypedCrossover(procedural=op),
+        ProceduralMutations.AutoTypedCrossover(core=bounded_core, procedural=op),
         left,
         right;
         rng=MersenneTwister(2000),
@@ -58,13 +69,105 @@
         :z,
         AppNode(AbsNode(:x, IndexNode(0)), ConstNode(:one)),
     )))
-    sites = ProceduralMutations._collect_procedural_sites(
+    sites = ProceduralMutations._collect_functiondef_sites(
         letlike,
         type_context,
         LambdaRegression.TypeSystem.make_tyvar_factory(),
     )
     @test !(sites isa Err)
     @test any(site -> site.path == [1, 1, 1, 1], sites)
+
+    scope_parent = Individual(
+        AstTree(Procedural.ScopeNode([AbsNode(:x, IndexNode(0))], IndexNode(0))),
+        target,
+    )
+    @test_throws MethodError crossover(
+        ProceduralMutations.AutoTypedCrossover(procedural=op),
+        scope_parent,
+        right;
+        rng=MersenneTwister(1),
+        global_consts_ty=type_context,
+    )
+end
+
+@testitem "Auto typed crossover uses contextual directional transport" begin
+    using Test
+    using Random
+    using LambdaRegression
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, IndexNode
+    using LambdaRegression.Mutations.Populations:
+        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
+        crossover
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer
+    using LambdaRegression.Utils: Err
+
+    ProceduralMutations = LambdaRegression.ProceduralMutations
+    int_function = TyFun(IntTy, IntTy)
+    type_context = Dict{Symbol,TyLike}(
+        :ADD => TyFun(IntTy, TyFun(IntTy, IntTy)),
+        :ZERO => IntTy,
+        :USE_FUN => TyFun(int_function, IntTy),
+    )
+    left = Individual(
+        AstTree(AbsNode(
+            :x,
+            AppNode(
+                AppNode(ConstNode(:ADD), IndexNode(0)),
+                ConstNode(:ZERO),
+            ),
+        )),
+        int_function,
+    )
+    right = Individual(
+        AstTree(AbsNode(
+            :x,
+            AppNode(
+                ConstNode(:USE_FUN),
+                AbsNode(
+                    :y,
+                    AppNode(
+                        AppNode(ConstNode(:ADD), IndexNode(1)),
+                        IndexNode(0),
+                    ),
+                ),
+            ),
+        )),
+        int_function,
+    )
+    left_before, right_before = deepcopy(left), deepcopy(right)
+    core = TypedSubtreeSwapCrossover(
+        max_try=1,
+        require_same_depth=false,
+        min_sites=1,
+        selection=PathCrossoverSelectionPolicy(
+            [1, 1, 2],
+            [1, 2, 1],
+        ),
+    )
+
+    result = crossover(
+        ProceduralMutations.AutoTypedCrossover(core=core),
+        left,
+        right;
+        rng=MersenneTwister(8000),
+        global_consts_ty=type_context,
+    )
+
+    @test !(result isa Err)
+    if !(result isa Err)
+        child_left, child_right = result
+        @test child_left.tree != left.tree
+        @test child_right.tree != right.tree
+        @test infer(child_left.tree, type_context) == int_function
+        @test infer(child_right.tree, type_context) == int_function
+    end
+    @test left.tree == left_before.tree
+    @test left.local_consts == left_before.local_consts
+    @test left.local_consts_ty == left_before.local_consts_ty
+    @test right.tree == right_before.tree
+    @test right.local_consts == right_before.local_consts
+    @test right.local_consts_ty == right_before.local_consts_ty
 end
 
 @testitem "FunctionDef recursive-body mutation preserves a genuine self call" begin

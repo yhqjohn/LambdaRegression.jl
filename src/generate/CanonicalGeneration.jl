@@ -1765,6 +1765,13 @@ bucket keys use `default`.
 struct GenerationWeights
     default::Float64
     overrides::Dict{Symbol,Float64}
+    function GenerationWeights(default::Float64, overrides::Dict{Symbol,Float64})
+        isfinite(default) && default >= 0 ||
+            throw(ArgumentError("default generation weight must be finite and nonnegative"))
+        all(weight -> isfinite(weight) && weight >= 0, values(overrides)) ||
+            throw(ArgumentError("generation weights must be finite and nonnegative"))
+        return new(default, overrides)
+    end
 end
 
 function GenerationWeights(;
@@ -1818,6 +1825,7 @@ function _head_weight(weights::GenerationWeights, head::HeadEntry)
     weight = _bucket_weight(weights, head.weight_bucket)
     for tag in _metadata_get(head.metadata, :weight_tags, ())
         weight *= _tag_weight(weights, tag)
+        isfinite(weight) || throw(ArgumentError("generation head weight overflow for $(head.name)"))
     end
     return weight
 end
@@ -4635,8 +4643,11 @@ function _sample_set(derivations::Vector{<:CoreDerivation}, weights::GenerationW
     total = 0.0
     for derivation in derivations
         weight = _derivation_weight(derivation, weights)
+        isfinite(weight) && weight >= 0 ||
+            throw(ArgumentError("derivation weight must be finite and nonnegative"))
         weight > 0 || continue
         total += weight
+        isfinite(total) || throw(ArgumentError("derivation weight sum overflow"))
         push!(kept, derivation)
         push!(cumulative_weights, total)
     end
@@ -5058,9 +5069,12 @@ function _positive_option_pool(options::Vector{<:NamedTuple})
     pool = NamedTuple[]
     total_weight = 0.0
     for option in options
+        option.weight isa Real && isfinite(option.weight) && option.weight >= 0 ||
+            throw(ArgumentError("generation option weight must be finite and nonnegative"))
         option.weight > 0 || continue
         push!(pool, option)
         total_weight += option.weight
+        isfinite(total_weight) || throw(ArgumentError("generation option weight sum overflow"))
     end
     return pool, total_weight
 end
@@ -10336,6 +10350,13 @@ end
         node_budget=3,
     )
     @test CG.known_generation_witness(rejected_relation, rejected_query) !== nothing
+end
+
+@testitem "CanonicalGeneration positional weights reject invalid values" begin
+    using Test
+    CG = LambdaRegression.CanonicalGeneration
+    @test_throws ArgumentError CG.GenerationWeights(Inf, Dict{Symbol,Float64}())
+    @test_throws ArgumentError CG.GenerationWeights(1.0, Dict{Symbol,Float64}(:constant => -1.0))
 end
 
 end # module CanonicalGeneration
