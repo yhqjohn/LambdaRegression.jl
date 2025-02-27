@@ -662,6 +662,7 @@ default_head_providers() = _DEFAULT_HEAD_PROVIDERS
 function test_catalog_consts()
     return Dict{Symbol,Any}(
         :FSIN => TypeSystem.FSIN,
+        :FCOS => TypeSystem.FCOS,
         :FSQRT => TypeSystem.FSQRT,
         :SQR => TypeSystem.SQR,
         :FADD => TypeSystem.FADD,
@@ -677,6 +678,7 @@ end
 function test_catalog_weight_tags()
     return Dict{Symbol,Tuple{Vararg{Symbol}}}(
         :FSIN => (:real_unary,),
+        :FCOS => (:real_unary,),
         :FSQRT => (:real_unary,),
         :SQR => (:real_unary,),
         :FADD => (:real_binary, :multi_arg),
@@ -6528,7 +6530,7 @@ end
     )
     names = Set(entry.name for entry in catalog.heads)
 
-    @test all(name -> name in names, [:FSIN, :FSQRT, :SQR, :FADD, :FSUB, :FMUL, :FDIV])
+    @test all(name -> name in names, [:FSIN, :FCOS, :FSQRT, :SQR, :FADD, :FSUB, :FMUL, :FDIV])
     @test :LENF in names
 end
 
@@ -7337,7 +7339,7 @@ end
     context = CG.test_catalog_consts()
     generation_kwargs = CG.test_catalog_generation_kwargs(profile=:deeper)
 
-    @test all(name -> haskey(context, name), [:FSIN, :FSQRT, :SQR, :FADD, :FSUB, :FMUL, :FDIV, :FEQ, :FLE, :LENF])
+    @test all(name -> haskey(context, name), [:FSIN, :FCOS, :FSQRT, :SQR, :FADD, :FSUB, :FMUL, :FDIV, :FEQ, :FLE, :LENF])
     @test !haskey(context, :TRUE)
     @test !haskey(context, :FALSE)
     @test !haskey(context, :NOT)

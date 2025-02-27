@@ -1392,6 +1392,7 @@ an `Int -> Float` conversion primitive.
 LENF(xs) = float(length(xs))
 
 FSIN(x) = sin(x)
+FCOS(x) = cos(x)
 FSQRT(x) = sqrt(x)
 SQR(x) = x * x
 
@@ -1443,6 +1444,7 @@ get_type(::typeof(AFOLDL)) = ∀([_α, _β, _γ], (_γ → _β → _γ) → _γ 
 get_type(::typeof(LENF)) = ∀([_α, _β], TyArray(_α, _β) → FloatTy)
 
 get_type(::typeof(FSIN)) = FloatTy → FloatTy
+get_type(::typeof(FCOS)) = FloatTy → FloatTy
 get_type(::typeof(FSQRT)) = FloatTy → FloatTy
 get_type(::typeof(SQR)) = FloatTy → FloatTy
 

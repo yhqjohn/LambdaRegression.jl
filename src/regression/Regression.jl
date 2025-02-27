@@ -57,6 +57,8 @@ export default_config, default_components, default_regressor
 export PreparedDefaultEvaluator, prepare_default_evaluator, evaluate_default
 export TensorSchema, TensorSeries, SeriesTask, series_task
 export series_mse, series_components, series_regressor
+export AbstractConstantSearch, ConstantSearchBudget, ConstantSearchStats
+export ConstantSearchResult, GaussianConstantSearch, search_constants
 
 struct NotImplementedErr end
 struct MissingComponentErr
@@ -724,6 +726,30 @@ function _preflight_regression_config(
     timing = get(config, :timing, (; enabled=false))
     get(timing, :enabled, false) isa Bool ||
         return ArgumentError("timing.enabled must be Bool")
+    constant_search = get(config, :constant_search, (; enabled=false))
+    get(constant_search, :enabled, false) isa Bool ||
+        return ArgumentError("constant_search.enabled must be Bool")
+    conditional_share = get(constant_search, :conditional_share, 0.4)
+    conditional_share isa Real && isfinite(conditional_share) &&
+        0 <= conditional_share <= 1 || return ArgumentError(
+            "constant_search.conditional_share must be finite and in [0, 1]",
+        )
+    max_proposals = get(constant_search, :max_proposals, 16)
+    max_objective_evals = get(constant_search, :max_objective_evals, 17)
+    max_proposals isa Int && max_proposals >= 0 || return ArgumentError(
+        "constant_search.max_proposals must be a non-negative integer",
+    )
+    max_objective_evals isa Int && max_objective_evals >= 1 || return ArgumentError(
+        "constant_search.max_objective_evals must be a positive integer",
+    )
+    if get(constant_search, :enabled, false)
+        haskey(components, :constant_search) || return ArgumentError(
+            "constant_search component is required when constant search is enabled",
+        )
+        components.constant_search isa AbstractConstantSearch || return ArgumentError(
+            "constant_search component must be an AbstractConstantSearch",
+        )
+    end
     parallel = get(config, :parallel, (; enabled=false))
     get(parallel, :enabled, false) isa Bool ||
         return ArgumentError("parallel.enabled must be Bool")
@@ -878,6 +904,12 @@ function default_config(;
         topk_types=8,
     ),
     timing=(; enabled=false),
+    constant_search=(;
+        enabled=false,
+        conditional_share=0.4,
+        max_proposals=16,
+        max_objective_evals=17,
+    ),
     log=(; enabled=false, every=1, topk=5, io=stdout),
     parallel=(; enabled=false, mode=:individual, schedule=:dynamic),
     kwargs...
@@ -902,6 +934,12 @@ function default_config(;
         topk_types=8,
     ), stats)
     timing = merge((; enabled=false), timing)
+    constant_search = merge((;
+        enabled=false,
+        conditional_share=0.4,
+        max_proposals=16,
+        max_objective_evals=17,
+    ), constant_search)
     log = merge((; enabled=false, every=1, topk=5, io=stdout), log)
     parallel = merge((; enabled=false, mode=:individual, schedule=:dynamic), parallel)
     base = (;
@@ -921,6 +959,7 @@ function default_config(;
         repro,
         stats,
         timing,
+        constant_search,
         log,
         parallel,
     )
@@ -929,7 +968,7 @@ end
 
 function _merge_config_overrides(config::NamedTuple, overrides::NamedTuple)
     result = merge(config, overrides)
-    for key in (:repro, :stats, :timing, :log, :parallel)
+    for key in (:repro, :stats, :timing, :constant_search, :log, :parallel)
         haskey(overrides, key) || continue
         section = merge(get(config, key, (;)), get(overrides, key, (;)))
         result = merge(result, NamedTuple{(key,)}((section,)))
@@ -1065,6 +1104,41 @@ function _guarded_list_map_scaffold(target_ty::Ty, ctx::NamedTuple)
     )
 end
 
+function _guarded_list_real_scaffold(target_ty::Ty, ctx::NamedTuple)
+    target = TypeSystem.prune(target_ty)
+    target isa TyFun || return nothing
+    TypeSystem.prune(target.arg) isa TyList || return nothing
+    TypeSystem.prune(target.res) == FloatTy || return nothing
+    required = (:UNCONS_CASE, :ZERO)
+    all(name -> haskey(ctx.global_consts, name), required) || return nothing
+    all(name -> haskey(ctx.global_consts_ty, name), required) || return nothing
+
+    on_item = AbsNode(
+        :head,
+        AbsNode(
+            :tail,
+            AppNode(IndexNode(3), IndexNode(0)),
+        ),
+    )
+    body = AbsNode(
+        :series,
+        AppNode(
+            AppNode(
+                AppNode(ConstNode(:UNCONS_CASE), IndexNode(0)),
+                on_item,
+            ),
+            ConstNode(:ZERO),
+        ),
+    )
+    return CanonicalGeneration.GenerationResult(
+        AstTree(Procedural.FunctionDefNode(body)),
+        target_ty,
+        Dict{Symbol,Any}(),
+        Dict{Symbol,TyLike}(),
+        Dict{Symbol,Any}(:startup_scaffold => :guarded_list_real),
+    )
+end
+
 function (::_StartupFunctionDefMutationGenerator)(
     mode::Symbol,
     target_ty::Ty,
@@ -1076,6 +1150,8 @@ function (::_StartupFunctionDefMutationGenerator)(
 )
     if mode === :recursive_body
         scaffold = _guarded_list_map_scaffold(target_ty, ctx)
+        scaffold === nothing &&
+            (scaffold = _guarded_list_real_scaffold(target_ty, ctx))
         scaffold === nothing || return scaffold
     end
     return ProceduralMutations.generate_functiondef_replacement(
@@ -1118,11 +1194,13 @@ the bounded capability-offspring slots. The startup policy favors recursive-
 body construction for a finite FunctionDef niche and direct unary/binary growth
 for an existing self-call niche; ordinary reproduction keeps the caller's
 chooser unchanged.
-For `List T → List T` only, the startup recursive-body generator first builds a
+For `List T → List T`, the startup recursive-body generator first builds a
 guarded identity-map scaffold when `UNCONS_CASE`, `CONS`, and `NIL` are present.
-This supplies a finite productive recursion shape without choosing the head
-transformation; later typed mutations still own that search. Other targets use
-the ordinary injected FunctionDef generator unchanged.
+For `List T → Float`, it can build the smaller guarded tail-recursion scaffold
+when `UNCONS_CASE` and `ZERO` are present. These supply finite productive
+recursion shapes without choosing the head transformation; later typed
+mutations still own that search. Other targets use the ordinary injected
+FunctionDef generator unchanged.
 Initialization growth routes the already configured unary composition, binary
 composition, and contextual expansion operators. Each accepted edit must grow
 the term and may not move farther from its slot's target node count; equal-
@@ -1131,6 +1209,8 @@ even target size.
 
 This is a **loader only**: it does not run any business logic. The returned
 components are designed to be easy to override via `merge`.
+`constant_search` defaults to the structured Gaussian adapter, but `fit!` uses
+it only when `config.constant_search.enabled=true`.
 """
 function default_components(;
     global_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
@@ -1159,6 +1239,7 @@ function default_components(;
     ),
     functiondef_recursive_body_site_weight::Float64=4.0,
     mutations::Vector{<:Mutations.AbstractMutation}=[
+        Mutations.ParameterIntroductionMutation(),
         Mutations.ScalarConstMutation(),
         Mutations.BoolConstMutation(),
         Mutations.ArrayConstMutation(),
@@ -1268,6 +1349,7 @@ function default_components(;
     loss_failure=_no_candidate_exception,
     evaluation_threadsafe::Bool=true,
     crossover_op=ProceduralMutations.AutoTypedCrossover(),
+    constant_search=nothing,
     mutation_driver=_default_mutation_driver,
     generation_config_factory=rng -> CanonicalGeneration.GenerationConfig(;
         rng,
@@ -1587,6 +1669,7 @@ function default_components(;
 
     init_population === nothing && (init_population = default_init_population)
     make_immigrant === nothing && (make_immigrant = default_make_immigrant)
+    constant_search === nothing && (constant_search = GaussianConstantSearch())
 
     base = (;
         global_consts,
@@ -1617,6 +1700,7 @@ function default_components(;
         loss_failure,
         evaluation_threadsafe,
         crossover_op,
+        constant_search,
         mutation_driver,
         functiondef_provider,
         generation_config_factory,
@@ -1657,7 +1741,10 @@ This function is intentionally conservative: it aims to "run end-to-end" with
 strong DI boundaries, not to be optimal. When `config.timing.enabled` is true,
 the callback and returned history expose per-generation evaluation,
 reproduction, and total generation seconds, together with the run's initial
-population construction time.
+population construction time. Constant search is an optional subchannel of an
+ordinary mutation event: `conditional_share` controls routing after the
+mutation-rate gate, and its finite proposal/evaluation budget and timing are
+reported separately. Capability-reserved mutation slots remain structural.
 """
 function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
     length(data.X) == length(data.Y) || return Err(ArgumentError("X and Y must have the same length"))
@@ -1762,6 +1849,52 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
             return nothing
         end
 
+        function _constant_training_objective(ind::Individual)
+            rejection = _individual_candidate_rejection(ind, components)
+            rejection === nothing || return Err(ArgumentError(
+                "constant-search candidate rejected: $rejection",
+            ))
+            prepared_default = eval_fn === evaluate_default ?
+                prepare_default_evaluator(
+                    ind,
+                    components,
+                    config;
+                    copy_tree=false,
+                ) : nothing
+            total = 0.0
+            count = 0
+            for (xj, yj) in zip(data.X, data.Y)
+                yhat = try
+                    prepared_default === nothing ?
+                        eval_fn(ind, xj, components, config) :
+                        prepared_default(xj)
+                catch issue
+                    classified = candidate_failure(issue)
+                    strict_errors && !classified && rethrow()
+                    return Err(issue)
+                end
+                if yhat isa Err
+                    issue = yhat.value
+                    classified = candidate_failure(issue)
+                    strict_errors && !classified && throw(issue)
+                    return yhat
+                end
+                _finite_prediction(yhat) || return Err(NonFiniteOutputErr())
+                sample_loss = try
+                    loss_fn(yhat, yj)
+                catch issue
+                    classified = loss_failure(issue)
+                    strict_errors && !classified && rethrow()
+                    return Err(issue)
+                end
+                finite_loss = _finite_real_loss(sample_loss)
+                finite_loss === nothing && return Err(NonFiniteOutputErr())
+                total += finite_loss
+                count += 1
+            end
+            return total / max(count, 1)
+        end
+
         function _eval_ind!(i::Int)
             ind = pop[i]
             if candidate_rejection_reasons[i] !== nothing
@@ -1851,15 +1984,18 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
         evaluation_seconds = (time_ns() - evaluation_started_ns) / 1.0e9
         crossover_seconds = 0.0
         mutation_seconds = 0.0
+        constant_search_seconds = 0.0
         timing_snapshot(reproduction_seconds::Float64=0.0) = timing_enabled ? (;
             initialization_seconds,
             evaluation_seconds,
             reproduction_seconds,
             crossover_seconds,
             mutation_seconds,
+            constant_search_seconds,
             reproduction_other_seconds=max(
                 0.0,
-                reproduction_seconds - crossover_seconds - mutation_seconds,
+                reproduction_seconds - crossover_seconds - mutation_seconds -
+                    constant_search_seconds,
             ),
             generation_seconds=(time_ns() - generation_started_ns) / 1.0e9,
             threads=do_parallel ? Threads.nthreads() : 1,
@@ -1990,6 +2126,18 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
             :mutation_attempt => 0,
             :mutation_ok => 0,
             :mutation_err => 0,
+            :constant_search_attempt => 0,
+            :constant_search_applicable => 0,
+            :constant_search_improved => 0,
+            :constant_search_no_improvement => 0,
+            :constant_search_ineligible => 0,
+            :constant_search_invalid_source => 0,
+            :constant_search_proposals => 0,
+            :constant_search_objective_evaluations => 0,
+            :constant_search_nonfinite_outcomes => 0,
+            :constant_search_invalid_outcomes => 0,
+            :constant_search_scalar_proposals => 0,
+            :constant_search_tensor_proposals => 0,
             :bloat_rejected => 0,
             :candidate_rejected => 0,
             :n_capability_elite => 0,
@@ -2043,6 +2191,13 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
         tournament_size = get(config, :tournament_size, 7)
         mutation_rate = get(config, :mutation_rate, 0.7)
         crossover_rate = get(config, :crossover_rate, 0.2)
+        constantcfg = get(config, :constant_search, (; enabled=false))
+        constant_search_enabled = get(constantcfg, :enabled, false)
+        constant_search_share = Float64(get(constantcfg, :conditional_share, 0.4))
+        constant_search_budget = ConstantSearchBudget(
+            max_proposals=get(constantcfg, :max_proposals, 16),
+            max_objective_evals=get(constantcfg, :max_objective_evals, 17),
+        )
         crossover_op = components.crossover_op
 
         pending_children = Individual[]
@@ -2226,118 +2381,210 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
                     changed = crossed
                     rng_mut = derive_rng(seed, :mutate, g, slot_idx, attempt, ci)
                     if forced_parent !== nothing || rand(rng_mut) < mutation_rate
-                        _inc!(repro_stats, :mutation_attempt, 1)
-                        tyfactory = components.tyfactory_ctor()
-                        symfactory = SymbolGenerator()
-                        const_symfactory = components.const_symfactory_ctor()
-                        local_consts = copy(child.local_consts)
-                        local_consts_ty = copy(child.local_consts_ty)
-                        mutation_driver = get(
-                            components,
-                            :mutation_driver,
-                            Mutations.mutate_tree,
-                        )
-                        chooser = components.mutation_chooser
-                        if forced_tag !== nothing
-                            chooser_router = get(
-                                components,
-                                :capability_mutation_chooser,
-                                (tag, mutations, ordinary) -> ordinary,
+                        constant_route = false
+                        if forced_parent === nothing && constant_search_enabled
+                            rng_route = derive_rng(
+                                seed,
+                                :constant_search_route,
+                                g,
+                                slot_idx,
+                                attempt,
+                                ci,
                             )
-                            applicable(
-                                chooser_router,
-                                forced_tag,
-                                components.mutations,
-                                chooser,
-                            ) || throw(ArgumentError(
-                                "capability_mutation_chooser must accept " *
-                                "(tag, mutations, ordinary_chooser)",
-                            ))
-                            chooser = chooser_router(
-                                forced_tag,
-                                components.mutations,
-                                chooser,
-                            )
-                            chooser isa Mutations.AbstractPairChooser || throw(
-                                ArgumentError(
-                                    "capability_mutation_chooser must return an " *
-                                    "AbstractPairChooser",
-                                ),
-                            )
+                            constant_route = rand(rng_route) < constant_search_share
                         end
-                        mutation_started_ns = timing_enabled ? time_ns() : UInt64(0)
-                        mutated = mutation_driver(
-                            child.tree,
-                            reg.target_ty;
-                            rng=rng_mut,
-                            mutations=components.mutations,
-                            chooser,
-                            provider=components.mutation_provider,
-                            max_try=forced_parent === nothing ?
-                                components.mutation_max_try : get(
-                                    reprocfg,
-                                    :capability_mutation_max_try,
-                                    1,
-                                ),
-                            prune_consts=components.mutation_prune_consts,
-                            copy_tree=true,
-                            copy_ctx=true,
-                            global_consts=components.global_consts,
-                            global_consts_ty=global_type_ctx,
-                            local_consts=local_consts,
-                            local_consts_ty=local_consts_ty,
-                            tyfactory=tyfactory,
-                            symfactory=symfactory,
-                            const_symfactory=const_symfactory,
-                            bloat_policy=get(
-                                components,
-                                :bloat_policy,
-                                Mutations.BloatPolicy(),
-                            ),
-                            adaptive_policy=get(
-                                components,
-                                :mutation_adaptive_policy,
-                                Mutations.AdaptivePolicy(),
-                            ),
-                            type_inference=get(components, :type_inference, nothing),
-                            recorder=rec_mut,
-                        )
-                        timing_enabled && (mutation_seconds +=
-                            (time_ns() - mutation_started_ns) / 1.0e9)
-                        if mutated isa Err
-                            _inc!(repro_stats, :mutation_err, 1)
-                        else
-                            _remove_redundant_global_locals!(
-                                local_consts,
-                                local_consts_ty,
-                                components.global_consts,
+                        if constant_route
+                            _inc!(repro_stats, :constant_search_attempt, 1)
+                            rng_constant = derive_rng(
+                                seed,
+                                :constant_search,
+                                g,
+                                slot_idx,
+                                attempt,
+                                ci,
                             )
-                            candidate = Individual(
-                                mutated,
-                                reg.target_ty;
-                                local_consts,
-                                local_consts_ty,
-                                fitness=nothing,
-                                meta=(;),
+                            search_started_ns = timing_enabled ? time_ns() : UInt64(0)
+                            searched = search_constants(
+                                components.constant_search,
+                                child,
+                                _constant_training_objective;
+                                rng=rng_constant,
+                                budget=constant_search_budget,
                             )
-                            contract_error = _validate_individual_contract(
-                                candidate,
-                                reg,
-                                components,
-                                "mutation child $ci",
+                            timing_enabled && (constant_search_seconds +=
+                                (time_ns() - search_started_ns) / 1.0e9)
+                            search_stats = searched.stats
+                            _inc!(
+                                repro_stats,
+                                :constant_search_proposals,
+                                search_stats.proposals,
                             )
-                            contract_error === nothing || throw(contract_error)
-                            if _within_bloat_limit(
-                                candidate.tree,
-                                get(components, :bloat_policy, Mutations.BloatPolicy());
-                                parent_nodes=length(child.tree),
+                            _inc!(
+                                repro_stats,
+                                :constant_search_objective_evaluations,
+                                search_stats.objective_evaluations,
                             )
-                                _inc!(repro_stats, :mutation_ok, 1)
+                            _inc!(
+                                repro_stats,
+                                :constant_search_nonfinite_outcomes,
+                                search_stats.nonfinite_outcomes,
+                            )
+                            _inc!(
+                                repro_stats,
+                                :constant_search_invalid_outcomes,
+                                search_stats.invalid_outcomes,
+                            )
+                            _inc!(
+                                repro_stats,
+                                :constant_search_scalar_proposals,
+                                search_stats.scalar_proposals,
+                            )
+                            _inc!(
+                                repro_stats,
+                                :constant_search_tensor_proposals,
+                                search_stats.tensor_proposals,
+                            )
+                            if searched.status === :ineligible
+                                _inc!(repro_stats, :constant_search_ineligible, 1)
+                                constant_route = false
+                            elseif searched.status === :improved
+                                _inc!(repro_stats, :constant_search_applicable, 1)
+                                _inc!(repro_stats, :constant_search_improved, 1)
+                                contract_error = _validate_individual_contract(
+                                    searched.individual,
+                                    reg,
+                                    components,
+                                    "constant-search child $ci",
+                                )
+                                contract_error === nothing || throw(contract_error)
+                                child = searched.individual
                                 changed = true
-                                child = candidate
+                            elseif searched.status === :no_improvement
+                                _inc!(repro_stats, :constant_search_applicable, 1)
+                                _inc!(repro_stats, :constant_search_no_improvement, 1)
+                            elseif searched.status === :invalid_source
+                                _inc!(repro_stats, :constant_search_applicable, 1)
+                                _inc!(repro_stats, :constant_search_invalid_source, 1)
                             else
+                                throw(ArgumentError(
+                                    "unknown constant-search status: $(searched.status)",
+                                ))
+                            end
+                        end
+                        if !constant_route
+                            _inc!(repro_stats, :mutation_attempt, 1)
+                            tyfactory = components.tyfactory_ctor()
+                            symfactory = SymbolGenerator()
+                            const_symfactory = components.const_symfactory_ctor()
+                            local_consts = copy(child.local_consts)
+                            local_consts_ty = copy(child.local_consts_ty)
+                            mutation_driver = get(
+                                components,
+                                :mutation_driver,
+                                Mutations.mutate_tree,
+                            )
+                            chooser = components.mutation_chooser
+                            if forced_tag !== nothing
+                                chooser_router = get(
+                                    components,
+                                    :capability_mutation_chooser,
+                                    (tag, mutations, ordinary) -> ordinary,
+                                )
+                                applicable(
+                                    chooser_router,
+                                    forced_tag,
+                                    components.mutations,
+                                    chooser,
+                                ) || throw(ArgumentError(
+                                    "capability_mutation_chooser must accept " *
+                                    "(tag, mutations, ordinary_chooser)",
+                                ))
+                                chooser = chooser_router(
+                                    forced_tag,
+                                    components.mutations,
+                                    chooser,
+                                )
+                                chooser isa Mutations.AbstractPairChooser || throw(
+                                    ArgumentError(
+                                        "capability_mutation_chooser must return an " *
+                                        "AbstractPairChooser",
+                                    ),
+                                )
+                            end
+                            mutation_started_ns = timing_enabled ? time_ns() : UInt64(0)
+                            mutated = mutation_driver(
+                                child.tree,
+                                reg.target_ty;
+                                rng=rng_mut,
+                                mutations=components.mutations,
+                                chooser,
+                                provider=components.mutation_provider,
+                                max_try=forced_parent === nothing ?
+                                    components.mutation_max_try : get(
+                                        reprocfg,
+                                        :capability_mutation_max_try,
+                                        1,
+                                    ),
+                                prune_consts=components.mutation_prune_consts,
+                                copy_tree=true,
+                                copy_ctx=true,
+                                global_consts=components.global_consts,
+                                global_consts_ty=global_type_ctx,
+                                local_consts=local_consts,
+                                local_consts_ty=local_consts_ty,
+                                tyfactory=tyfactory,
+                                symfactory=symfactory,
+                                const_symfactory=const_symfactory,
+                                bloat_policy=get(
+                                    components,
+                                    :bloat_policy,
+                                    Mutations.BloatPolicy(),
+                                ),
+                                adaptive_policy=get(
+                                    components,
+                                    :mutation_adaptive_policy,
+                                    Mutations.AdaptivePolicy(),
+                                ),
+                                type_inference=get(components, :type_inference, nothing),
+                                recorder=rec_mut,
+                            )
+                            timing_enabled && (mutation_seconds +=
+                                (time_ns() - mutation_started_ns) / 1.0e9)
+                            if mutated isa Err
                                 _inc!(repro_stats, :mutation_err, 1)
-                                _inc!(repro_stats, :bloat_rejected, 1)
+                            else
+                                _remove_redundant_global_locals!(
+                                    local_consts,
+                                    local_consts_ty,
+                                    components.global_consts,
+                                )
+                                candidate = Individual(
+                                    mutated,
+                                    reg.target_ty;
+                                    local_consts,
+                                    local_consts_ty,
+                                    fitness=nothing,
+                                    meta=(;),
+                                )
+                                contract_error = _validate_individual_contract(
+                                    candidate,
+                                    reg,
+                                    components,
+                                    "mutation child $ci",
+                                )
+                                contract_error === nothing || throw(contract_error)
+                                if _within_bloat_limit(
+                                    candidate.tree,
+                                    get(components, :bloat_policy, Mutations.BloatPolicy());
+                                    parent_nodes=length(child.tree),
+                                )
+                                    _inc!(repro_stats, :mutation_ok, 1)
+                                    changed = true
+                                    child = candidate
+                                else
+                                    _inc!(repro_stats, :mutation_err, 1)
+                                    _inc!(repro_stats, :bloat_rejected, 1)
+                                end
                             end
                         end
                     end
@@ -2402,7 +2649,7 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
         if do_stats && get(statscfg, :print, false) && (g % get(statscfg, :every, 1) == 0)
             io = get(logcfg, :io, stdout)
             if repro_stats !== nothing
-                println(io, "  repro: children=$(repro_stats[:n_child_total]) clone=$(repro_stats[:n_child_clone]) changed=$(repro_stats[:n_child_changed]) capability_elite=$(repro_stats[:n_capability_elite]) capability_offspring=$(repro_stats[:n_capability_offspring]) candidate_rejected=$(repro_stats[:candidate_rejected]) resample=$(repro_stats[:n_resample]) immigrant=$(repro_stats[:n_immigrant]) clone_fallback=$(repro_stats[:n_clone_fallback]) cross(ok/err)=$(repro_stats[:crossover_ok])/$(repro_stats[:crossover_err]) mut(ok/err)=$(repro_stats[:mutation_ok])/$(repro_stats[:mutation_err])")
+                println(io, "  repro: children=$(repro_stats[:n_child_total]) clone=$(repro_stats[:n_child_clone]) changed=$(repro_stats[:n_child_changed]) capability_elite=$(repro_stats[:n_capability_elite]) capability_offspring=$(repro_stats[:n_capability_offspring]) candidate_rejected=$(repro_stats[:candidate_rejected]) resample=$(repro_stats[:n_resample]) immigrant=$(repro_stats[:n_immigrant]) clone_fallback=$(repro_stats[:n_clone_fallback]) cross(ok/err)=$(repro_stats[:crossover_ok])/$(repro_stats[:crossover_err]) mut(ok/err)=$(repro_stats[:mutation_ok])/$(repro_stats[:mutation_err]) const(attempt/improved/ineligible)=$(repro_stats[:constant_search_attempt])/$(repro_stats[:constant_search_improved])/$(repro_stats[:constant_search_ineligible])")
             end
             if mutation_stats !== nothing
                 tot = mutation_stats.totals
@@ -2428,6 +2675,7 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
     return FitResult(best, :max_generations, "Reached max generations", history, seed)
 end
 
+include("ConstantSearch.jl")
 include("TaskSchemas.jl")
 
 @testsnippet RegBaseImports begin
@@ -2633,6 +2881,52 @@ end
         source,
         target_ty;
         rng=MersenneTwister(1),
+        mutations=[recursive_mutation],
+        chooser=Mutations.WeightedPairChooser(
+            weights=Dict{Type,Float64}(typeof(recursive_mutation) => 1.0),
+        ),
+        provider=Mutations.IndexedProvider(),
+        max_try=1,
+        global_consts=globals,
+        global_consts_ty=global_types,
+    )
+
+    @test result isa AstTree
+    @test Procedural.functiondef_recursion_summary(result).self_calls == 1
+    inferred = Procedural.infer_procedural(result, global_types)
+    @test !(inferred isa Err)
+    @test iscompatible(inferred, target_ty)
+    @test iscompatible(target_ty, inferred)
+end
+
+@testitem "Regression startup constructs a guarded list-to-real scaffold" setup=[RegBaseImports] begin
+    using Random
+    using LambdaRegression: Procedural, ProceduralMutations
+    using LambdaRegression.TypeSystem:
+        UNCONS_CASE, TyList, get_type_ctx, iscompatible
+
+    list_float = TyList(FloatTy)
+    target_ty = TyFun(list_float, FloatTy)
+    globals = Dict{Symbol,Any}(
+        :UNCONS_CASE => UNCONS_CASE,
+        :ZERO => 0.0,
+    )
+    global_types = get_type_ctx(globals)
+    components = default_components(
+        global_consts=globals,
+        global_consts_ty=global_types,
+    )
+    recursive_mutation = only(filter(components.mutations) do mutation
+        mutation isa ProceduralMutations.FunctionDefMutation &&
+            ProceduralMutations._mode(mutation) === :recursive_body
+    end)
+    source = AstTree(Procedural.FunctionDefNode(
+        AbsNode(:series, ConstNode(:ZERO)),
+    ))
+    result = ProceduralMutations.mutate_procedural(
+        source,
+        target_ty;
+        rng=MersenneTwister(1111),
         mutations=[recursive_mutation],
         chooser=Mutations.WeightedPairChooser(
             weights=Dict{Type,Float64}(typeof(recursive_mutation) => 1.0),

@@ -1,0 +1,1150 @@
+"""
+    ScalarSearch
+
+Derived real-valued scalar expressions and conventional symbolic-regression
+search inside the ordinary typed program system. The authoritative
+representation remains an AST; scalar expressions are rebuildable caches that
+can be converted from supported AST regions and materialised transactionally
+into fixed program scaffolds.
+
+The module provides reference and prepared batched evaluation, a
+DynamicExpressions bridge, bounded generational search, and an optional
+regularized-evolution strategy with age replacement, rank tournaments,
+annealing, adaptive complexity frequencies, and a best-per-complexity archive.
+Both strategies use a conventional scalar mutation palette and independently
+bounded constant polishing. Initial candidates are not deeply polished; after
+structural search, remaining refinement budget may polish evolved candidates
+on the training loss–complexity frontier. The module also provides direct
+shape-preserving `MapPlan` and ordered `FoldPlan` adapters. A minimal evaluation
+path is:
+
+```julia
+expr = scalar_binary(:*, scalar_input(1),
+    scalar_unary(:sin, scalar_binary(:-, scalar_input(2), scalar_input(1))))
+y = evaluate_scalar(expr, X) # X is features × samples
+```
+
+Use `search_scalar(X, y; config=ScalarSearchConfig(...))` for independent
+scalar teachers, set `evolution_strategy=:regularized` for the steady-state
+path, or pass a contextual objective for a fixed program scaffold. Expected
+input-shape, numeric-domain, conversion, scaffold, and plan-shape failures are
+returned as `Err`; unsupported AST regions remain on the general program path.
+"""
+module ScalarSearch
+
+using TestItems
+using Random: AbstractRNG, default_rng, rand, randn
+using Optim
+using ..Utils: Err
+using ..ASTs.NodeASTs: AstNode, AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, LetNode
+using ..TypeSystem: FloatTy, TyLike
+
+export ScalarExpr, scalar_input, scalar_constant, scalar_unary, scalar_binary
+export evaluate_scalar_reference, scalar_from_ast, scalar_to_ast
+export PreparedScalarProgram, ScalarWorkspace, prepare_scalar, evaluate_scalar, evaluate_scalar!
+export ScalarSearchConfig, ScalarSearchResult, scalar_complexity
+export scalar_structure_similarity, search_scalar
+export FixedScalarCall, FixedScalarScaffold, ScalarMaterialization, materialize_scalar_scaffold
+export ScalarScaffoldErr
+export ScalarMapPlan, ScalarMapWorkspace, prepare_scalar_map, execute_scalar_map, execute_scalar_map!
+export ScalarFoldPlan, ScalarFoldWorkspace, prepare_scalar_fold, execute_scalar_fold
+export ScalarPlanShapeErr
+export ScalarInputShapeErr, ScalarDomainErr, ScalarConversionErr
+
+"""Base type for rebuildable real-valued scalar expressions."""
+abstract type ScalarExpr end
+
+struct _ScalarInput <: ScalarExpr
+    index::Int
+end
+
+struct _ScalarConstant <: ScalarExpr
+    value::Float64
+end
+
+struct _ScalarUnary <: ScalarExpr
+    op::Symbol
+    arg::ScalarExpr
+end
+
+struct _ScalarBinary <: ScalarExpr
+    op::Symbol
+    left::ScalarExpr
+    right::ScalarExpr
+end
+
+const _UNARY_AST = Dict(:sin => :FSIN, :cos => :FCOS, :sqrt => :FSQRT, :square => :SQR)
+const _BINARY_AST = Dict(:+ => :FADD, :- => :FSUB, :* => :FMUL, :/ => :FDIV)
+const _AST_UNARY = Dict(value => key for (key, value) in _UNARY_AST)
+const _AST_BINARY = Dict(value => key for (key, value) in _BINARY_AST)
+
+"""The feature matrix does not contain every feature requested by the expression."""
+struct ScalarInputShapeErr
+    required_features::Int
+    actual_features::Int
+end
+
+"""A scalar operator failed or produced a non-finite value at one sample."""
+struct ScalarDomainErr
+    op::Symbol
+    sample::Int
+end
+
+"""An AST region is outside the scalar language, or cannot be materialised."""
+struct ScalarConversionErr
+    reason::Symbol
+end
+
+"""Create a one-based scalar feature reference."""
+function scalar_input(index::Integer)
+    index >= 1 || throw(ArgumentError("scalar input indices are one-based and must be positive"))
+    return _ScalarInput(Int(index))
+end
+
+"""Create an ephemeral finite `Float64` scalar constant."""
+function scalar_constant(value::Real)
+    converted = Float64(value)
+    isfinite(converted) || throw(ArgumentError("scalar constants must be finite"))
+    return _ScalarConstant(converted)
+end
+
+"""Create a unary expression for `:sin`, `:cos`, `:sqrt`, or `:square`."""
+function scalar_unary(op::Symbol, arg::ScalarExpr)
+    haskey(_UNARY_AST, op) || throw(ArgumentError("unsupported scalar unary operator: $op"))
+    return _ScalarUnary(op, arg)
+end
+
+"""Create a binary expression for `:+`, `:-`, `:*`, or `:/`."""
+function scalar_binary(op::Symbol, left::ScalarExpr, right::ScalarExpr)
+    haskey(_BINARY_AST, op) || throw(ArgumentError("unsupported scalar binary operator: $op"))
+    return _ScalarBinary(op, left, right)
+end
+
+function _required_features(expr::_ScalarInput)
+    return expr.index
+end
+_required_features(::_ScalarConstant) = 0
+_required_features(expr::_ScalarUnary) = _required_features(expr.arg)
+_required_features(expr::_ScalarBinary) = max(_required_features(expr.left), _required_features(expr.right))
+
+function _eval_reference(expr::_ScalarInput, X, sample)
+    value = Float64(X[expr.index, sample])
+    return isfinite(value) ? value : Err(ScalarDomainErr(:input, sample))
+end
+_eval_reference(expr::_ScalarConstant, X, sample) = expr.value
+
+function _eval_reference(expr::_ScalarUnary, X, sample)
+    value = _eval_reference(expr.arg, X, sample)
+    value isa Err && return value
+    result = try
+        expr.op === :sin ? sin(value) :
+        expr.op === :cos ? cos(value) :
+        expr.op === :sqrt ? sqrt(value) :
+        value * value
+    catch error
+        error isa DomainError || rethrow()
+        return Err(ScalarDomainErr(expr.op, sample))
+    end
+    return isfinite(result) ? result : Err(ScalarDomainErr(expr.op, sample))
+end
+
+function _eval_reference(expr::_ScalarBinary, X, sample)
+    left = _eval_reference(expr.left, X, sample)
+    left isa Err && return left
+    right = _eval_reference(expr.right, X, sample)
+    right isa Err && return right
+    result = expr.op === :+ ? left + right :
+        expr.op === :- ? left - right :
+        expr.op === :* ? left * right : left / right
+    return isfinite(result) ? result : Err(ScalarDomainErr(expr.op, sample))
+end
+
+"""
+    evaluate_scalar_reference(expr, X) -> Vector{Float64} | Err
+
+Evaluate `expr` sample by sample over a `features × samples` real matrix. This
+path favours transparent semantics over speed and reports the first domain or
+non-finite failure with its one-based sample index.
+"""
+function evaluate_scalar_reference(expr::ScalarExpr, X::AbstractMatrix{<:Real})
+    required = _required_features(expr)
+    size(X, 1) >= required || return Err(ScalarInputShapeErr(required, size(X, 1)))
+    output = Vector{Float64}(undef, size(X, 2))
+    for sample in axes(X, 2)
+        value = _eval_reference(expr, X, sample)
+        value isa Err && return value
+        output[sample] = value
+    end
+    return output
+end
+
+function _dependency_index(node::AstNode, dependencies::AbstractVector{<:AstNode})
+    return findfirst(dependency -> dependency == node, dependencies)
+end
+
+function _scalar_from_ast(node::AstNode, dependencies, constant_values)
+    dependency = _dependency_index(node, dependencies)
+    dependency === nothing || return scalar_input(dependency)
+
+    if node isa ConstNode
+        if haskey(constant_values, node.name)
+            value = constant_values[node.name]
+            value isa Real || return Err(ScalarConversionErr(:nonreal_constant))
+            converted = Float64(value)
+            isfinite(converted) || return Err(ScalarConversionErr(:nonfinite_constant))
+            return scalar_constant(converted)
+        end
+        return Err(ScalarConversionErr(:unsupported_constant))
+    elseif node isa AppNode && node.func isa ConstNode && haskey(_AST_UNARY, node.func.name)
+        arg = _scalar_from_ast(node.arg, dependencies, constant_values)
+        arg isa Err && return arg
+        return scalar_unary(_AST_UNARY[node.func.name], arg)
+    elseif node isa AppNode && node.func isa AppNode &&
+            node.func.func isa ConstNode && haskey(_AST_BINARY, node.func.func.name)
+        left = _scalar_from_ast(node.func.arg, dependencies, constant_values)
+        left isa Err && return left
+        right = _scalar_from_ast(node.arg, dependencies, constant_values)
+        right isa Err && return right
+        return scalar_binary(_AST_BINARY[node.func.func.name], left, right)
+    end
+    return Err(ScalarConversionErr(:unsupported_ast))
+end
+
+"""
+    scalar_from_ast(node, dependencies; constant_values=Dict()) -> ScalarExpr | Err
+
+Recognise a supported real scalar region. `dependencies` defines the ordered
+feature boundary; named finite real constants may be supplied separately.
+"""
+function scalar_from_ast(node::AstNode, dependencies::AbstractVector{<:AstNode};
+        constant_values=Dict{Symbol,Float64}())
+    return _scalar_from_ast(node, dependencies, constant_values)
+end
+
+_default_constant_materializer(value) = nothing
+
+function _scalar_to_ast(expr::_ScalarInput, dependencies, materialize_constant)
+    expr.index <= length(dependencies) ||
+        return Err(ScalarConversionErr(:missing_dependency))
+    return deepcopy(dependencies[expr.index])
+end
+
+function _scalar_to_ast(expr::_ScalarConstant, dependencies, materialize_constant)
+    node = materialize_constant(expr.value)
+    return node isa AstNode ? node : Err(ScalarConversionErr(:unmaterialized_constant))
+end
+
+function _scalar_to_ast(expr::_ScalarUnary, dependencies, materialize_constant)
+    arg = _scalar_to_ast(expr.arg, dependencies, materialize_constant)
+    arg isa Err && return arg
+    return AppNode(ConstNode(_UNARY_AST[expr.op]), arg)
+end
+
+function _scalar_to_ast(expr::_ScalarBinary, dependencies, materialize_constant)
+    left = _scalar_to_ast(expr.left, dependencies, materialize_constant)
+    left isa Err && return left
+    right = _scalar_to_ast(expr.right, dependencies, materialize_constant)
+    right isa Err && return right
+    return AppNode(AppNode(ConstNode(_BINARY_AST[expr.op]), left), right)
+end
+
+"""
+    scalar_to_ast(expr, dependencies; materialize_constant=value -> nothing)
+
+Materialise a scalar expression as an ordinary AST. Feature dependencies are
+deep-copied. An expression containing ephemeral constants requires a callback
+that owns their eventual names and returns a `ConstNode` (or another AST node).
+"""
+function scalar_to_ast(expr::ScalarExpr, dependencies::AbstractVector{<:AstNode};
+        materialize_constant=_default_constant_materializer)
+    return _scalar_to_ast(expr, dependencies, materialize_constant)
+end
+
+@enum _ScalarOpcode::UInt8 begin
+    _OP_INPUT
+    _OP_CONSTANT
+    _OP_SIN
+    _OP_COS
+    _OP_SQRT
+    _OP_SQUARE
+    _OP_ADD
+    _OP_SUBTRACT
+    _OP_MULTIPLY
+    _OP_DIVIDE
+end
+
+struct _ScalarInstruction
+    opcode::_ScalarOpcode
+    left::Int
+    right::Int
+    value::Float64
+end
+
+"""
+    PreparedScalarProgram
+
+Immutable, thread-safe instruction plan compiled from a `ScalarExpr`. The plan
+contains no dataset or mutable scratch state and may therefore be shared across
+workers. Use one [`ScalarWorkspace`](@ref) per concurrent evaluation.
+"""
+struct PreparedScalarProgram
+    instructions::Tuple{Vararg{_ScalarInstruction}}
+    required_features::Int
+    source::ScalarExpr
+end
+
+"""Reusable, caller-owned scratch storage for prepared scalar evaluation."""
+mutable struct ScalarWorkspace
+    values::Vector{Float64}
+end
+
+ScalarWorkspace() = ScalarWorkspace(Float64[])
+
+function _compile_scalar!(instructions, expr::_ScalarInput)
+    push!(instructions, _ScalarInstruction(_OP_INPUT, expr.index, 0, 0.0))
+    return length(instructions)
+end
+
+function _compile_scalar!(instructions, expr::_ScalarConstant)
+    push!(instructions, _ScalarInstruction(_OP_CONSTANT, 0, 0, expr.value))
+    return length(instructions)
+end
+
+function _compile_scalar!(instructions, expr::_ScalarUnary)
+    arg = _compile_scalar!(instructions, expr.arg)
+    opcode = expr.op === :sin ? _OP_SIN :
+        expr.op === :cos ? _OP_COS :
+        expr.op === :sqrt ? _OP_SQRT : _OP_SQUARE
+    push!(instructions, _ScalarInstruction(opcode, arg, 0, 0.0))
+    return length(instructions)
+end
+
+function _compile_scalar!(instructions, expr::_ScalarBinary)
+    left = _compile_scalar!(instructions, expr.left)
+    right = _compile_scalar!(instructions, expr.right)
+    opcode = expr.op === :+ ? _OP_ADD :
+        expr.op === :- ? _OP_SUBTRACT :
+        expr.op === :* ? _OP_MULTIPLY : _OP_DIVIDE
+    push!(instructions, _ScalarInstruction(opcode, left, right, 0.0))
+    return length(instructions)
+end
+
+"""Compile a scalar expression into a rebuildable, dataset-independent plan."""
+function prepare_scalar(expr::ScalarExpr)
+    instructions = _ScalarInstruction[]
+    _compile_scalar!(instructions, expr)
+    return PreparedScalarProgram(Tuple(instructions), _required_features(expr), expr)
+end
+
+@inline _slot_start(slot::Int, samples::Int) = (slot - 1) * samples
+
+@inline function _opcode_symbol(opcode::_ScalarOpcode)
+    opcode === _OP_SIN && return :sin
+    opcode === _OP_COS && return :cos
+    opcode === _OP_SQRT && return :sqrt
+    opcode === _OP_SQUARE && return :square
+    opcode === _OP_ADD && return :+
+    opcode === _OP_SUBTRACT && return :-
+    opcode === _OP_MULTIPLY && return :*
+    opcode === _OP_DIVIDE && return :/
+    return opcode === _OP_INPUT ? :input : :constant
+end
+
+"""
+    evaluate_scalar!(output, prepared, X, workspace) -> output | Err
+
+Execute a prepared plan over a `features × samples` matrix without recursive
+per-sample tree dispatch. `output` must have one entry per sample. The workspace
+is reusable but deliberately not thread-safe; concurrent calls use distinct
+workspaces.
+"""
+function evaluate_scalar!(output::AbstractVector{Float64}, prepared::PreparedScalarProgram,
+        X::AbstractMatrix{<:Real}, workspace::ScalarWorkspace)
+    samples = size(X, 2)
+    length(output) == samples ||
+        throw(DimensionMismatch("scalar output length must equal the sample count"))
+    size(X, 1) >= prepared.required_features ||
+        return Err(ScalarInputShapeErr(prepared.required_features, size(X, 1)))
+
+    required_values = length(prepared.instructions) * samples
+    length(workspace.values) < required_values && resize!(workspace.values, required_values)
+    values = workspace.values
+    invalid = false
+
+    for (slot, instruction) in pairs(prepared.instructions)
+        destination = _slot_start(slot, samples)
+        if instruction.opcode === _OP_INPUT
+            feature = instruction.left
+            @inbounds for sample in 1:samples
+                value = Float64(X[feature, sample])
+                if isfinite(value)
+                    values[destination + sample] = value
+                else
+                    invalid = true
+                    values[destination + sample] = NaN
+                end
+            end
+        elseif instruction.opcode === _OP_CONSTANT
+            @inbounds for sample in 1:samples
+                values[destination + sample] = instruction.value
+            end
+        elseif instruction.opcode === _OP_SIN || instruction.opcode === _OP_COS ||
+                instruction.opcode === _OP_SQRT ||
+                instruction.opcode === _OP_SQUARE
+            source = _slot_start(instruction.left, samples)
+            @inbounds for sample in 1:samples
+                value = values[source + sample]
+                result = if instruction.opcode === _OP_SQRT && value < 0.0
+                    NaN
+                else
+                    instruction.opcode === _OP_SIN ? sin(value) :
+                        instruction.opcode === _OP_COS ? cos(value) :
+                        instruction.opcode === _OP_SQRT ? sqrt(value) : value * value
+                end
+                if isfinite(result)
+                    values[destination + sample] = result
+                else
+                    invalid = true
+                    values[destination + sample] = NaN
+                end
+            end
+        else
+            left = _slot_start(instruction.left, samples)
+            right = _slot_start(instruction.right, samples)
+            @inbounds for sample in 1:samples
+                left_value = values[left + sample]
+                right_value = values[right + sample]
+                result = instruction.opcode === _OP_ADD ? left_value + right_value :
+                    instruction.opcode === _OP_SUBTRACT ? left_value - right_value :
+                    instruction.opcode === _OP_MULTIPLY ? left_value * right_value :
+                    left_value / right_value
+                if isfinite(result)
+                    values[destination + sample] = result
+                else
+                    invalid = true
+                    values[destination + sample] = NaN
+                end
+            end
+        end
+    end
+
+    invalid && return evaluate_scalar_reference(prepared.source, X)
+    root = _slot_start(length(prepared.instructions), samples)
+    copyto!(output, 1, values, root + 1, samples)
+    return output
+end
+
+"""Allocate the output and scratch storage for one prepared scalar evaluation."""
+function evaluate_scalar(prepared::PreparedScalarProgram, X::AbstractMatrix{<:Real})
+    output = Vector{Float64}(undef, size(X, 2))
+    return evaluate_scalar!(output, prepared, X, ScalarWorkspace())
+end
+
+evaluate_scalar(expr::ScalarExpr, X::AbstractMatrix{<:Real}) =
+    evaluate_scalar(prepare_scalar(expr), X)
+
+include("search.jl")
+include("regularized_search.jl")
+include("dynamic_expressions.jl")
+include("node_regularized.jl")
+include("node_constant_refinement.jl")
+include("node_regularized_search.jl")
+include("node_regularized_state.jl")
+include("scaffolds.jl")
+include("plans.jl")
+
+@testsnippet ScalarSearchBaseImports begin
+    using Test
+    using Random
+    using LambdaRegression.ScalarSearch
+    using LambdaRegression.ASTs.NodeASTs: AppNode, ConstNode
+end
+
+@testitem "Scalar reference evaluator agrees with a worked batch and round trips AST" setup=[ScalarSearchBaseImports] begin
+    expr = scalar_binary(:*, scalar_input(1),
+        scalar_unary(:sin, scalar_binary(:-, scalar_input(2), scalar_input(1))))
+    X = [1.0 2.0 3.0; 4.0 6.0 8.0]
+
+    @test evaluate_scalar_reference(expr, X) ≈ X[1, :] .* sin.(X[2, :] .- X[1, :])
+
+    dependencies = [ConstNode(:x1), ConstNode(:x2)]
+    ast = AppNode(
+        AppNode(ConstNode(:FMUL), dependencies[1]),
+        AppNode(ConstNode(:FSIN),
+            AppNode(AppNode(ConstNode(:FSUB), dependencies[2]), dependencies[1])),
+    )
+    parsed = scalar_from_ast(ast, dependencies)
+    @test parsed isa ScalarExpr
+    @test scalar_to_ast(parsed, dependencies) == ast
+end
+
+@testitem "Scalar reference evaluator classifies domain failures" setup=[ScalarSearchBaseImports] begin
+    result = evaluate_scalar_reference(scalar_unary(:sqrt, scalar_input(1)),
+        reshape([-1.0, 4.0], 1, :))
+
+    @test result == LambdaRegression.Utils.Err(ScalarDomainErr(:sqrt, 1))
+end
+
+@testitem "Scalar cosine is an authoritative AST primitive" setup=[ScalarSearchBaseImports] begin
+    expr = scalar_unary(:cos, scalar_input(1))
+    X = reshape([0.0, 0.5, 1.0], 1, :)
+    ast = AppNode(ConstNode(:FCOS), ConstNode(:x))
+
+    @test evaluate_scalar(expr, X) ≈ cos.(X[1, :])
+    @test LambdaRegression.TypeSystem.get_type(LambdaRegression.TypeSystem.FCOS) ==
+        LambdaRegression.TypeSystem.TyFun(
+            LambdaRegression.TypeSystem.FloatTy,
+            LambdaRegression.TypeSystem.FloatTy,
+        )
+    @test LambdaRegression.CanonicalGeneration.test_catalog_consts()[:FCOS] ===
+        LambdaRegression.TypeSystem.FCOS
+    @test scalar_from_ast(ast, [ConstNode(:x)]) isa ScalarExpr
+    @test scalar_to_ast(expr, [ConstNode(:x)]) == ast
+end
+
+@testitem "Prepared scalar evaluator agrees with the reference corpus" setup=[ScalarSearchBaseImports] begin
+    x1, x2 = scalar_input(1), scalar_input(2)
+    expressions = ScalarExpr[
+        x1,
+        scalar_constant(2.5),
+        scalar_unary(:sin, scalar_binary(:-, x2, x1)),
+        scalar_unary(:sqrt,
+            scalar_binary(:+, scalar_unary(:square, x1), scalar_constant(0.25))),
+        scalar_binary(:/,
+            scalar_binary(:*, x1, scalar_unary(:sin, x2)),
+            scalar_binary(:+, scalar_unary(:square, x2), scalar_constant(1.0))),
+    ]
+    X = randn(MersenneTwister(1111), 2, 257)
+    workspace = ScalarWorkspace()
+
+    for expr in expressions
+        reference = evaluate_scalar_reference(expr, X)
+        prepared = prepare_scalar(expr)
+        output = zeros(size(X, 2))
+        @test evaluate_scalar!(output, prepared, X, workspace) ≈ reference
+        @test evaluate_scalar(prepared, X) ≈ reference
+    end
+
+    failing = prepare_scalar(scalar_unary(:sqrt, x1))
+    bad_X = reshape([1.0, -1.0], 1, :)
+    @test evaluate_scalar(failing, bad_X) ==
+        evaluate_scalar_reference(scalar_unary(:sqrt, x1), bad_X)
+
+    competing_failures = scalar_binary(:+,
+        scalar_unary(:sqrt, x1), scalar_unary(:sqrt, x2))
+    crossed_X = [1.0 -1.0; -1.0 1.0]
+    @test evaluate_scalar(prepare_scalar(competing_failures), crossed_X) ==
+        evaluate_scalar_reference(competing_failures, crossed_X)
+end
+
+@testitem "Prepared scalar plans erase instruction length from their type" setup=[ScalarSearchBaseImports] begin
+    short = prepare_scalar(scalar_binary(:+, scalar_input(1), scalar_input(2)))
+    long = prepare_scalar(scalar_binary(:*,
+        scalar_binary(:+, scalar_input(1), scalar_constant(1.0)),
+        scalar_unary(:sin, scalar_input(2))))
+
+    @test length(short.instructions) != length(long.instructions)
+    @test typeof(short) === typeof(long)
+end
+
+@testitem "Scalar structural similarity distinguishes equal-size topology" setup=[ScalarSearchBaseImports] begin
+    branched = scalar_binary(:+, scalar_input(1), scalar_constant(1.0))
+    nested = scalar_unary(:sin, scalar_unary(:square, scalar_input(1)))
+
+    @test scalar_complexity(branched) == scalar_complexity(nested)
+    @test scalar_structure_similarity(branched, nested) < 1.0
+    @test scalar_structure_similarity(branched, branched) == 1.0
+end
+
+@testitem "Prepared scalar evaluator matches generated finite expressions" setup=[ScalarSearchBaseImports] begin
+    rng = MersenneTwister(1234)
+    function finite_expression(depth)
+        if depth == 0
+            return rand(rng, Bool) ? scalar_input(rand(rng, 1:3)) :
+                scalar_constant(rand(rng) * 2 - 1)
+        end
+        choice = rand(rng, 1:7)
+        if choice == 1
+            return scalar_unary(:sin, finite_expression(depth - 1))
+        elseif choice == 2
+            return scalar_unary(:square, finite_expression(depth - 1))
+        elseif choice == 3
+            child = finite_expression(depth - 1)
+            return scalar_unary(:sqrt,
+                scalar_binary(:+, scalar_unary(:square, child), scalar_constant(0.25)))
+        elseif choice <= 6
+            operator = (:+, :-, :*)[choice - 3]
+            return scalar_binary(operator,
+                finite_expression(depth - 1), finite_expression(depth - 1))
+        end
+        denominator = finite_expression(depth - 1)
+        return scalar_binary(:/, finite_expression(depth - 1),
+            scalar_binary(:+, scalar_unary(:square, denominator), scalar_constant(1.0)))
+    end
+
+    X = rand(rng, 3, 129) .* 2 .- 1
+    workspace = ScalarWorkspace()
+    for _ in 1:64
+        expr = finite_expression(4)
+        expected = evaluate_scalar_reference(expr, X)
+        actual = zeros(size(X, 2))
+        @test evaluate_scalar!(actual, prepare_scalar(expr), X, workspace) ≈ expected
+    end
+
+    empty_X = Matrix{Float64}(undef, 3, 0)
+    @test evaluate_scalar(prepare_scalar(finite_expression(2)), empty_X) == Float64[]
+end
+
+@testitem "Scalar population search discovers a multistep polynomial" setup=[ScalarSearchBaseImports] begin
+    rng = MersenneTwister(1234)
+    X = rand(rng, 2, 128) .* 4 .- 2
+    y = @. X[1, :] * X[2, :] + X[1, :]
+    config = ScalarSearchConfig(
+        population_size=48,
+        max_evaluations=4_000,
+        max_complexity=15,
+        initial_depth=3,
+        unary_operators=[:sin, :square],
+        binary_operators=[:+, :-, :*],
+        constant_probability=0.1,
+        constant_refinement_iterations=0,
+        initial_affine_basis=false,
+    )
+
+    result = search_scalar(X, y; config, rng=MersenneTwister(1234))
+
+    @test result.best_loss <= 1.0e-12
+    @test result.evaluations <= config.max_evaluations
+    @test length(result.improvements) >= 2
+    @test result.generations >= 2
+    @test scalar_complexity(result.best) >= 5
+    @test evaluate_scalar(result.best, X) ≈ y atol=1.0e-6
+
+    repeated = search_scalar(X, y; config, rng=MersenneTwister(1234))
+    @test repeated.best_loss == result.best_loss
+    @test repeated.evaluations == result.evaluations
+    @test repeated.generations == result.generations
+    @test scalar_to_ast(repeated.best, [ConstNode(:x1), ConstNode(:x2)]) ==
+        scalar_to_ast(result.best, [ConstNode(:x1), ConstNode(:x2)])
+end
+
+@testitem "Scalar search defaults keep structure ahead of constant polishing" setup=[ScalarSearchBaseImports] begin
+    config = ScalarSearchConfig()
+
+    @test config.evolution_strategy === :generational
+    @test config.constant_refinement_iterations == 8
+    @test config.constant_refinement_elites == 2
+    @test config.constant_refinement_interval == 25
+    @test config.constant_refinement_start_generation == 25
+    @test config.constant_refinement_probability == 0.0
+    @test config.max_constant_refinement_evaluations == 10_000
+    @test config.constant_refinement_optimizer == :bfgs
+    @test config.complexity_balanced_tournament
+    @test config.mutation_probability == 0.9
+    @test config.crossover_probability == 0.05
+    @test config.random_restart_probability == 0.0
+    @test !config.initial_affine_basis
+end
+
+@testitem "Scalar search selects regularized evolution through its public configuration" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=24)), 1, :)
+    y = @. X[1, :]^2 + X[1, :]
+    config = ScalarSearchConfig(
+        population_size=8,
+        max_evaluations=40,
+        max_complexity=10,
+        initial_depth=2,
+        tournament_size=3,
+        elite_count=2,
+        unary_operators=[:square],
+        binary_operators=[:+, :*],
+        constant_refinement_iterations=0,
+        initial_pool_multiplier=1,
+        evolution_strategy=:regularized,
+    )
+
+    first_result = search_scalar(
+        X, y; config, rng=MersenneTwister(8000), stop_loss=nothing)
+    second_result = search_scalar(
+        X, y; config, rng=MersenneTwister(8000), stop_loss=nothing)
+
+    @test first_result.evaluations == config.max_evaluations
+    @test first_result.termination === :evaluation_cap
+    @test first_result.variation.oldest_replacements > 0
+    @test first_result.best_loss == second_result.best_loss
+    @test scalar_to_ast(first_result.best, [ConstNode(:x)]) ==
+        scalar_to_ast(second_result.best, [ConstNode(:x)])
+end
+
+@testitem "Scalar search can defer early stopping for archive selection" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=24)), 1, :)
+    y = copy(X[1, :])
+    config = ScalarSearchConfig(
+        population_size=6,
+        max_evaluations=24,
+        max_complexity=8,
+        initial_depth=1,
+        tournament_size=2,
+        elite_count=1,
+        unary_operators=[:square],
+        binary_operators=[:+],
+        constant_refinement_iterations=0,
+        initial_pool_multiplier=1,
+    )
+
+    result = search_scalar(X, y;
+        config, rng=MersenneTwister(1), stop_loss=nothing)
+
+    @test result.evaluations == config.max_evaluations
+    @test result.termination === :evaluation_cap
+    @test result.best_loss <= 1.0e-12
+end
+
+@testitem "Scalar search exposes random restart mutation" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=24)), 1, :)
+    y = @. X[1, :]^3 + 0.17
+    config = ScalarSearchConfig(
+        population_size=8,
+        max_evaluations=32,
+        max_complexity=8,
+        initial_depth=1,
+        tournament_size=3,
+        elite_count=1,
+        unary_operators=[:square],
+        binary_operators=[:+, :*],
+        mutation_probability=1.0,
+        crossover_probability=0.0,
+        random_restart_probability=1.0,
+        constant_refinement_iterations=0,
+        initial_pool_multiplier=1,
+    )
+
+    result = search_scalar(X, y; config, rng=MersenneTwister(42))
+
+    @test result.variation.mutation_attempts > 0
+    @test result.variation.mutation_kinds.restart ==
+        result.variation.mutation_attempts
+end
+
+@testitem "Scalar search exposes subtree graft mutation" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=32)), 1, :)
+    y = @. X[1, :] + sin(X[1, :])
+    config = ScalarSearchConfig(
+        population_size=8,
+        max_evaluations=96,
+        max_complexity=14,
+        initial_depth=2,
+        tournament_size=3,
+        elite_count=1,
+        unary_operators=[:sin],
+        binary_operators=[:+, :*],
+        mutation_probability=1.0,
+        crossover_probability=0.0,
+        constant_refinement_iterations=0,
+        initial_pool_multiplier=1,
+    )
+
+    result = search_scalar(X, y; config, rng=MersenneTwister(1234))
+
+    @test result.variation.mutation_kinds.graft > 0
+    @test sum(values(result.variation.mutation_kinds)) ==
+        result.variation.mutation_attempts
+end
+
+@testitem "Scalar search exposes tree rotation mutation" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=32)), 1, :)
+    y = @. 0.65 * X[1, :] + 0.2 * sin(X[1, :]) - 0.1
+    config = ScalarSearchConfig(
+        population_size=8,
+        max_evaluations=96,
+        max_complexity=14,
+        initial_depth=3,
+        tournament_size=3,
+        elite_count=1,
+        unary_operators=[:sin, :square],
+        binary_operators=[:+, :*],
+        mutation_probability=1.0,
+        crossover_probability=0.0,
+        constant_refinement_iterations=0,
+        initial_pool_multiplier=1,
+    )
+
+    result = search_scalar(X, y; config, rng=MersenneTwister(42))
+
+    @test result.variation.mutation_kinds.rotate > 0
+    @test sum(values(result.variation.mutation_kinds)) ==
+        result.variation.mutation_attempts
+end
+
+@testitem "Scalar search refines constants with separate accounting" setup=[ScalarSearchBaseImports] begin
+    X = [
+        -1.0 -0.5 0.0 0.5 1.0 -0.75 0.25 0.8;
+         0.2  0.9 -0.4 1.0 -0.7 -0.25 0.65 -0.9;
+    ]
+    y = @. 0.75 * X[1, :] - 1.25 * X[2, :] + 0.5
+    approximate = scalar_binary(:+,
+        scalar_binary(:+,
+            scalar_binary(:*, scalar_constant(0.2), scalar_input(1)),
+            scalar_binary(:*, scalar_constant(-0.3), scalar_input(2))),
+        scalar_constant(1.1))
+    config = ScalarSearchConfig(
+        population_size=2,
+        max_evaluations=4,
+        max_complexity=16,
+        initial_depth=1,
+        tournament_size=1,
+        elite_count=1,
+        unary_operators=[:square],
+        binary_operators=[:+, :-, :*],
+        constant_probability=0.2,
+        constant_refinement_iterations=160,
+        constant_refinement_elites=1,
+        constant_refinement_interval=1,
+        constant_refinement_start_generation=1,
+        constant_refinement_probability=0.0,
+        max_constant_refinement_evaluations=1_000,
+        initial_pool_multiplier=1,
+    )
+
+    result = search_scalar(
+        X,
+        y;
+        config,
+        rng=MersenneTwister(8000),
+        initial_population=[approximate, approximate],
+    )
+
+    @test result.best_loss <= 1.0e-5
+    @test result.evaluations <= config.max_evaluations
+    @test result.constant_refinement_evaluations > 0
+    @test result.constant_refinement_evaluations <=
+        config.max_constant_refinement_evaluations
+    @test result.constant_refinement_invalid_evaluations == 0
+end
+
+@testitem "Scalar search does not polish the unevolved initial pool" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=24)), 1, :)
+    y = @. 0.7 * X[1, :] + 0.2
+    approximate = scalar_binary(:+,
+        scalar_binary(:*, scalar_constant(0.4), scalar_input(1)),
+        scalar_constant(0.0))
+    config = ScalarSearchConfig(
+        population_size=8,
+        max_evaluations=8,
+        max_complexity=8,
+        initial_depth=1,
+        unary_operators=[:square],
+        binary_operators=[:+, :*],
+        constant_refinement_iterations=32,
+        constant_refinement_elites=2,
+        constant_refinement_interval=2,
+        initial_pool_multiplier=1,
+        initial_affine_basis=false,
+    )
+
+    result = search_scalar(
+        X,
+        y;
+        config,
+        rng=MersenneTwister(555),
+        initial_population=[approximate],
+    )
+
+    @test result.generations == 0
+    @test result.constant_refinement_evaluations == 0
+
+    delayed = ScalarSearchConfig(
+        population_size=8,
+        max_evaluations=16,
+        max_complexity=8,
+        initial_depth=1,
+        unary_operators=[:square],
+        binary_operators=[:+, :*],
+        constant_refinement_iterations=32,
+        constant_refinement_elites=2,
+        constant_refinement_interval=1,
+        constant_refinement_start_generation=3,
+        constant_refinement_probability=1.0,
+        initial_pool_multiplier=1,
+    )
+    delayed_result = search_scalar(
+        X,
+        y;
+        config=delayed,
+        rng=MersenneTwister(555),
+        initial_population=fill(approximate, delayed.population_size),
+    )
+
+    @test delayed_result.generations < delayed.constant_refinement_start_generation
+    @test delayed_result.constant_refinement_evaluations == 0
+end
+
+@testitem "Scalar search polishes evolved Pareto candidates at the final boundary" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=24)), 1, :)
+    y = @. 0.7 * X[1, :] + 0.2
+    approximate = scalar_binary(:+,
+        scalar_binary(:*, scalar_constant(0.4), scalar_input(1)),
+        scalar_constant(0.0))
+    config = ScalarSearchConfig(
+        population_size=2,
+        max_evaluations=4,
+        max_complexity=8,
+        initial_depth=1,
+        tournament_size=1,
+        elite_count=1,
+        unary_operators=[:square],
+        binary_operators=[:+, :*],
+        mutation_probability=1.0,
+        crossover_probability=0.0,
+        constant_refinement_iterations=64,
+        constant_refinement_elites=1,
+        constant_refinement_interval=100,
+        constant_refinement_start_generation=1,
+        constant_refinement_probability=0.0,
+        max_constant_refinement_evaluations=500,
+        initial_pool_multiplier=1,
+    )
+
+    result = search_scalar(
+        X,
+        y;
+        config,
+        rng=MersenneTwister(2000),
+        initial_population=fill(approximate, config.population_size),
+        stop_loss=nothing,
+    )
+
+    @test result.evaluations == config.max_evaluations
+    @test result.variation.mutation_kinds.constant > 0
+    @test result.constant_refinement_evaluations > 0
+    @test result.constant_refinement_evaluations <=
+        config.max_constant_refinement_evaluations
+    @test result.best_loss <= 1.0e-8
+end
+
+@testitem "Scalar search reports diverse leaders and variation outcomes" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=32)), 1, :)
+    y = @. X[1, :] * X[1, :] + X[1, :] + 0.001 * sin(7 * X[1, :])
+    config = ScalarSearchConfig(
+        population_size=12,
+        max_evaluations=125,
+        max_complexity=12,
+        initial_depth=2,
+        unary_operators=[:square],
+        binary_operators=[:+, :*],
+        constant_refinement_iterations=8,
+    )
+
+    result = search_scalar(X, y; config, rng=MersenneTwister(1234))
+
+    @test !isempty(result.leaders)
+    @test length(result.leaders) <= 8
+    @test all(leader -> leader.loss >= result.best_loss, result.leaders)
+    @test result.variation.attempts == result.variation.changed + result.variation.unchanged
+    @test sum(values(result.variation.mutation_kinds)) ==
+        result.variation.mutation_attempts
+    @test sum(entry.count for entry in result.variation.final_complexity_histogram) ==
+        result.variation.final_population_size
+    @test result.variation.final_population_size == config.population_size
+    @test 1 <= result.variation.final_unique_structures <=
+        result.variation.final_population_size
+    @test issorted(entry.complexity for entry in result.complexity_archive)
+    @test allunique(entry.complexity for entry in result.complexity_archive)
+    @test minimum(entry.loss for entry in result.complexity_archive) == result.best_loss
+    @test 0.0 <= scalar_structure_similarity(result.leaders[1].expr,
+        result.leaders[end].expr) <= 1.0
+    @test scalar_structure_similarity(
+        scalar_binary(:+, scalar_input(1), scalar_constant(1.0)),
+        scalar_binary(:+, scalar_input(1), scalar_constant(2.0)),
+    ) == 1.0
+end
+
+@testitem "Scalar search discovers a coefficient-bearing analytic teacher" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=96)), 1, :)
+    y = @. sin(X[1, :]) + 0.3 * X[1, :] * X[1, :] - 0.2
+    config = ScalarSearchConfig(
+        population_size=32,
+        max_evaluations=12_000,
+        max_complexity=16,
+        initial_depth=3,
+        unary_operators=[:sin, :square],
+        binary_operators=[:+, :*],
+        constant_probability=0.2,
+        mutation_probability=0.9,
+        crossover_probability=0.05,
+        constant_refinement_iterations=16,
+        constant_refinement_elites=2,
+        constant_refinement_interval=10,
+        constant_refinement_start_generation=1,
+        constant_refinement_probability=0.01,
+        initial_affine_basis=false,
+    )
+
+    result = search_scalar(X, y; config, rng=MersenneTwister(8000))
+
+    @test result.best_loss <= 1.0e-5
+    @test result.generations > 0
+    @test result.variation.attempts > 0
+    @test result.constant_refinement_evaluations > 0
+    @test result.variation.mutation_kinds.scale > 0
+    @test result.variation.mutation_kinds.shift > 0
+end
+
+@testitem "Scalar search accepts a contextual repeated-call objective" setup=[ScalarSearchBaseImports] begin
+    X = reshape(collect(range(-1.0, 1.0; length=48)), 1, :)
+    triple_target = @. 3 * (X[1, :] * X[1, :] + X[1, :])
+    objective_calls = Ref(0)
+    function repeated_objective(expr)
+        objective_calls[] += 1
+        prediction = evaluate_scalar(expr, X)
+        prediction isa LambdaRegression.Utils.Err && return prediction
+        return sum(abs2, 3 .* prediction .- triple_target) / length(triple_target)
+    end
+    config = ScalarSearchConfig(
+        population_size=16,
+        max_evaluations=512,
+        max_complexity=12,
+        initial_depth=2,
+        unary_operators=[:square],
+        binary_operators=[:+, :*],
+        constant_refinement_iterations=16,
+    )
+
+    result = search_scalar(
+        X,
+        zeros(size(X, 2));
+        objective=repeated_objective,
+        config,
+        rng=MersenneTwister(2000),
+    )
+
+    @test result.best_loss <= 1.0e-10
+    @test objective_calls[] >= result.evaluations
+end
+
+@testitem "Fixed scalar scaffold materializes shared constants transactionally" setup=[ScalarSearchBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
+
+    apply2(op, left, right) = AppNode(AppNode(ConstNode(op), left), right)
+    template = AstTree(AbsNode(:a, AbsNode(:b, AbsNode(:c,
+        apply2(:FADD,
+            apply2(:FADD, ConstNode(:PHI_A), ConstNode(:PHI_B)),
+            ConstNode(:PHI_C)),
+    ))))
+    original = deepcopy(template)
+    scaffold = FixedScalarScaffold(template, [
+        FixedScalarCall(:PHI_A, [IndexNode(2)]),
+        FixedScalarCall(:PHI_B, [IndexNode(1)]),
+        FixedScalarCall(:PHI_C, [IndexNode(0)]),
+    ])
+    x = scalar_input(1)
+    candidate = scalar_binary(:+, scalar_unary(:square, x), scalar_constant(0.5))
+
+    materialized = materialize_scalar_scaffold(scaffold, candidate)
+
+    @test materialized isa ScalarMaterialization
+    @test template == original
+    @test length(materialized.local_consts) == 1
+    @test length(materialized.local_consts_ty) == 1
+    second_materialized = materialize_scalar_scaffold(scaffold, candidate)
+    @test second_materialized.local_consts !== materialized.local_consts
+    @test second_materialized.tree !== materialized.tree
+    prepared = LambdaRegression.Procedural.prepare_procedural(materialized.tree)
+    context = merge(
+        Dict{Symbol,Any}(:FADD => LambdaRegression.TypeSystem.FADD,
+            :SQR => LambdaRegression.TypeSystem.SQR),
+        materialized.local_consts,
+    )
+    @test LambdaRegression.Procedural.run_procedural(
+        prepared, context; args=(1.0, 2.0, 3.0), max_steps=256) ≈ 15.5
+    inferred = LambdaRegression.TypeSystem.infer(
+        materialized.tree,
+        merge(LambdaRegression.TypeSystem.get_type_ctx(Dict{Symbol,Any}(
+            :FADD => LambdaRegression.TypeSystem.FADD,
+            :SQR => LambdaRegression.TypeSystem.SQR,
+        )), materialized.local_consts_ty),
+    )
+    expected = LambdaRegression.TypeSystem.TyFun(
+        LambdaRegression.TypeSystem.FloatTy,
+        LambdaRegression.TypeSystem.TyFun(
+            LambdaRegression.TypeSystem.FloatTy,
+            LambdaRegression.TypeSystem.TyFun(
+                LambdaRegression.TypeSystem.FloatTy,
+                LambdaRegression.TypeSystem.FloatTy,
+            ),
+        ),
+    )
+    @test LambdaRegression.TypeSystem.iscompatible(inferred, expected)
+end
+
+@testitem "Fixed scalar scaffold resolves nested shared calls" setup=[ScalarSearchBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
+
+    template = AstTree(AbsNode(:x, ConstNode(:PHI_3)))
+    scaffold = FixedScalarScaffold(template, [
+        FixedScalarCall(:PHI_1, [IndexNode(0)]),
+        FixedScalarCall(:PHI_2, [ConstNode(:PHI_1)]),
+        FixedScalarCall(:PHI_3, [ConstNode(:PHI_2)]),
+    ])
+    candidate = scalar_binary(:+, scalar_input(1), scalar_constant(0.5))
+
+    materialized = materialize_scalar_scaffold(scaffold, candidate)
+
+    @test materialized isa ScalarMaterialization
+    @test length(materialized.local_consts) == 1
+    prepared = LambdaRegression.Procedural.prepare_procedural(materialized.tree)
+    context = merge(
+        Dict{Symbol,Any}(:FADD => LambdaRegression.TypeSystem.FADD),
+        materialized.local_consts,
+    )
+    @test LambdaRegression.Procedural.run_procedural(
+        prepared, context; args=(1.0,), max_steps=256) ≈ 2.5
+
+    cyclic = FixedScalarScaffold(
+        AstTree(AbsNode(:x, ConstNode(:PHI_A))),
+        [
+            FixedScalarCall(:PHI_A, [ConstNode(:PHI_B)]),
+            FixedScalarCall(:PHI_B, [ConstNode(:PHI_A)]),
+        ],
+    )
+    issue = materialize_scalar_scaffold(cyclic, candidate)
+    @test issue isa LambdaRegression.Utils.Err
+    @test issue.value == ScalarScaffoldErr(:cyclic_dependency, :PHI_A)
+end
+
+@testitem "Direct scalar map preserves dense and nested shapes" setup=[ScalarSearchBaseImports] begin
+    expr = scalar_binary(:+, scalar_unary(:square, scalar_input(1)), scalar_input(2))
+    plan = prepare_scalar_map(expr; parameter_count=1)
+    input = [1.0 2.0 3.0; 4.0 5.0 6.0]
+    output = similar(input)
+    workspace = ScalarMapWorkspace()
+
+    @test execute_scalar_map!(output, plan, input, (0.5,), workspace) === output
+    @test output ≈ input .^ 2 .+ 0.5
+
+    nested = [[1.0, 2.0], [3.0, 4.0, 5.0]]
+    nested_output = execute_scalar_map(plan, nested, (0.5,))
+    @test length.(nested_output) == [2, 3]
+    @test nested_output == [[1.5, 4.5], [9.5, 16.5, 25.5]]
+
+    domain_plan = prepare_scalar_map(scalar_unary(:sqrt, scalar_input(1)))
+    @test execute_scalar_map(domain_plan, [-1.0, 4.0]) ==
+        LambdaRegression.Utils.Err(ScalarDomainErr(:sqrt, 1))
+end
+
+@testitem "Direct scalar fold is ordered and supports array accumulators" setup=[ScalarSearchBaseImports] begin
+    subtract = prepare_scalar_fold(
+        scalar_binary(:-, scalar_input(1), scalar_input(2)))
+    @test execute_scalar_fold(subtract, [1.0, 2.0, 3.0], 10.0) == 4.0
+    @test execute_scalar_fold(subtract, Float64[], 10.0) == 10.0
+
+    add = prepare_scalar_fold(scalar_binary(:+, scalar_input(1), scalar_input(2)))
+    sequence = [[1.0, 2.0], [3.0, 4.0]]
+    result = execute_scalar_fold(add, sequence, [10.0, 20.0])
+    @test result == [14.0, 26.0]
+
+    bad = execute_scalar_fold(add, [[1.0], [2.0, 3.0]], [0.0])
+    @test bad == LambdaRegression.Utils.Err(ScalarPlanShapeErr(:fold_item_shape))
+end
+
+end # module ScalarSearch

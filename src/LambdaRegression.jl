@@ -20,6 +20,10 @@ include("typesystem/TypeSystem.jl")
 using .TypeSystem
 export TypeSystem
 
+include("scalar/ScalarSearch.jl")
+using .ScalarSearch
+export ScalarSearch
+
 include("factories/ValueFactories.jl")
 using .ValueFactories
 export ValueFactories

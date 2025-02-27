@@ -419,6 +419,7 @@ export BloatPolicy, AdaptivePolicy
 export MutationAttemptRecorder, mutation_recorder_summary
 export prune_local_consts!
 export ConstMutation, ScalarConstMutation, BoolConstMutation, ArrayConstMutation, ConstValueMutationPolicy
+export ParameterIntroductionMutation
 export PointMutation
 export SubtreeReplacementMutation, ContextualExpansionMutation
 export UnaryCompositionMutation, BinaryCompositionMutation
@@ -980,6 +981,7 @@ Selection model:
   `Dict{DataType,Float64}` inputs remain accepted. Defaults:
 - `ScalarConstMutation => 0.25`
 - `ArrayConstMutation => 0.25`
+- `ParameterIntroductionMutation => 0.15`
 - `BoolConstMutation => 0.05`
 - `PointMutation => 0.10`
 - `CSEMutation => 0.08`
@@ -1032,6 +1034,7 @@ function WeightedPairChooser(; weights=nothing, cache_eligibility::Bool=false)
         # Split constant operators (preferred).
         ScalarConstMutation => 0.25,
         ArrayConstMutation => 0.25,
+        ParameterIntroductionMutation => 0.15,
         BoolConstMutation => 0.05,
         # Backwards-compatible wrapper.
         ConstMutation => 0.55,
@@ -1403,6 +1406,90 @@ end
 
 site_weight(m::SubtreeReplacementMutation, site::Site, env::MutationEnv, ctx::NamedTuple) =
     site_selection_weight(m.site_selection, site, env, ctx)
+
+"""
+    ParameterIntroductionMutation(; σ=1.0, site_lock, site_selection)
+
+Introduce a fresh mutable real parameter at a typed expression site.
+
+The operator anchors on the site's inferred type and supports `Float` plus
+fixed-shape nested `TyArray[..., Float]`. It requires `ctx.local_consts`,
+`ctx.local_consts_ty`, and `ctx.const_symfactory`; the ordinary mutation driver
+provides these fields. Unsupported/open shapes have no eligible site. A chosen
+site is replaced transactionally with a new local constant, so final inference
+and bloat validation remain owned by `mutate_tree`. The default site policy
+does not penalize lexical depth: numeric sites in an ordinary function body
+must not become unreachable merely because they are enclosed by lambdas.
+"""
+struct ParameterIntroductionMutation <: AbstractMutation
+    σ::Float64
+    site_lock::AbstractSiteLockPolicy
+    site_selection::AbstractSiteSelectionPolicy
+end
+
+function ParameterIntroductionMutation(;
+    σ::Real=1.0,
+    site_lock::AbstractSiteLockPolicy=DefaultSiteLockPolicy(spine_only=false),
+    site_selection::AbstractSiteSelectionPolicy=ExponentialSiteSelectionPolicy(
+        scope_bias=0.0,
+    ),
+)
+    scale = Float64(σ)
+    isfinite(scale) && scale > 0 || throw(ArgumentError(
+        "parameter introduction σ must be finite and positive",
+    ))
+    return ParameterIntroductionMutation(scale, site_lock, site_selection)
+end
+
+required_site_kinds(::ParameterIntroductionMutation) = Symbol[:any]
+
+function _real_parameter_shape(ty::Ty)
+    current = TypeSystem.prune(ty)
+    current == FloatTy && return ()
+    dimensions = Int[]
+    while current isa TyArray
+        length_ty = TypeSystem.prune(current.len)
+        length_ty isa TyNat || return nothing
+        push!(dimensions, length_ty.value)
+        current = TypeSystem.prune(current.elem)
+    end
+    current == FloatTy || return nothing
+    isempty(dimensions) && return nothing
+    return Tuple(dimensions)
+end
+
+function is_site_eligible(
+    mutation::ParameterIntroductionMutation,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+)
+    is_site_locked(mutation.site_lock, site, env, ctx) && return false
+    _real_parameter_shape(site.ty) === nothing && return false
+    return site_selection_weight(mutation.site_selection, site, env, ctx) > 0
+end
+
+site_weight(
+    mutation::ParameterIntroductionMutation,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+) = site_selection_weight(mutation.site_selection, site, env, ctx)
+
+function apply(
+    mutation::ParameterIntroductionMutation,
+    tree::AstTree,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+)
+    shape = _real_parameter_shape(site.ty)
+    shape === nothing && return Err(UnsupportedConstTyErr(site.ty))
+    value = isempty(shape) ?
+        randn(env.rng) * mutation.σ :
+        randn(env.rng, Float64, shape...) .* mutation.σ
+    return _apply_local_const_mutation!(tree, site, ctx, value)
+end
 
 function _collect_const_names!(names::Set{Symbol}, node::AstNode)
     node isa ConstNode && push!(names, node.name)
@@ -2565,6 +2652,7 @@ end
 """Return a fresh authoritative baseline mutation set."""
 function default_mutations()
     return AbstractMutation[
+        ParameterIntroductionMutation(),
         ScalarConstMutation(),
         BoolConstMutation(),
         ArrayConstMutation(),
@@ -3098,6 +3186,95 @@ end
     @test size(out) == size(value)
     @test isapprox(delta[:, :, 1], delta[:, :, 2])
     @test length(unique(round.(vec(delta[:, :, 1]); digits=10))) > 1
+end
+
+@testitem "Mutations ParameterIntroductionMutation creates a typed scalar parameter" setup=[MutBaseImports] begin
+    using LambdaRegression.Mutations:
+        ParameterIntroductionMutation, PathSiteSelectionPolicy
+    using LambdaRegression.TypeSystem: FADD, SQR, get_type_ctx, infer, iscompatible
+
+    tree = AstTree(AbsNode(
+        :x,
+        AppNode(
+            AppNode(
+                ConstNode(:FADD),
+                AppNode(ConstNode(:SQR), IndexNode(0)),
+            ),
+            IndexNode(0),
+        ),
+    ))
+    target_ty = TyFun(FloatTy, FloatTy)
+    local_consts = Dict{Symbol,Any}()
+    local_consts_ty = Dict{Symbol,TyLike}()
+    mutation = ParameterIntroductionMutation(
+        σ=0.5,
+        site_selection=PathSiteSelectionPolicy([1, 1, 2]),
+    )
+    globals = Dict{Symbol,Any}(:FADD => FADD, :SQR => SQR)
+    global_types = get_type_ctx(globals)
+
+    mutated = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(1234),
+        global_consts=globals,
+        global_consts_ty=global_types,
+        local_consts,
+        local_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(
+            weights=Dict{DataType,Float64}(ParameterIntroductionMutation => 1.0),
+        ),
+        provider=IndexedProvider(),
+        max_try=1,
+    )
+
+    @test mutated isa AstTree
+    @test mutated.root.body.func.arg isa ConstNode
+    name = mutated.root.body.func.arg.name
+    @test local_consts[name] isa Float64
+    @test local_consts_ty[name] == FloatTy
+    @test tree.root.body.func.arg isa AppNode
+    inferred = infer(mutated, merge(global_types, local_consts_ty))
+    @test !(inferred isa Err)
+    @test iscompatible(inferred, target_ty)
+end
+
+@testitem "Mutations ParameterIntroductionMutation creates dense tensor blocks" setup=[MutBaseImports] begin
+    using LambdaRegression.Mutations: ParameterIntroductionMutation
+
+    tensor_ty = TyArray(TyNat(2), TyArray(TyNat(3), FloatTy))
+    tree = AstTree(ConstNode(:INPUT))
+    global_types = Dict{Symbol,TyLike}(:INPUT => tensor_ty)
+    local_consts = Dict{Symbol,Any}()
+    local_consts_ty = Dict{Symbol,TyLike}()
+    mutation = ParameterIntroductionMutation(σ=0.25)
+
+    mutated = mutate_tree(
+        tree,
+        tensor_ty;
+        rng=MersenneTwister(8000),
+        global_consts=Dict{Symbol,Any}(:INPUT => zeros(2, 3)),
+        global_consts_ty=global_types,
+        local_consts,
+        local_consts_ty,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(
+            weights=Dict{DataType,Float64}(ParameterIntroductionMutation => 1.0),
+        ),
+        provider=IndexedProvider(),
+        max_try=1,
+    )
+
+    @test mutated isa AstTree
+    @test mutated.root isa ConstNode
+    @test mutated.root.name != :INPUT
+    value = local_consts[mutated.root.name]
+    @test value isa Matrix{Float64}
+    @test size(value) == (2, 3)
+    @test any(!iszero, value)
+    @test local_consts_ty[mutated.root.name] == tensor_ty
+    @test tree.root == ConstNode(:INPUT)
 end
 
 @testitem "Mutations PointMutation Index swap respects binder types" setup=[MutBaseImports] begin
