@@ -28,6 +28,11 @@ Status
 - For diagnostics, `fit!` supports `callback(state)`, optional per-generation
   timing through `config.timing.enabled`, and an optional
   `components.init_population(...)` hook.
+- An optional caller-owned `components.retention` channel may archive valid
+  individuals, inject ordinary migrants, and expose retention diagnostics as
+  `callback(state).retention`. Mutable channels persist for their object
+  lifetime; create a fresh channel for each independent fit unless cross-fit
+  memory is intentional.
 - Thread-safe primitives for SR paths live in `ASTs.Contexts.EvalContext` and
   `TypeSystem.make_tyvar_factory`.
 """
@@ -1791,6 +1796,10 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
 
     seed = haskey(config, :seed) ? UInt64(config.seed) : rand(reg.rng, UInt64)
 
+    # Optional retention channel composed through components.retention; an
+    # absent channel (the default) leaves population dynamics unchanged.
+    retention = get(components, :retention, nothing)
+
     # Merge typing contexts used by crossover (and optionally by evaluation logging).
     global_type_ctx = merge(components.global_consts_ty, components.input_types)
 
@@ -2011,6 +2020,9 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
             best_loss = gen_best_loss
             best = pop[best_idx]
         end
+        if retention !== nothing
+            record!(retention, pop, losses, complexities, valid_candidates, perm)
+        end
         eval_stats = (;
             n_eval_err=sum(eval_err_counts),
             n_eval_exception=sum(eval_exception_counts),
@@ -2081,6 +2093,7 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
                 best_loss=best_loss,
                 eval_stats=eval_stats,
                 timing_stats=timing_snapshot(),
+                retention=retention === nothing ? nothing : stats(retention),
                 seed=seed,
                 components=components,
                 config=config,
@@ -2185,6 +2198,13 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
                     needed -= 1
                     needed == 0 && break
                 end
+            end
+        end
+
+        if retention !== nothing
+            for member in take_migrants!(retention, g, N - length(next_pop))
+                push!(next_pop, member)
+                _inc!(repro_stats, :hof_migrant, 1)
             end
         end
 
@@ -2676,6 +2696,7 @@ function fit!(reg::Regressor, data::SupervisedDataset; callback=nothing)
 end
 
 include("ConstantSearch.jl")
+include("HallOfFame.jl")
 include("TaskSchemas.jl")
 
 @testsnippet RegBaseImports begin

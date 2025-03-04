@@ -127,7 +127,8 @@ function _engine_policy_site(site)
 end
 
 _engine_is_domain_exclusion(error)::Bool =
-    error isa _SnapshotMuUnsupportedErr || error isa _SnapshotCyclicTypeErr
+    error isa _SnapshotMuUnsupportedErr || error isa _SnapshotCyclicTypeErr ||
+    error isa _SnapshotUnclassifiedSiteErr
 
 function _engine_witness_mappings(
     donor_site,

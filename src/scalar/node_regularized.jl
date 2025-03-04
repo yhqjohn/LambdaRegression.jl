@@ -197,6 +197,11 @@ function _node_wrap_operation(rng, node, feature_count, config)
         op=_dynamic_unary_index(rand(rng, config.unary_operators)), l=node)
 end
 
+"""List configured same-arity operator indices excluding the current one.
+
+The node arity and configured operator world anchor the list. Unsupported node
+degrees follow the binary branch and fail when converted or proposed.
+"""
 function _node_allowed_operator_indices(node, config)
     symbols = node.degree == 1 ? config.unary_operators : config.binary_operators
     indices = node.degree == 1 ?
@@ -205,6 +210,12 @@ function _node_allowed_operator_indices(node, config)
     return filter(!=(node.op), indices)
 end
 
+"""Choose one local arity-preserving rotation of an owned operation root.
+
+Only the supplied root and caller RNG are consulted. Leaves and unsupported
+child shapes return the original root; malformed operator indices remain an
+unexpected programmer error at evaluation/materialisation.
+"""
 function _node_rotate(rng, root)
     if root.degree == 1
         child = root.l

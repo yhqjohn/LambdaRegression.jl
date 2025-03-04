@@ -363,17 +363,46 @@ end
 function _regularized_move_window!(frequency::_RegularizedFrequency)
     difference = sum(frequency.frequencies) - frequency.window
     loops = 0
-    while difference > 0 && loops < 1000
+    while difference > 0 && loops < length(frequency.frequencies)
         indices = findall(value -> value > 1.0, frequency.frequencies)
         isempty(indices) && break
         amount = min(difference / length(indices),
             minimum(frequency.frequencies[indices]) - 1.0)
-        amount <= 1.0e-6 && break
+        # Even a one-ulp excess above the pseudocount floor must be removed.
+        # Otherwise that smallest bucket blocks trimming every larger bucket
+        # on all later observations. Each floor-limited pass removes at least
+        # one active bucket, so the number of buckets bounds the passes.
+        amount <= 0.0 && break
         frequency.frequencies[indices] .-= amount
         difference -= amount * length(indices)
         loops += 1
     end
     return frequency
+end
+
+@testitem "Scalar frequency window trims near-floor buckets" begin
+    using LambdaRegression.ScalarSearch: _RegularizedFrequency,
+        _regularized_move_window!, _regularized_normalize!
+    using Random: MersenneTwister, rand
+
+    state = _RegularizedFrequency(10, 2)
+    state.frequencies .= [nextfloat(1.0), 100.0]
+    _regularized_move_window!(state)
+    @test sum(state.frequencies) <= 10 + 1e-9
+    @test all(>=(1.0), state.frequencies)
+
+    state = _RegularizedFrequency(4096, 254)
+    rng = MersenneTwister(1234)
+    for _ in 1:200
+        for size in rand(rng, 1:254, 64)
+            state.frequencies[size] += 1.0
+        end
+        _regularized_move_window!(state)
+        @test sum(state.frequencies) <= 4096 + 1e-8
+        @test all(>=(1.0), state.frequencies)
+    end
+    _regularized_normalize!(state)
+    @test sum(state.normalized_frequencies) ≈ 1.0
 end
 
 function _regularized_normalize!(frequency::_RegularizedFrequency)

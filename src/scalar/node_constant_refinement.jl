@@ -119,8 +119,6 @@ function _node_refine_constants(candidate::_NodeScalarCandidate, loss::Real,
     return (refined, refined_loss, evaluations[], invalid_evaluations[])
 end
 
-_node_scalar_refine_constants(args...) = _node_refine_constants(args...)
-
 @testsnippet NodeConstantRefinementImports begin
     using Test
     using LambdaRegression.ScalarSearch

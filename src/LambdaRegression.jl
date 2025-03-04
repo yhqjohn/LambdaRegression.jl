@@ -45,6 +45,9 @@ export mutate_tree
 include("procedural/ProceduralMutations.jl")
 using .ProceduralMutations
 export ProceduralMutations
+
+include("typedsearch/TypedSearch.jl")
+export TypedSearch
 #
 include("regression/Regression.jl")
 using .Regression

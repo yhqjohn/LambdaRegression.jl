@@ -1,23 +1,23 @@
-# Program-guided scalar search
+# Program-guided specialised search
 
-The ordinary lambda and function-definition AST is the authoritative
-individual. It defines program meaning, lexical sharing, inspection,
-serialization, and written complexity. Scalar search operates on rebuildable
-views of real-valued regions and materialises candidates back into that AST.
+The ordinary typed lambda and function-definition AST remains authoritative.
+Specialised search views are rebuildable projections; a candidate joins the
+population only after materialisation and checking in the ordinary AST.
 
-The search space has cooperating layers: dense scalar algebra for local
-numeric changes, predefined collection structure, and general typed programs
-for abstraction, higher-order reuse, recursion, and structural discovery.
-These are views of one program, not competing public languages.
+The search space adds frozen occurrence-typed structure beside dense scalar
+regions and general typed programs. Frozen search starts from an inferred
+program and varies finite monomorphic occurrences, or occurrences under an
+externally rigid environment, using exact type matching. Unsupported
+polymorphic or recursive interiors may remain opaque typed atoms while their
+free dependencies stay explicit.
 
-A scalar region carries the explicit dependencies needed to evaluate its
-alternatives. Its normal objective is the loss of the complete enclosing
-program, rather than an independently invented internal target. Scalar
-optimisation is multi-step population search; compatible regions may share
-material, but a donor's score is not automatically valid in another context.
+Specialised phases are incomplete evolutionary views, not a second semantic
+program representation. Selected candidates return to the ordinary AST, where
+general variation can introduce abstraction, polymorphic use, recursion, and
+cross-region combinations. Reanalysis can expose eligible regions again.
 
-The specialised representation and its state are derived data. They may be
-retained to avoid rebuilding search work, but must be reconstructible from the
-program, task, primitive world, and context. Candidates return through a
-verified materialisation boundary, while unsupported regions retain the
-general evaluator path.
+Scalar search remains contextual and population-based. It may retain local
+state and share compatible material, but a score is reusable only when the
+candidate and enclosing evaluation conditions match. The materialisation
+boundary owns source reconstruction, typing, and capture avoidance; rejected
+local movements do not weaken complete-program search.

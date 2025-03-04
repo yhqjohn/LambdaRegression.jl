@@ -18,11 +18,14 @@ end
 
 struct _SnapshotMuUnsupportedErr <: Exception end
 struct _SnapshotCyclicTypeErr <: Exception end
+struct _SnapshotUnclassifiedSiteErr <: Exception end
 
 Base.showerror(io::IO, ::_SnapshotMuUnsupportedErr) =
     print(io, "snapshot open retrieval is strictly mu-free")
 Base.showerror(io::IO, ::_SnapshotCyclicTypeErr) =
     print(io, "snapshot open retrieval rejects cyclic inferred types")
+Base.showerror(io::IO, ::_SnapshotUnclassifiedSiteErr) =
+    print(io, "snapshot open retrieval cannot classify one target site variable")
 
 Base.:(==)(left::_SnapshotOpenAnswer, right::_SnapshotOpenAnswer) =
     left.site == right.site && left.h == right.h && left.residual == right.residual
@@ -207,7 +210,7 @@ function _snapshot_target_site(site, site_id::Int)
     demand_term = _snapshot_open_term(demand) do variable, _
         return get(r_keys, variable) do
             get(b_keys, variable) do
-                throw(ArgumentError("unclassified target demand variable"))
+                throw(_SnapshotUnclassifiedSiteErr())
             end
         end
     end
@@ -228,7 +231,7 @@ function _snapshot_target_site(site, site_id::Int)
         body = _snapshot_open_term(scheme) do variable, _
             return get(t_keys, variable) do
                 get(r_keys, variable) do
-                    throw(ArgumentError("unclassified target binder variable"))
+                    throw(_SnapshotUnclassifiedSiteErr())
                 end
             end
         end
@@ -644,4 +647,39 @@ end
     @test length(answers[1].h) == 1
     @test first(answers[1].h[1]).kind === :function_def
     @test last(answers[1].h[1]).kind === :function_def
+end
+
+@testitem "unclassifiable target site variables become classified exclusions" begin
+    using Test
+    using LambdaRegression.Mutations.Populations:
+        _SnapshotUnclassifiedSiteErr, _engine_witness_mappings,
+        _snapshot_target_site
+    using LambdaRegression.TypeSystem:
+        IntTy, TyLike, TyScheme, make_tyvar_factory
+    using LambdaRegression.Utils: Err
+
+    # A demand variable that appears in no binder scheme and no offer cannot
+    # be placed in R or B; retrieval must exclude the site, not crash search.
+    factory = make_tyvar_factory()
+    stray = factory(0)
+    binder = (kind=:lambda, owner_path=(), ordinal=1)
+    target = (;
+        path=(1,),
+        demand=stray,
+        offer=IntTy,
+        binder_schemes=Dict{Any,TyLike}(binder => TyScheme([], IntTy)),
+    )
+    @test_throws _SnapshotUnclassifiedSiteErr _snapshot_target_site(target, 1)
+
+    donor_binder = (kind=:lambda, owner_path=(), ordinal=9)
+    donor = (;
+        offer=IntTy,
+        external_occurrences=Dict(
+            donor_binder => [(path=(1,), use_type=IntTy)],
+        ),
+        binder_schemes=Dict{Any,TyLike}(donor_binder => TyScheme([], IntTy)),
+    )
+    result = _engine_witness_mappings(donor, target)
+    @test result.mappings isa Err
+    @test result.status === :exhausted
 end

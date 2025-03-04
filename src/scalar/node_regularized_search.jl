@@ -55,6 +55,12 @@ function _node_observe_population!(frequency::_RegularizedFrequency, population)
     return _regularized_normalize!(frequency)
 end
 
+"""Choose one candidate by rank tournament without replacement.
+
+Candidate loss/complexity, the configured tournament size, and the shared
+frequency snapshot anchor ranking. Empty candidate sets fail at sampling;
+malformed selection probabilities are rejected by the state initializer.
+"""
 function _node_tournament(rng, candidates, config, frequency;
         loss_normalization, selection_p, use_frequency_in_tournament,
         adaptive_parsimony_scaling)
@@ -123,30 +129,14 @@ function _node_regularized_report(population, archive, best, evaluations,
         annealing, use_frequency, frequency_window)
 end
 
-"""Propose one regularized child with the reference retry boundary.
+"""Propose one named variation under the conventional retry boundary.
 
-The two owned node parents and scalar grammar are the complete context. A
-sampled no-op is returned immediately; structural mutations and crossover are
-retried at most ten times, after which the unchanged first parent is returned
-with `false`. The helper never evaluates a candidate or consumes a structural
-evaluation budget.
+The owned parents, feature count, configured operator world, and explicit
+mutation kind fully anchor the proposal. Structural kinds retry at most ten
+times; a no-op, simplification, optimisation marker, or composition is tried
+once. Exhaustion returns the unchanged first parent with `false`; unexpected
+operator kinds fail in `_node_scalar_propose`.
 """
-function _node_regularized_child(rng::AbstractRNG,
-        first_parent::_NodeScalarCandidate, second_parent::_NodeScalarCandidate,
-        feature_count::Int, config::ScalarSearchConfig)
-    draw = rand(rng)
-    kind = if draw < config.mutation_probability
-        _node_scalar_sample_mutation(rng, first_parent, config)
-    elseif draw < config.mutation_probability + config.crossover_probability
-        :crossover
-    else
-        :compose
-    end
-    child, changed = _node_regularized_named_child(
-        rng, first_parent, second_parent, feature_count, config, kind)
-    return (child, kind, changed)
-end
-
 function _node_regularized_named_child(rng::AbstractRNG,
         first_parent::_NodeScalarCandidate, second_parent::_NodeScalarCandidate,
         feature_count::Int, config::ScalarSearchConfig, kind::Symbol;
