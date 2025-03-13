@@ -25,6 +25,14 @@ Status
   list elimination for both initialization and generator-backed variation.
 - `prepare_default_evaluator` reuses procedural preparation across a batch, and
   `fit!` maps non-finite outputs or losses to the configured error penalty.
+- `initialize_age_search`, `advance_age_search!`, and `inject_age_migrants!`
+  provide a bounded resumable age-based complete-AST population slice; they
+  preserve their own state and account for initialization, evolution, and
+  migration objective work separately.
+- `search_typed_roots` and `search_typed_hole` provide a bounded typed-island
+  bridge that exports and rechecks complete ASTs for every task score.
+- `prepare_scalar_region` and `search_scalar_region` expose the automatic
+  scalar-region entry while keeping complete ASTs authoritative.
 - For diagnostics, `fit!` supports `callback(state)`, optional per-generation
   timing through `config.timing.enabled`, and an optional
   `components.init_population(...)` hook.
@@ -64,6 +72,11 @@ export TensorSchema, TensorSeries, SeriesTask, series_task
 export series_mse, series_components, series_regressor
 export AbstractConstantSearch, ConstantSearchBudget, ConstantSearchStats
 export ConstantSearchResult, GaussianConstantSearch, search_constants
+export AgeSearchState, AgeSearchIndividual, AgeSearchMigration
+export AgeSearchCounters, AgeSearchReport, AgeSearchNoValidErr
+export initialize_age_search, advance_age_search!, inject_age_migrants!
+export TypedRefinementError, TypedRefinementResult
+export search_typed_roots, search_typed_hole
 
 struct NotImplementedErr end
 struct MissingComponentErr
@@ -2698,6 +2711,9 @@ end
 include("ConstantSearch.jl")
 include("HallOfFame.jl")
 include("TaskSchemas.jl")
+include("age_search.jl")
+include("scalar_refinement.jl")
+include("typed_refinement.jl")
 
 @testsnippet RegBaseImports begin
     using LambdaRegression.Regression: default_components

@@ -1,23 +1,24 @@
-# Program-guided specialised search
+# Alternating program and scalar search
 
-The ordinary typed lambda and function-definition AST remains authoritative.
-Specialised search views are rebuildable projections; a candidate joins the
-population only after materialisation and checking in the ordinary AST.
+The ordinary typed AST is the authoritative individual. Scalar and
+frozen-type representations are specialised views that return ordinary
+programs after verified materialisation.
 
-The search space adds frozen occurrence-typed structure beside dense scalar
-regions and general typed programs. Frozen search starts from an inferred
-program and varies finite monomorphic occurrences, or occurrences under an
-externally rigid environment, using exact type matching. Unsupported
-polymorphic or recursive interiors may remain opaque typed atoms while their
-free dependencies stay explicit.
+General program search and local search form repeated alternating phases. A
+complete-program population changes bindings, sharing, types, and context.
+Bounded local phases refine eligible scalar or frozen typed regions. Returned
+candidates are rechecked, scored in the enclosing task, and made available to
+the next program phase.
 
-Specialised phases are incomplete evolutionary views, not a second semantic
-program representation. Selected candidates return to the ordinary AST, where
-general variation can introduce abstraction, polymorphic use, recursion, and
-cross-region combinations. Reanalysis can expose eligible regions again.
+Specialised phases are intentionally incomplete. General AST variation can
+introduce abstractions, polymorphic uses, recursion, and combinations that a
+local language cannot express. Reanalysis may expose new regions later.
 
-Scalar search remains contextual and population-based. It may retain local
-state and share compatible material, but a score is reusable only when the
-candidate and enclosing evaluation conditions match. The materialisation
-boundary owns source reconstruction, typing, and capture avoidance; rejected
-local movements do not weaken complete-program search.
+Scalar regions carry explicit dependencies and use multi-step population
+search. Frozen typed search varies inferred monomorphic occurrences, or
+occurrences under a rigid environment, with exact type matching. Lexical
+bindings and source dependencies remain explicit.
+
+The coordinator owns scheduling, population replacement, archives, and local
+proposal policy. These choices may change without changing source semantics,
+contextual scoring, or ordinary-AST ownership.
