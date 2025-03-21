@@ -50,7 +50,7 @@ module TypedSearch
 
 using ..Utils: Err
 using ..TypeSystem
-using ..ScalarSearch: _RegularizedFrequency, _regularized_move_window!,
+using ..SearchPolicies: _RegularizedFrequency, _regularized_move_window!,
     _regularized_normalize!, _regularized_frequency,
     _regularized_acceptance_probability
 using TestItems
@@ -75,7 +75,7 @@ include("nsga2_search.jl")
 include("trajectory.jl")
 include("evaluation.jl")
 
-export SourceAnalysis, SourceHole, SourceBoundaryError
+export TypedAnalysis, SourceHole, SourceBoundaryError
 export prepare_source, source_hole, import_hole, export_hole
 export SourceProgram, register_program!, admit_program_donor!, expand_program_donors
 export written_complexity

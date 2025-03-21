@@ -3260,7 +3260,7 @@ function _safe_tolist_head(array_ty::TyArray, list_ty::TyList)
         TyFun(array_ty, list_ty),
         CoreProductive(),
         _TOLIST_WEIGHT;
-        metadata=(value=TypeSystem.TOLIST, source_array_depth_limit=0),
+        metadata=(value=Primitives.TOLIST, source_array_depth_limit=0),
     )
 end
 
@@ -3273,7 +3273,7 @@ function _safe_uncons_case_head(source_ty::TyList, result_ty::Ty)
         head_ty,
         Decoration(),
         _SAFE_LIST_ACCESS_WEIGHT;
-        metadata=(value=TypeSystem.UNCONS_CASE,),
+        metadata=(value=Primitives.UNCONS_CASE,),
     )
 end
 

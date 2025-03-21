@@ -15,18 +15,22 @@ using TestItems
 
 using ...Utils: Err
 using ...TypeSystem:
-    Ty, TyLike, TyVar, TyFun, TyRigid, TyScheme, _inst, collect_free_vars, generalize,
-    infer, iscompatible, isequal_mu, make_tyvar_factory, semantic_typekey
+    Ty, TyLike, TyRigid, TyScheme, _inst, collect_free_vars,
+    iscompatible, isequal_mu, make_tyvar_factory, semantic_typekey
+using ...Primitives
+using ...Programs: Program, _publish_program
+using ...Programs: ConstSymbolFactory
 using ...ASTs.NodeASTs:
-    AstTree, AstNode, AbsNode, AppNode, ConstNode, IndexNode, LetNode,
-    ScopeState, VarNode, children
-using ...ASTs.Contexts: ConstSymbolFactory
+    AstTree, AstNode, AbsNode, AppNode, ConstNode, FunctionDefNode, IndexNode,
+    VarNode, children
 using ...Trees: traverse, PointerState, getstate, setroot!, setchild!
-import ..Mutations: _application_roles_stable, _resolve_scoped, _retained_application_ancestors
 
 export AbstractCrossoverSelectionPolicy, UniformCrossoverSelectionPolicy
 export CrossoverSite, PathCrossoverSelectionPolicy
 export crossover_site_weight, crossover_pair_weight
+export crossover_site_path, crossover_site_depth, crossover_site_type
+export crossover_site_binder_types, crossover_site_capture_levels
+export crossover_site_offer
 export TypedSubtreeSwapCrossover, CrossoverPairPoolExhaustedErr
 export NoEligibleCrossoverPairErr
 export CrossoverAnswerBudgetExhaustedErr
@@ -59,42 +63,46 @@ end
 """
     CrossoverSite
 
-Attempt-local read-only routing view for one typed subtree. `path` is the child
-path from the root, `depth` is its visible binder count, `ty` is its inferred
-type, `binder_types` is ordered outermost to innermost, and `capture_levels`
-contains only external De Bruijn levels actually used by the subtree. `offer`
-is the reusable upper-bound scheme recorded by inference, while `ty` remains
-the site's demand (the instantiated lower-bound type).
+Lightweight routing reference `(analysis,id)` for one typed subtree. Paths,
+depth, demand, offer, binder schemes, and captured De Bruijn levels are
+queried explicitly and are not cached as a second analysis.
 """
 struct CrossoverSite
-    path::Vector{Int}
-    depth::Int
-    ty::Ty
-    binder_types::Vector{Union{Nothing,TyLike}}
-    capture_levels::Vector{Int}
-    offer::TyLike
+    analysis::TypedAnalysis
+    id::Int
 end
 
-# Preserve the original five-argument construction convention. Sites produced
-# by `_collect_sites` below use the authoritative upper-bound metadata.
-CrossoverSite(
-    path::Vector{Int},
-    depth::Int,
-    ty::Ty,
-    binder_types::Vector{Union{Nothing,TyLike}},
-    capture_levels::Vector{Int},
-) = CrossoverSite(path, depth, ty, binder_types, capture_levels, ty)
+crossover_site_path(site::CrossoverSite) = collect(Int, typed_analysis_path(site.analysis, site.id))
+function crossover_site_depth(site::CrossoverSite)
+    head = site.analysis.index.env_head[site.id]
+    return head == 0 ? 0 : site.analysis.index.bindings[head].depth
+end
 
-# Accept the natural explicit `(demand, offer, binders, captures)` spelling as
-# well; the stored field order keeps the old positional fields stable.
-CrossoverSite(
-    path::Vector{Int},
-    depth::Int,
-    demand::Ty,
-    offer::TyLike,
-    binder_types::Vector{Union{Nothing,TyLike}},
-    capture_levels::Vector{Int},
-) = CrossoverSite(path, depth, demand, binder_types, capture_levels, offer)
+function crossover_site_type(site::CrossoverSite)::Ty
+    demand = site.analysis.metadata[site.id][1]
+    return demand isa TyScheme ? demand.ty : demand
+end
+
+function crossover_site_offer(site::CrossoverSite)::TyLike
+    return site.analysis.metadata[site.id][2]
+end
+
+function crossover_site_binder_types(site::CrossoverSite)
+    ids = visible_binder_ids(site.analysis, site.id)
+    return Union{Nothing,TyLike}[
+        get(site.analysis.binder_schemes, id, nothing)
+        for id in reverse(ids)
+    ]
+end
+
+function crossover_site_capture_levels(site::CrossoverSite)
+    depth = crossover_site_depth(site)
+    levels = Int[]
+    for binder in captured_binder_ids(site.analysis, site.id)
+        push!(levels, depth - site.analysis.index.bindings[binder].depth)
+    end
+    return sort!(unique!(levels))
+end
 
 """
 Policy hook for weighting crossover sites and compatible site pairs.
@@ -132,11 +140,43 @@ crossover_site_weight(
     site::CrossoverSite,
     side::Symbol,
 ) = if side === :left
-    site.path == policy.left_path ? 1.0 : 0.0
+    crossover_site_path(site) == policy.left_path ? 1.0 : 0.0
 elseif side === :right
-    site.path == policy.right_path ? 1.0 : 0.0
+    crossover_site_path(site) == policy.right_path ? 1.0 : 0.0
 else
     throw(ArgumentError("crossover side must be :left or :right"))
+end
+
+function _crossover_site_weights(
+    policy::PathCrossoverSelectionPolicy,
+    sites::Vector{CrossoverSite},
+    side::Symbol,
+)
+    isempty(sites) && return Float64[]
+    requested_path = if side === :left
+        policy.left_path
+    elseif side === :right
+        policy.right_path
+    else
+        throw(ArgumentError("crossover side must be :left or :right"))
+    end
+    analysis = first(sites).analysis
+    selected_ids = typed_analysis_site_ids(
+        analysis; include_root=true, site_path=requested_path,
+    )
+    selected_id = isempty(selected_ids) ? 0 : only(selected_ids)
+    return Float64[site.id == selected_id ? 1.0 : 0.0 for site in sites]
+end
+
+function _crossover_site_weights(
+    policy::AbstractCrossoverSelectionPolicy,
+    sites::Vector{CrossoverSite},
+    side::Symbol,
+)
+    return Float64[
+        _checked_crossover_weight(crossover_site_weight(policy, site, side))
+        for site in sites
+    ]
 end
 
 """Return the nonnegative extra weight of a compatible site pair."""
@@ -169,115 +209,21 @@ function _weighted_crossover_order(rng::AbstractRNG, logweights::Vector{Float64}
     return sortperm(scores; rev=true)
 end
 
-function _binder_types(scope, by_abstraction)::Vector{Union{Nothing,TyLike}}
-    tys = Union{Nothing,TyLike}[]
-    for abs in scope.abstractions
-        push!(tys, get(by_abstraction, abs, nothing))
-    end
-    return tys
-end
-
-function _collect_binder_types!(
-    by_abstraction::IdDict{AbsNode,Union{Nothing,TyLike}},
-    node::AstNode,
-    meta,
-    level::Int,
+"""Collect transient policy views from the one common typed analysis."""
+function _collect_sites(
+    tree::AstTree,
+    type_ctx::Dict{Symbol,<:TyLike};
+    tyfactory,
+    target_ty::Union{Nothing,Ty}=nothing,
 )
-    if node isa AbsNode
-        abs_ty = haskey(meta, node) ? meta[node][1] : nothing
-        by_abstraction[node] = abs_ty isa TyFun ? (abs_ty::TyFun).arg : nothing
-        _collect_binder_types!(by_abstraction, node.body, meta, level)
-    elseif node isa AppNode && node.func isa AbsNode
-        abstraction = node.func::AbsNode
-        by_abstraction[abstraction] = haskey(meta, node.arg) ?
-            generalize(meta[node.arg][1], level) : nothing
-        _collect_binder_types!(by_abstraction, abstraction.body, meta, level)
-        _collect_binder_types!(by_abstraction, node.arg, meta, level + 1)
-    elseif node isa AppNode
-        _collect_binder_types!(by_abstraction, node.func, meta, level)
-        _collect_binder_types!(by_abstraction, node.arg, meta, level)
-    end
-    return by_abstraction
-end
-
-function _collect_binder_types(tree::AstTree, meta)
-    by_abstraction = IdDict{AbsNode,Union{Nothing,TyLike}}()
-    return _collect_binder_types!(by_abstraction, tree.root, meta, 0)
-end
-
-function _capture_level_map!(
-    by_node::IdDict{AstNode,Vector{Int}},
-    node::AstNode,
-)::Vector{Int}
-    if node isa IndexNode
-        levels = Int[node.index]
-    elseif node isa AbsNode
-        body_levels = _capture_level_map!(by_node, node.body)
-        levels = Int[level - 1 for level in body_levels if level > 0]
-    elseif node isa AppNode
-        func_levels = _capture_level_map!(by_node, node.func)
-        arg_levels = _capture_level_map!(by_node, node.arg)
-        levels = sort!(unique!(vcat(func_levels, arg_levels)))
-    elseif node isa ConstNode || node isa VarNode
-        levels = Int[]
-    else
-        throw(ArgumentError("capture analysis does not support $(typeof(node))"))
-    end
-    by_node[node] = levels
-    return levels
-end
-
-function _capture_level_map(tree::AstTree)
-    by_node = IdDict{AstNode,Vector{Int}}()
-    _capture_level_map!(by_node, tree.root)
-    return by_node
-end
-
-function _collect_sites(tree::AstTree, type_ctx::Dict{Symbol,<:TyLike}; tyfactory)
-    meta = Dict{AstNode,Tuple{TyLike,TyLike}}()
-    # Inference may link monomorphic `TyVar`s stored in a context. Site
-    # collection is observational, so isolate the complete graph while
-    # preserving sharing among context entries.
-    inferred = infer(tree, _detached_type_ctx(type_ctx), tyfactory, meta)
-    inferred isa Err && return inferred
-    binder_types_by_abstraction = _collect_binder_types(tree, meta)
-    capture_levels_by_node = _capture_level_map(tree)
-
-    sites = CrossoverSite[]
-    paths = IdDict{AstNode,Vector{Int}}()
-
-    traverse(tree, PointerState{AstNode}, ScopeState) do _, node, bag
-        pointer = getstate(bag, PointerState{AstNode})
-        scope = getstate(bag, ScopeState)
-
-        path =
-            if pointer.parent === nothing
-                Int[]
-            else
-                parent_path = get(paths, pointer.parent, Int[])
-                vcat(parent_path, pointer.child_index)
-            end
-        paths[node] = path
-
-        # W intentionally omits metadata for the direct abstraction of a
-        # maximally generalized let. Its body still has authoritative metadata
-        # and must remain traversable.
-        haskey(meta, node) || return nothing
-
-        node_ty = meta[node][1]
-        binder_types = _binder_types(scope, binder_types_by_abstraction)
-        push!(sites, CrossoverSite(
-            path,
-            length(scope.abstractions),
-            node_ty,
-            binder_types,
-            capture_levels_by_node[node],
-            meta[node][2],
-        ))
-        return nothing
-    end
-
-    return sites
+    analysis = prepare_typed_analysis(
+        tree,
+        type_ctx;
+        factory=tyfactory,
+        target_ty,
+    )
+    analysis isa Err && return analysis
+    return CrossoverSite[CrossoverSite(analysis, id) for id in typed_analysis_site_ids(analysis)]
 end
 
 function _node_at_path(tree::AstTree, path::Vector{Int})::AstNode
@@ -463,25 +409,6 @@ function _contextual_node_key(
             _contextual_node_key(app.func, local_consts, local_consts_ty, slots, payloads),
             _contextual_node_key(app.arg, local_consts, local_consts_ty, slots, payloads),
         )
-    elseif node isa LetNode
-        let_node = node::LetNode
-        return (
-            :let,
-            _contextual_node_key(
-                let_node.value,
-                local_consts,
-                local_consts_ty,
-                slots,
-                payloads,
-            ),
-            _contextual_node_key(
-                let_node.body,
-                local_consts,
-                local_consts_ty,
-                slots,
-                payloads,
-            ),
-        )
     elseif node isa FunctionDefNode
         return (
             :function_def,
@@ -537,14 +464,59 @@ function _same_contextual_subtree(a, b)::Bool
     return a[1] == b[1] && a[2] == b[2] && isequal(a[3], b[3])
 end
 
+function _crossover_application_roles_stable(
+    original_tree::AstTree,
+    child_tree::AstTree,
+    path::Vector{Int},
+)
+    original_node = original_tree.root
+    child_node = child_tree.root
+    for child_index in path
+        if original_node isa AppNode || child_node isa AppNode
+            original_node isa AppNode && child_node isa AppNode || return false
+            (original_node.func isa AbsNode) ==
+                (child_node.func isa AbsNode) || return false
+        end
+        original_children = children(original_node)
+        child_children = children(child_node)
+        1 <= child_index <= length(original_children) || return false
+        1 <= child_index <= length(child_children) || return false
+        original_node = original_children[child_index]
+        child_node = child_children[child_index]
+    end
+    return true
+end
+
+function _binding_at_level(site::CrossoverSite, level::Int)
+    index = site.analysis.index
+    current = index.env_head[site.id]
+    while current != 0
+        binding = index.bindings[current]
+        crossover_site_depth(site) - binding.depth == level && return current
+        current = binding.outer
+    end
+    return nothing
+end
+
 function _binder_at_level(site::CrossoverSite, level::Int)
-    level < site.depth || return nothing
-    return site.binder_types[end - level]
+    binder = _binding_at_level(site, level)
+    binder === nothing && return nothing
+    return get(site.analysis.binder_schemes, binder, nothing)
 end
 
 function _captures_fit(op, donor::CrossoverSite, destination::CrossoverSite)::Bool
-    for level in donor.capture_levels
-        level < destination.depth || return false
+    for level in crossover_site_capture_levels(donor)
+        level < crossover_site_depth(destination) || return false
+        donor_binder = _binding_at_level(donor, level)
+        destination_binder = _binding_at_level(destination, level)
+        donor_binder === nothing && return false
+        destination_binder === nothing && return false
+        # A FunctionDef self binder is not interchangeable with an ordinary
+        # lexical binder even when their types and capture levels coincide.
+        donor_is_self = donor.analysis.index.bindings[donor_binder].kind === :function_def
+        destination_is_self =
+            destination.analysis.index.bindings[destination_binder].kind === :function_def
+        donor_is_self == destination_is_self || return false
         op.require_compatible_binders || continue
         donor_ty = _binder_at_level(donor, level)
         destination_ty = _binder_at_level(destination, level)
@@ -557,10 +529,12 @@ function _captures_fit(op, donor::CrossoverSite, destination::CrossoverSite)::Bo
 end
 
 function _sites_match(op, a::CrossoverSite, b::CrossoverSite)::Bool
-    iscompatible(a.ty, b.ty) || return false
-    iscompatible(b.ty, a.ty) || return false
+    iscompatible(crossover_site_type(a), crossover_site_type(b)) || return false
+    iscompatible(crossover_site_type(b), crossover_site_type(a)) || return false
 
-    op.require_same_depth && (a.depth == b.depth) || (!op.require_same_depth) || return false
+    op.require_same_depth &&
+        (crossover_site_depth(a) == crossover_site_depth(b)) ||
+        (!op.require_same_depth) || return false
 
     return _captures_fit(op, a, b) && _captures_fit(op, b, a)
 end
@@ -695,13 +669,14 @@ function _same_target_type(a::Ty, b::Ty)
 end
 
 """
-    crossover(op::TypedSubtreeSwapCrossover, a::Individual, b::Individual;
+    crossover(op::TypedSubtreeSwapCrossover, a::Program, b::Program;
+        target_a, target_b,
         rng=MersenneTwister(2000),
         global_consts_ty=nothing,
         tyfactory_ctor=make_tyvar_factory,
         const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
         prune=true,
-    ) -> Union{Tuple{Individual,Individual},Err}
+    ) -> Union{Tuple{Program,Program},Err}
 
 Apply type-safe subtree swap crossover.
 
@@ -714,48 +689,49 @@ Thread-safety requirements:
   `const_symfactory_ctor()` to generate fresh local-constant symbols deterministically.
 """
 function crossover(op::TypedSubtreeSwapCrossover,
-    a::Individual,
-    b::Individual;
+    a::Program,
+    b::Program;
+    target_a::Ty,
+    target_b::Ty,
     rng::AbstractRNG=MersenneTwister(2000),
     global_consts_ty::Union{Nothing,Dict{Symbol,TyLike}}=nothing,
     tyfactory_ctor=make_tyvar_factory,
     const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
     prune::Bool=true,
 )
-    _same_target_type(a.target_ty, b.target_ty) ||
-        return Err(TargetTypeMismatchErr(a.target_ty, b.target_ty))
+    _same_target_type(target_a, target_b) ||
+        return Err(TargetTypeMismatchErr(target_a, target_b))
     global_consts_ty === nothing && return Err(MissingGlobalTypeCtxErr())
 
     tyfactory = tyfactory_ctor()
 
     # Pre-collect sites using the parents' own local type contexts.
-    sites_a = _collect_sites(a.tree, merge(global_consts_ty, a.local_consts_ty); tyfactory=tyfactory)
+    sites_a = _collect_sites(
+        a.tree,
+        merge(global_consts_ty, a.local_consts_ty);
+        tyfactory=tyfactory,
+        target_ty=target_a,
+    )
     sites_a isa Err && return sites_a
-    sites_b = _collect_sites(b.tree, merge(global_consts_ty, b.local_consts_ty); tyfactory=tyfactory)
+    sites_b = _collect_sites(
+        b.tree,
+        merge(global_consts_ty, b.local_consts_ty);
+        tyfactory=tyfactory,
+        target_ty=target_b,
+    )
     sites_b isa Err && return sites_b
 
-    scoped_a = _resolve_scoped(a.tree)
-    scoped_a isa Err && return scoped_a
-    scoped_b = _resolve_scoped(b.tree)
-    scoped_b isa Err && return scoped_b
-
     allow_root = op.allow_root
-    sites_a2 = allow_root ? sites_a : filter(s -> !isempty(s.path), sites_a)
-    sites_b2 = allow_root ? sites_b : filter(s -> !isempty(s.path), sites_b)
+    sites_a2 = allow_root ? sites_a : filter(s -> s.id != 1, sites_a)
+    sites_b2 = allow_root ? sites_b : filter(s -> s.id != 1, sites_b)
 
     length(sites_a2) >= op.min_sites || return Err(NoEligibleCrossoverSiteErr())
     length(sites_b2) >= op.min_sites || return Err(NoEligibleCrossoverSiteErr())
 
-    weights_a = Float64[
-        _checked_crossover_weight(crossover_site_weight(op.selection, site, :left))
-        for site in sites_a2
-    ]
-    weights_b = Float64[
-        _checked_crossover_weight(crossover_site_weight(op.selection, site, :right))
-        for site in sites_b2
-    ]
-    compatibility_keys_a = _closed_compatibility_key.(getfield.(sites_a2, :ty))
-    compatibility_keys_b = _closed_compatibility_key.(getfield.(sites_b2, :ty))
+    weights_a = _crossover_site_weights(op.selection, sites_a2, :left)
+    weights_b = _crossover_site_weights(op.selection, sites_b2, :right)
+    compatibility_keys_a = _closed_compatibility_key.(crossover_site_type.(sites_a2))
+    compatibility_keys_b = _closed_compatibility_key.(crossover_site_type.(sites_b2))
     pair_pool = Tuple{CrossoverSite,CrossoverSite}[]
     pair_logweights = Float64[]
     for (index_a, site_a) in pairs(sites_a2)
@@ -786,9 +762,11 @@ function crossover(op::TypedSubtreeSwapCrossover,
         pair_index = pair_order[order_index]
         site_a, site_b = pair_pool[pair_index]
 
-        source_a = _node_at_path_maybe(a.tree, site_a.path)
+        site_a_path = crossover_site_path(site_a)
+        site_b_path = crossover_site_path(site_b)
+        source_a = _node_at_path_maybe(a.tree, site_a_path)
         source_a === nothing && continue
-        source_b = _node_at_path_maybe(b.tree, site_b.path)
+        source_b = _node_at_path_maybe(b.tree, site_b_path)
         source_b === nothing && continue
         key_a = _contextual_subtree_key(source_a, a.local_consts, a.local_consts_ty)
         key_b = _contextual_subtree_key(source_b, b.local_consts, b.local_consts_ty)
@@ -802,9 +780,9 @@ function crossover(op::TypedSubtreeSwapCrossover,
         local_b = copy(b.local_consts)
         local_b_ty = copy(b.local_consts_ty)
 
-        node_a = _node_at_path_maybe(tree_a, site_a.path)
+        node_a = _node_at_path_maybe(tree_a, site_a_path)
         node_a === nothing && continue
-        node_b = _node_at_path_maybe(tree_b, site_b.path)
+        node_b = _node_at_path_maybe(tree_b, site_b_path)
         node_b === nothing && continue
         sub_a = AstTree(deepcopy(node_a))
         sub_b = AstTree(deepcopy(node_b))
@@ -845,19 +823,11 @@ function crossover(op::TypedSubtreeSwapCrossover,
             factory_b,
         )
 
-        _replace_at_path_maybe!(tree_a, site_a.path, sub_b) || continue
-        _replace_at_path_maybe!(tree_b, site_b.path, sub_a) || continue
+        _replace_at_path_maybe!(tree_a, site_a_path, sub_b) || continue
+        _replace_at_path_maybe!(tree_b, site_b_path, sub_a) || continue
 
-        retained_a = _retained_application_ancestors(scoped_a, site_a.path)
-        retained_a isa Err && continue
-        retained_b = _retained_application_ancestors(scoped_b, site_b.path)
-        retained_b isa Err && continue
-        child_scoped_a = _resolve_scoped(tree_a)
-        child_scoped_a isa Err && continue
-        child_scoped_b = _resolve_scoped(tree_b)
-        child_scoped_b isa Err && continue
-        _application_roles_stable(scoped_a, child_scoped_a, retained_a) || continue
-        _application_roles_stable(scoped_b, child_scoped_b, retained_b) || continue
+        _crossover_application_roles_stable(a.tree, tree_a, site_a_path) || continue
+        _crossover_application_roles_stable(b.tree, tree_b, site_b_path) || continue
 
         if prune
             prune_local_consts!(tree_a, local_a, local_a_ty)
@@ -866,17 +836,25 @@ function crossover(op::TypedSubtreeSwapCrossover,
 
         # Validate type invariants.
         type_ctx_a = merge(global_consts_ty, local_a_ty)
-        inf_a = infer(tree_a, type_ctx_a, tyfactory)
+        inf_a = prepare_typed_analysis(
+            tree_a,
+            type_ctx_a;
+            factory=tyfactory,
+            target_ty=target_a,
+        )
         inf_a isa Err && continue
-        iscompatible(inf_a, a.target_ty) || continue
 
         type_ctx_b = merge(global_consts_ty, local_b_ty)
-        inf_b = infer(tree_b, type_ctx_b, tyfactory)
+        inf_b = prepare_typed_analysis(
+            tree_b,
+            type_ctx_b;
+            factory=tyfactory,
+            target_ty=target_b,
+        )
         inf_b isa Err && continue
-        iscompatible(inf_b, b.target_ty) || continue
 
-        child_a = Individual(tree_a, a.target_ty; local_consts=local_a, local_consts_ty=local_a_ty, fitness=nothing, meta=(;))
-        child_b = Individual(tree_b, b.target_ty; local_consts=local_b, local_consts_ty=local_b_ty, fitness=nothing, meta=(;))
+        child_a = _publish_program(tree_a, local_a, local_a_ty)
+        child_b = _publish_program(tree_b, local_b, local_b_ty)
         return (child_a, child_b)
     end
 
@@ -884,12 +862,91 @@ function crossover(op::TypedSubtreeSwapCrossover,
     return Err(CrossoverMaxTryReachedErr(op.max_try))
 end
 
+"""
+    IndependentCrossover(operator)
+
+Compose the two directed recombination calls used by the default regression
+path.  The first child is produced from `(recipient=a, donor=b)` and the
+second from `(recipient=b, donor=a)`; each direction keeps its own target and
+selection role.  This is deliberately separate from `crossover` on
+`TypedSubtreeSwapCrossover`, whose contract is one reciprocal site-pair swap
+with atomic two-child validation.
+"""
+struct IndependentCrossover <: AbstractCrossover
+    operator::TypedSubtreeSwapCrossover
+end
+
+IndependentCrossover(; kwargs...) =
+    IndependentCrossover(TypedSubtreeSwapCrossover(; kwargs...))
+
+function crossover(
+    op::IndependentCrossover,
+    a::Program,
+    b::Program;
+    target_a::Ty,
+    target_b::Ty,
+    rng::AbstractRNG=MersenneTwister(2000),
+    global_consts_ty::Union{Nothing,Dict{Symbol,TyLike}}=nothing,
+    tyfactory_ctor=make_tyvar_factory,
+    kwargs...,
+)
+    global_consts_ty === nothing && return Err(MissingGlobalTypeCtxErr())
+    prepared_a = _prepare_crossover_parent(
+        a,
+        target_a,
+        global_consts_ty;
+        tyfactory_ctor,
+    )
+    prepared_a isa Err && return prepared_a
+    prepared_b = _prepare_crossover_parent(
+        b,
+        target_b,
+        global_consts_ty;
+        tyfactory_ctor,
+    )
+    prepared_b isa Err && return prepared_b
+
+    child_a = recombine(
+        op.operator,
+        a,
+        b;
+        recipient_target=target_a,
+        donor_target=target_b,
+        rng,
+        global_consts_ty,
+        tyfactory_ctor,
+        selection_roles=(:left, :right),
+        _prepared_recipient=prepared_a,
+        _prepared_donor=prepared_b,
+        kwargs...,
+    )
+    child_a isa Err && return child_a
+
+    child_b = recombine(
+        op.operator,
+        b,
+        a;
+        recipient_target=target_b,
+        donor_target=target_a,
+        rng,
+        global_consts_ty,
+        tyfactory_ctor,
+        selection_roles=(:right, :left),
+        _prepared_recipient=prepared_b,
+        _prepared_donor=prepared_a,
+        kwargs...,
+    )
+    child_b isa Err && return child_b
+    return (child_a, child_b)
+end
+
 @testsnippet PopCrossBaseImports begin
     using Random
-    using LambdaRegression.Mutations.Populations: Individual, TypedSubtreeSwapCrossover, crossover
+    using LambdaRegression.Mutations.Populations:
+        Program, TypedSubtreeSwapCrossover, crossover, prepare_typed_analysis
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike, infer, iscompatible
-    using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
+    using LambdaRegression.Programs: ConstSymbolFactory
     using LambdaRegression.TypeSystem: make_tyvar_factory
     using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike
     using LambdaRegression.Utils: Err
@@ -903,7 +960,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual,
+        Program,
         PathCrossoverSelectionPolicy,
         TypedSubtreeSwapCrossover,
         recombine
@@ -921,13 +978,11 @@ end
         :USEF => TyFun(int_to_int, IntTy),
         :INC => int_to_int,
     )
-    recipient = Individual(
+    recipient = Program(
         AstTree(AppNode(ConstNode(:USEF), ConstNode(:INC))),
-        IntTy,
     )
-    donor = Individual(
+    donor = Program(
         AstTree(AbsNode(:x, IndexNode(0))),
-        int_to_int,
     )
     before_recipient = deepcopy(recipient)
     before_donor = deepcopy(donor)
@@ -943,6 +998,8 @@ end
         donor;
         rng=MersenneTwister(1111),
         global_consts_ty=global_types,
+        recipient_target=IntTy,
+        donor_target=int_to_int,
     )
     first = run_once()
     second = run_once()
@@ -959,11 +1016,9 @@ end
     @test recipient.tree == before_recipient.tree
     @test recipient.local_consts == before_recipient.local_consts
     @test recipient.local_consts_ty == before_recipient.local_consts_ty
-    @test recipient.target_ty == before_recipient.target_ty
     @test donor.tree == before_donor.tree
     @test donor.local_consts == before_donor.local_consts
     @test donor.local_consts_ty == before_donor.local_consts_ty
-    @test donor.target_ty == before_donor.target_ty
 
     # Site analysis is observational. A monomorphic variable owned by the
     # caller's context must not be linked while the recipient is inferred.
@@ -973,9 +1028,8 @@ end
         :APPLY => TyFun(caller_owned, IntTy),
         :ONE => IntTy,
     )
-    mutable_recipient = Individual(
+    mutable_recipient = Program(
         AstTree(AppNode(ConstNode(:APPLY), ConstNode(:ONE))),
-        IntTy,
     )
     recombine(
         TypedSubtreeSwapCrossover(min_sites=1),
@@ -983,6 +1037,8 @@ end
         donor;
         rng=MersenneTwister(1234),
         global_consts_ty=mutable_global_types,
+        recipient_target=IntTy,
+        donor_target=int_to_int,
     )
     @test caller_owned.instance === nothing
 end
@@ -992,7 +1048,7 @@ end
     using Random
     using LambdaRegression.ASTs.NodeASTs: AppNode, AstTree, ConstNode
     using LambdaRegression.Mutations.Populations:
-        Individual, TypedSubtreeSwapCrossover, recombine
+        Program, TypedSubtreeSwapCrossover, recombine
     using LambdaRegression.TypeSystem:
         IntTy, TyFun, TyLike, TyMu, infer, isequal_mu, make_tyvar_factory
     using LambdaRegression.Utils: Err
@@ -1005,11 +1061,10 @@ end
         :ONE => IntTy,
         :TWO => IntTy,
     )
-    recipient = Individual(
+    recipient = Program(
         AstTree(AppNode(ConstNode(:WRAP), ConstNode(:ONE))),
-        mu_type,
     )
-    donor = Individual(AstTree(ConstNode(:TWO)), IntTy)
+    donor = Program(AstTree(ConstNode(:TWO)))
 
     child = recombine(
         TypedSubtreeSwapCrossover(max_try=8, min_sites=1),
@@ -1017,6 +1072,8 @@ end
         donor;
         rng=MersenneTwister(8000),
         global_consts_ty=global_types,
+        recipient_target=mu_type,
+        donor_target=IntTy,
     )
     @test !(child isa Err)
     if !(child isa Err)
@@ -1033,8 +1090,8 @@ end
     tree_a = AstTree(AbsNode(:x, AppNode(AppNode(ConstNode(:add), IndexNode(0)), ConstNode(:k))))
     tree_b = AstTree(AbsNode(:x, AppNode(AppNode(ConstNode(:add), ConstNode(:k)), IndexNode(0))))
 
-    ind_a = Individual(tree_a, target_ty; local_consts=Dict{Symbol,Any}(:k => 1), local_consts_ty=Dict{Symbol,TyLike}(:k => IntTy))
-    ind_b = Individual(tree_b, target_ty; local_consts=Dict{Symbol,Any}(:k => 99), local_consts_ty=Dict{Symbol,TyLike}(:k => IntTy))
+    ind_a = Program(tree_a; local_consts=Dict{Symbol,Any}(:k => 1), local_consts_ty=Dict{Symbol,TyLike}(:k => IntTy))
+    ind_b = Program(tree_b; local_consts=Dict{Symbol,Any}(:k => 99), local_consts_ty=Dict{Symbol,TyLike}(:k => IntTy))
 
     op = TypedSubtreeSwapCrossover(max_try=20)
     (c1, c2) = crossover(
@@ -1043,6 +1100,8 @@ end
         ind_b;
         rng=rng,
         global_consts_ty=global_consts_ty,
+        target_a=target_ty,
+        target_b=target_ty,
         tyfactory_ctor=make_tyvar_factory,
         const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
         prune=true,
@@ -1065,7 +1124,10 @@ end
     sites = LambdaRegression.Mutations.Populations._collect_sites(tree, merge(global_consts_ty, local_consts_ty); tyfactory=tyf)
     @test !(sites isa Err)
     for s in sites
-        @test LambdaRegression.Mutations.Populations._node_at_path_maybe(tree, s.path) !== nothing
+        @test LambdaRegression.Mutations.Populations._node_at_path_maybe(
+            tree,
+            LambdaRegression.Mutations.Populations.crossover_site_path(s),
+        ) !== nothing
     end
 end
 
@@ -1074,8 +1136,8 @@ end
     global_consts_ty = Dict{Symbol,TyLike}()
 
     # Both parents use the same local constant name but different values.
-    ind_a = Individual(AstTree(ConstNode(:c1)), IntTy; local_consts=Dict{Symbol,Any}(:c1 => 1), local_consts_ty=Dict{Symbol,TyLike}(:c1 => IntTy))
-    ind_b = Individual(AstTree(ConstNode(:c1)), IntTy; local_consts=Dict{Symbol,Any}(:c1 => 2), local_consts_ty=Dict{Symbol,TyLike}(:c1 => IntTy))
+    ind_a = Program(AstTree(ConstNode(:c1)); local_consts=Dict{Symbol,Any}(:c1 => 1), local_consts_ty=Dict{Symbol,TyLike}(:c1 => IntTy))
+    ind_b = Program(AstTree(ConstNode(:c1)); local_consts=Dict{Symbol,Any}(:c1 => 2), local_consts_ty=Dict{Symbol,TyLike}(:c1 => IntTy))
 
     op = TypedSubtreeSwapCrossover(max_try=5, min_sites=1, allow_root=true)
     (c1, c2) = crossover(
@@ -1084,6 +1146,8 @@ end
         ind_b;
         rng=rng,
         global_consts_ty=global_consts_ty,
+        target_a=IntTy,
+        target_b=IntTy,
         tyfactory_ctor=make_tyvar_factory,
         const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
         prune=true,
@@ -1102,13 +1166,12 @@ end
 
 @testitem "Populations crossover preserves donor globals against recipient locals" setup=[PopCrossBaseImports] begin
     global_consts_ty = Dict{Symbol,TyLike}(:a => IntTy, :g => IntTy)
-    ind_a = Individual(
+    ind_a = Program(
         AstTree(ConstNode(:a)),
-        IntTy;
         local_consts=Dict{Symbol,Any}(:g => 99),
         local_consts_ty=Dict{Symbol,TyLike}(:g => IntTy),
     )
-    ind_b = Individual(AstTree(ConstNode(:g)), IntTy)
+    ind_b = Program(AstTree(ConstNode(:g)))
 
     result = crossover(
         TypedSubtreeSwapCrossover(max_try=1, min_sites=1, allow_root=true),
@@ -1116,6 +1179,8 @@ end
         ind_b;
         rng=MersenneTwister(2000),
         global_consts_ty=global_consts_ty,
+        target_a=IntTy,
+        target_b=IntTy,
         const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
         prune=true,
     )
@@ -1130,15 +1195,13 @@ end
 end
 
 @testitem "Populations crossover rejects local alpha-renaming as a no-op" setup=[PopCrossBaseImports] begin
-    ind_a = Individual(
+    ind_a = Program(
         AstTree(ConstNode(:left)),
-        IntTy;
         local_consts=Dict{Symbol,Any}(:left => 1),
         local_consts_ty=Dict{Symbol,TyLike}(:left => IntTy),
     )
-    ind_b = Individual(
+    ind_b = Program(
         AstTree(ConstNode(:right)),
-        IntTy;
         local_consts=Dict{Symbol,Any}(:right => 1),
         local_consts_ty=Dict{Symbol,TyLike}(:right => IntTy),
     )
@@ -1149,6 +1212,8 @@ end
         ind_b;
         rng=MersenneTwister(1),
         global_consts_ty=Dict{Symbol,TyLike}(),
+        target_a=IntTy,
+        target_b=IntTy,
         const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
         prune=true,
     )
@@ -1188,9 +1253,9 @@ end
     using Test
     using Random
     import LambdaRegression.Mutations.Populations:
-        crossover_pair_weight, crossover_site_weight
+        crossover_pair_weight, crossover_site_weight, crossover_site_path
     using LambdaRegression.Mutations.Populations:
-        AbstractCrossoverSelectionPolicy, CrossoverSite, Individual,
+        AbstractCrossoverSelectionPolicy, CrossoverSite, Program,
         TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
@@ -1201,22 +1266,20 @@ end
         ::ExtremeScalePolicy,
         site::CrossoverSite,
         ::Symbol,
-    ) = site.path == [1] ? 1.0e-300 : 1.0
+    ) = crossover_site_path(site) == [1] ? 1.0e-300 : 1.0
     crossover_pair_weight(
         ::ExtremeScalePolicy,
         left::CrossoverSite,
         right::CrossoverSite,
-    ) = left.path == [1] && right.path == [1] ? 1.0e300 : 0.0
+    ) = crossover_site_path(left) == [1] && crossover_site_path(right) == [1] ? 1.0e300 : 0.0
 
     unary_int = TyFun(IntTy, IntTy)
     globals = Dict{Symbol,TyLike}(:inc => unary_int, :dec => unary_int)
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(AbsNode(:x, AppNode(ConstNode(:inc), IndexNode(0)))),
-        unary_int,
     )
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(AbsNode(:x, AppNode(ConstNode(:dec), IndexNode(0)))),
-        unary_int,
     )
     result = crossover(
         TypedSubtreeSwapCrossover(
@@ -1228,6 +1291,8 @@ end
         parent_b;
         rng=MersenneTwister(8000),
         global_consts_ty=globals,
+        target_a=unary_int,
+        target_b=unary_int,
     )
 
     @test !(result isa Err)
@@ -1237,8 +1302,8 @@ end
     using LambdaRegression.Mutations.Populations: PathCrossoverSelectionPolicy
 
     global_consts_ty = Dict{Symbol,TyLike}(:a => IntTy, :b => IntTy)
-    ind_a = Individual(AstTree(ConstNode(:a)), IntTy)
-    ind_b = Individual(AstTree(ConstNode(:b)), IntTy)
+    ind_a = Program(AstTree(ConstNode(:a)))
+    ind_b = Program(AstTree(ConstNode(:b)))
     result = crossover(
         TypedSubtreeSwapCrossover(
             max_try=1,
@@ -1250,17 +1315,88 @@ end
         ind_b;
         rng=MersenneTwister(1111),
         global_consts_ty=global_consts_ty,
+        target_a=IntTy,
+        target_b=IntTy,
     )
 
     @test result isa Err
     @test nameof(typeof(result.value)) == :NoEligibleCrossoverPairErr
 end
 
+@testitem "Populations path weights preserve side roles and prefilter min_sites" begin
+    using Test
+    using Random
+    using LambdaRegression.Mutations.Populations:
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, IndexNode
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
+    using LambdaRegression.Utils: Err
+
+    function_type = TyFun(IntTy, IntTy)
+    globals = Dict{Symbol,TyLike}(
+        :INC => function_type,
+        :ONE => IntTy,
+    )
+    left = Program(AstTree(AbsNode(
+        :x, AppNode(ConstNode(:INC), IndexNode(0)),
+    )))
+    right = Program(AstTree(AbsNode(
+        :y, AppNode(ConstNode(:INC), IndexNode(0)),
+    )))
+    result = crossover(
+        TypedSubtreeSwapCrossover(
+            max_try=1,
+            min_sites=2,
+            allow_root=true,
+            require_compatible_binders=false,
+            selection=PathCrossoverSelectionPolicy([1], [1, 2]),
+        ),
+        left,
+        right;
+        rng=MersenneTwister(2000),
+        global_consts_ty=globals,
+        target_a=function_type,
+        target_b=function_type,
+    )
+    @test !(result isa Err)
+    result isa Err && return
+    child_left, child_right = result
+    @test child_left.tree != left.tree
+    @test child_right.tree != right.tree
+    @test iscompatible(infer(child_left.tree, globals), function_type)
+    @test iscompatible(infer(child_right.tree, globals), function_type)
+
+    root_excluded = crossover(
+        TypedSubtreeSwapCrossover(
+            max_try=1,
+            min_sites=2,
+            allow_root=false,
+            require_compatible_binders=false,
+            selection=PathCrossoverSelectionPolicy(Int[], [1, 2]),
+        ),
+        left,
+        right;
+        rng=MersenneTwister(1),
+        global_consts_ty=globals,
+        target_a=function_type,
+        target_b=function_type,
+    )
+    @test root_excluded isa Err
+    if root_excluded isa Err
+        @test nameof(typeof(root_excluded.value)) == :NoEligibleCrossoverPairErr
+    end
+end
+
 @testitem "Populations crossover validates routing sides and budgets" setup=[PopCrossBaseImports] begin
     using LambdaRegression.Mutations.Populations:
         CrossoverSite, PathCrossoverSelectionPolicy, crossover_site_weight
 
-    site = CrossoverSite(Int[], 0, IntTy, Union{Nothing,TyLike}[], Int[])
+    analysis = prepare_typed_analysis(
+        AstTree(ConstNode(:one)),
+        Dict{Symbol,TyLike}(:one => IntTy),
+    )
+    site = CrossoverSite(analysis, 1)
     policy = PathCrossoverSelectionPolicy(Int[], Int[])
     @test_throws ArgumentError crossover_site_weight(policy, site, :middle)
     @test_throws ArgumentError TypedSubtreeSwapCrossover(max_try=0)
@@ -1281,11 +1417,19 @@ end
     rng = MersenneTwister(1234)
     global_consts_ty = Dict{Symbol,TyLike}()
 
-    ind_a = Individual(AstTree(ConstNode(:c1)), IntTy; local_consts=Dict{Symbol,Any}(:c1 => 1), local_consts_ty=Dict{Symbol,TyLike}(:c1 => IntTy))
-    ind_b = Individual(AstTree(AbsNode(:x, IndexNode(0))), TyFun(IntTy, IntTy))
+    ind_a = Program(AstTree(ConstNode(:c1)); local_consts=Dict{Symbol,Any}(:c1 => 1), local_consts_ty=Dict{Symbol,TyLike}(:c1 => IntTy))
+    ind_b = Program(AstTree(AbsNode(:x, IndexNode(0))))
 
     op = TypedSubtreeSwapCrossover(max_try=5, min_sites=1, allow_root=true)
-    res = crossover(op, ind_a, ind_b; rng=rng, global_consts_ty=global_consts_ty)
+    res = crossover(
+        op,
+        ind_a,
+        ind_b;
+        rng=rng,
+        global_consts_ty=global_consts_ty,
+        target_a=IntTy,
+        target_b=TyFun(IntTy, IntTy),
+    )
     @test res isa Err
 end
 
@@ -1302,13 +1446,15 @@ end
         TyFun(IntTy, TyFun(IntTy, two_binder)),
     )
 
-    ind_a = Individual(AstTree(ConstNode(:a)), period_one)
-    ind_b = Individual(AstTree(ConstNode(:b)), period_two)
+    ind_a = Program(AstTree(ConstNode(:a)))
+    ind_b = Program(AstTree(ConstNode(:b)))
     result = crossover(
         TypedSubtreeSwapCrossover(max_try=1, min_sites=1, allow_root=true),
         ind_a,
         ind_b;
         global_consts_ty=Dict{Symbol,TyLike}(:a => period_one, :b => period_two),
+        target_a=period_one,
+        target_b=period_two,
     )
     @test !(result isa Err)
     if !(result isa Err)
@@ -1322,8 +1468,8 @@ end
     fresh = make_tyvar_factory()
     target_var = fresh(0)
     open_target = TyFun(target_var, target_var)
-    ind_a = Individual(AstTree(ConstNode(:a)), open_target)
-    ind_b = Individual(AstTree(ConstNode(:b)), open_target)
+    ind_a = Program(AstTree(ConstNode(:a)))
+    ind_b = Program(AstTree(ConstNode(:b)))
     result = crossover(
         TypedSubtreeSwapCrossover(max_try=1, min_sites=1, allow_root=true),
         ind_a,
@@ -1332,6 +1478,8 @@ end
             :a => open_target,
             :b => open_target,
         ),
+        target_a=open_target,
+        target_b=open_target,
     )
     @test !(result isa Err)
     if !(result isa Err)
@@ -1345,15 +1493,13 @@ end
     fresh = make_tyvar_factory()
     left_ty = fresh(0)
     right_ty = fresh(0)
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(ConstNode(:left)),
-        left_ty;
         local_consts=Dict{Symbol,Any}(:left => 1),
         local_consts_ty=Dict{Symbol,TyLike}(:left => left_ty),
     )
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(ConstNode(:right)),
-        right_ty;
         local_consts=Dict{Symbol,Any}(:right => 2),
         local_consts_ty=Dict{Symbol,TyLike}(:right => right_ty),
     )
@@ -1365,6 +1511,8 @@ end
             parent_b;
             rng=MersenneTwister(42),
             global_consts_ty=Dict{Symbol,TyLike}(),
+            target_a=left_ty,
+            target_b=right_ty,
         )
     catch exception
         exception
@@ -1440,12 +1588,14 @@ end
         binder_b,
         TyFun(atom_b, TyFun(atom_b, binder_b)),
     )
-    ind_a = Individual(AstTree(ConstNode(:a)), target_a)
-    ind_b = Individual(AstTree(ConstNode(:b)), target_b)
+    ind_a = Program(AstTree(ConstNode(:a)))
+    ind_b = Program(AstTree(ConstNode(:b)))
     result = crossover(
         TypedSubtreeSwapCrossover(max_try=1, min_sites=1, allow_root=true),
         ind_a,
         ind_b;
+        target_a=target_a,
+        target_b=target_b,
         global_consts_ty=Dict{Symbol,TyLike}(:a => target_a, :b => target_b),
     )
     @test !(
@@ -1455,13 +1605,11 @@ end
 end
 
 @testitem "Populations TypedSubtreeSwapCrossover rejects alpha-equivalent no-op swaps" setup=[PopCrossBaseImports] begin
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(AbsNode(:left_name, IndexNode(0))),
-        TyFun(IntTy, IntTy),
     )
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(AbsNode(:right_name, IndexNode(0))),
-        TyFun(IntTy, IntTy),
     )
     before_a = deepcopy(parent_a.tree)
     before_b = deepcopy(parent_b.tree)
@@ -1472,6 +1620,8 @@ end
         parent_b;
         rng=MersenneTwister(42),
         global_consts_ty=Dict{Symbol,TyLike}(),
+        target_a=TyFun(IntTy, IntTy),
+        target_b=TyFun(IntTy, IntTy),
     )
 
     @test result isa Err
@@ -1481,11 +1631,14 @@ end
 
 @testitem "Populations crossover analyzes maximally generalized let bodies" begin
     using Test
-    using LambdaRegression.Mutations.Populations: _collect_sites
+    using LambdaRegression.Mutations.Populations:
+        _collect_sites, crossover_site_path, crossover_site_type,
+        crossover_site_binder_types
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem:
-        PAIR, TRUE, BoolTy, IntTy, TyLike, TyProd, TyScheme, get_type_ctx,
+        BoolTy, IntTy, TyLike, TyProd, TyScheme, get_type_ctx,
         make_tyvar_factory
+    using LambdaRegression.Primitives: PAIR, TRUE
     using LambdaRegression.Utils: Err
 
     pair(left, right) = AppNode(AppNode(ConstNode(:PAIR), left), right)
@@ -1510,12 +1663,13 @@ end
 
     @test !(sites isa Err)
     sites isa Err && return
-    @test any(site -> length(site.path) >= 2 && site.path[1:2] == [1, 1], sites)
-    @test any(site -> site.ty == TyProd(IntTy, BoolTy), sites)
+    @test any(site -> length(crossover_site_path(site)) >= 2 &&
+        crossover_site_path(site)[1:2] == [1, 1], sites)
+    @test any(site -> crossover_site_type(site) == TyProd(IntTy, BoolTy), sites)
     @test any(
         site -> any(
             binder_ty -> binder_ty isa TyScheme && !isempty(binder_ty.vars),
-            site.binder_types,
+            crossover_site_binder_types(site),
         ),
         sites,
     )
@@ -1525,7 +1679,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
@@ -1537,13 +1691,11 @@ end
         :use_higher => TyFun(higher, IntTy),
         :head => higher,
     )
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(AppNode(ConstNode(:use_higher), AbsNode(:f, ConstNode(:one)))),
-        IntTy,
     )
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(AppNode(ConstNode(:head), AbsNode(:x, IndexNode(0)))),
-        IntTy,
     )
     before_a = deepcopy(parent_a.tree)
     before_b = deepcopy(parent_b.tree)
@@ -1561,6 +1713,8 @@ end
         parent_b;
         rng=MersenneTwister(2000),
         global_consts_ty=global_types,
+        target_a=IntTy,
+        target_b=IntTy,
     )
 
     @test result isa Err
@@ -1572,7 +1726,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
     using LambdaRegression.Utils: Err
@@ -1583,15 +1737,14 @@ end
         :two => IntTy,
         :consume => TyFun(TyFun(IntTy, IntTy), IntTy),
     )
-    parent_a = Individual(AstTree(AbsNode(:x, ConstNode(:one))), target_ty)
-    parent_b = Individual(
+    parent_a = Program(AstTree(AbsNode(:x, ConstNode(:one))))
+    parent_b = Program(
         AstTree(
             AbsNode(
                 :x,
                 AppNode(ConstNode(:consume), AbsNode(:y, ConstNode(:two))),
             ),
         ),
-        target_ty,
     )
 
     result = crossover(
@@ -1606,6 +1759,8 @@ end
         parent_b;
         rng=MersenneTwister(1),
         global_consts_ty=global_types,
+        target_a=target_ty,
+        target_b=target_ty,
     )
 
     @test !(result isa Err)
@@ -1624,7 +1779,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
     using LambdaRegression.Utils: Err
@@ -1640,15 +1795,14 @@ end
     )
     add_x = AppNode(AppNode(ConstNode(:add), IndexNode(0)), ConstNode(:one))
     mul_y = AppNode(AppNode(ConstNode(:mul), IndexNode(0)), ConstNode(:two))
-    parent_a = Individual(AstTree(AbsNode(:x, add_x)), target_ty)
-    parent_b = Individual(
+    parent_a = Program(AstTree(AbsNode(:x, add_x)))
+    parent_b = Program(
         AstTree(
             AbsNode(
                 :x,
                 AppNode(ConstNode(:consume), AbsNode(:y, mul_y)),
             ),
         ),
-        target_ty,
     )
 
     result = crossover(
@@ -1663,6 +1817,8 @@ end
         parent_b;
         rng=MersenneTwister(1111),
         global_consts_ty=global_types,
+        target_a=target_ty,
+        target_b=target_ty,
     )
 
     @test !(result isa Err)
@@ -1679,7 +1835,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
     using LambdaRegression.Utils: Err
@@ -1703,11 +1859,10 @@ end
         :z,
         AppNode(AppNode(ConstNode(:mul), IndexNode(2)), ConstNode(:two)),
     )
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(AbsNode(:x, AbsNode(:y, AppNode(ConstNode(:consume), captured_a)))),
-        target_ty,
     )
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(
             AbsNode(
                 :x,
@@ -1720,7 +1875,6 @@ end
                 ),
             ),
         ),
-        target_ty,
     )
 
     result = crossover(
@@ -1735,6 +1889,8 @@ end
         parent_b;
         rng=MersenneTwister(1234),
         global_consts_ty=global_types,
+        target_a=target_ty,
+        target_b=target_ty,
     )
 
     @test !(result isa Err)
@@ -1751,7 +1907,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
@@ -1764,24 +1920,22 @@ end
         :one => IntTy,
         :two => IntTy,
     )
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(
             AbsNode(
                 :x,
                 AppNode(AppNode(ConstNode(:add), IndexNode(0)), ConstNode(:one)),
             ),
         ),
-        target_ty,
     )
     escaped = AppNode(AppNode(ConstNode(:add), IndexNode(1)), ConstNode(:two))
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(
             AbsNode(
                 :x,
                 AppNode(ConstNode(:consume), AbsNode(:y, escaped)),
             ),
         ),
-        target_ty,
     )
     before_a = deepcopy(parent_a.tree)
     before_b = deepcopy(parent_b.tree)
@@ -1798,6 +1952,8 @@ end
         parent_b;
         rng=MersenneTwister(1234),
         global_consts_ty=global_types,
+        target_a=target_ty,
+        target_b=target_ty,
     )
 
     @test result isa Err
@@ -1809,22 +1965,22 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem:
-        FALSE, PAIR, TRUE, BoolTy, IntTy, TyLike, TyProd, get_type_ctx, infer
+        BoolTy, IntTy, TyLike, TyProd, get_type_ctx, infer
+    using LambdaRegression.Primitives: FALSE, PAIR, TRUE
     using LambdaRegression.Utils: Err
 
     pair(left, right) = AppNode(AppNode(ConstNode(:PAIR), left), right)
     apply_id(value) = AppNode(IndexNode(0), ConstNode(value))
-    make_parent(int_name, bool_name) = Individual(
+    make_parent(int_name, bool_name) = Program(
         AstTree(
             AppNode(
                 AbsNode(:id, pair(apply_id(int_name), apply_id(bool_name))),
                 AbsNode(:x, IndexNode(0)),
             ),
         ),
-        TyProd(IntTy, BoolTy),
     )
     global_types = Dict{Symbol,TyLike}(get_type_ctx(Dict{Symbol,Any}(
         :PAIR => PAIR,
@@ -1844,6 +2000,8 @@ end
         make_parent(:two, :falsehood);
         rng=MersenneTwister(8000),
         global_consts_ty=global_types,
+        target_a=TyProd(IntTy, BoolTy),
+        target_b=TyProd(IntTy, BoolTy),
     )
 
     @test !(result isa Err)
@@ -1858,8 +2016,8 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
-    using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+    using LambdaRegression.Programs: ConstSymbolFactory
     using LambdaRegression.ASTs.NodeASTs: AppNode, AstTree, ConstNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer
     using LambdaRegression.Utils: Err
@@ -1871,23 +2029,21 @@ end
         :one => IntTy,
         :two => IntTy,
     )
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(
             AppNode(
                 AppNode(ConstNode(:add), ConstNode(:c1)),
                 ConstNode(:one),
             ),
         ),
-        IntTy,
     )
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(
             AppNode(
                 AppNode(ConstNode(:add), ConstNode(:donor)),
                 ConstNode(:two),
             ),
         ),
-        IntTy;
         local_consts=Dict{Symbol,Any}(:donor => 9),
         local_consts_ty=Dict{Symbol,TyLike}(:donor => IntTy),
     )
@@ -1902,6 +2058,8 @@ end
         parent_b;
         rng=MersenneTwister(42),
         global_consts_ty=global_types,
+        target_a=IntTy,
+        target_b=IntTy,
         const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
     )
 
@@ -1919,37 +2077,15 @@ end
     end
 end
 
-@testitem "Populations core crossover has no FunctionDef term adapter" begin
-    using Test
-    using LambdaRegression: Procedural
-    using LambdaRegression.Mutations.Populations:
-        Individual, TypedSubtreeSwapCrossover, crossover
-    using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
-    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
-
-    target_ty = TyFun(IntTy, IntTy)
-    parent_a = Individual(
-        AstTree(Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0)))),
-        target_ty,
-    )
-    parent_b = Individual(AstTree(AbsNode(:x, IndexNode(0))), target_ty)
-    @test_throws MethodError crossover(
-        TypedSubtreeSwapCrossover(min_sites=1),
-        parent_a,
-        parent_b;
-        global_consts_ty=Dict{Symbol,TyLike}(),
-    )
-end
-
 @testitem "Populations crossover builds finite pairs once and rejects no-ops before copying" begin
     using Test
     using Random
     import LambdaRegression.Mutations.Populations:
-        crossover_pair_weight, crossover_site_weight
+        crossover_pair_weight, crossover_site_weight, crossover_site_path
     using LambdaRegression.Mutations.Populations:
-        AbstractCrossoverSelectionPolicy, CrossoverSite, Individual,
+        AbstractCrossoverSelectionPolicy, CrossoverSite, Program,
         TypedSubtreeSwapCrossover, crossover
-    using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
+    using LambdaRegression.Programs: ConstSymbolFactory
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
@@ -1961,14 +2097,14 @@ end
         ::CountingRootPolicy,
         site::CrossoverSite,
         ::Symbol,
-    ) = (isempty(site.path) || site.path == [1]) ? 1.0 : 0.0
+    ) = (isempty(crossover_site_path(site)) || crossover_site_path(site) == [1]) ? 1.0 : 0.0
     function crossover_pair_weight(
         policy::CountingRootPolicy,
         left::CrossoverSite,
         right::CrossoverSite,
     )
         policy.pair_calls += 1
-        return left.path == right.path ? 1.0 : 0.0
+        return crossover_site_path(left) == crossover_site_path(right) ? 1.0 : 0.0
     end
 
     target_ty = TyFun(IntTy, IntTy)
@@ -1977,8 +2113,8 @@ end
         :one => IntTy,
     )
     body = AppNode(AppNode(ConstNode(:add), IndexNode(0)), ConstNode(:one))
-    parent_a = Individual(AstTree(AbsNode(:left, deepcopy(body))), target_ty)
-    parent_b = Individual(AstTree(AbsNode(:right, deepcopy(body))), target_ty)
+    parent_a = Program(AstTree(AbsNode(:left, deepcopy(body))))
+    parent_b = Program(AstTree(AbsNode(:right, deepcopy(body))))
     policy = CountingRootPolicy(0)
     factory_calls = Ref(0)
     result = crossover(
@@ -1991,6 +2127,8 @@ end
         parent_b;
         rng=MersenneTwister(555),
         global_consts_ty=global_types,
+        target_a=target_ty,
+        target_b=target_ty,
         const_symfactory_ctor=() -> begin
             factory_calls[] += 1
             ConstSymbolFactory(prefix=:c)
@@ -2006,7 +2144,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: BoolTy, IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
@@ -2018,11 +2156,10 @@ end
         :consume_bool => TyFun(TyFun(BoolTy, IntTy), IntTy),
         :one => IntTy,
     )
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(AbsNode(:x, AppNode(ConstNode(:inc), IndexNode(0)))),
-        target_ty,
     )
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(
             AbsNode(
                 :x,
@@ -2035,7 +2172,6 @@ end
                 ),
             ),
         ),
-        target_ty,
     )
     before_a = deepcopy(parent_a)
     before_b = deepcopy(parent_b)
@@ -2052,6 +2188,8 @@ end
         parent_b;
         rng=MersenneTwister(2000),
         global_consts_ty=global_types,
+        target_a=target_ty,
+        target_b=target_ty,
     )
 
     @test result isa Err
@@ -2067,7 +2205,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, TypedSubtreeSwapCrossover, crossover
+        Program, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
@@ -2076,7 +2214,7 @@ end
     global_types = Dict{Symbol,TyLike}(
         :add => TyFun(IntTy, TyFun(IntTy, IntTy)),
     )
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(
             AbsNode(
                 :x,
@@ -2086,11 +2224,10 @@ end
                 ),
             ),
         ),
-        target_ty;
         local_consts=Dict{Symbol,Any}(:left => 1),
         local_consts_ty=Dict{Symbol,TyLike}(:left => IntTy),
     )
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(
             AbsNode(
                 :x,
@@ -2100,7 +2237,6 @@ end
                 ),
             ),
         ),
-        target_ty;
         local_consts=Dict{Symbol,Any}(:right => 2),
         local_consts_ty=Dict{Symbol,TyLike}(:right => IntTy),
     )
@@ -2111,6 +2247,8 @@ end
         parent_b;
         rng=MersenneTwister(1),
         global_consts_ty=global_types,
+        target_a=target_ty,
+        target_b=target_ty,
     )
 
     first = run_once()
@@ -2131,7 +2269,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
     using LambdaRegression.Utils: Err
@@ -2139,7 +2277,7 @@ end
     int_function = TyFun(IntTy, IntTy)
     target_ty = TyFun(int_function, int_function)
     global_types = Dict{Symbol,TyLike}(:inc => int_function)
-    parent_a = Individual(
+    parent_a = Program(
         AstTree(
             AbsNode(
                 :f,
@@ -2152,9 +2290,8 @@ end
                 ),
             ),
         ),
-        target_ty,
     )
-    parent_b = Individual(
+    parent_b = Program(
         AstTree(
             AbsNode(
                 :f,
@@ -2167,7 +2304,6 @@ end
                 ),
             ),
         ),
-        target_ty,
     )
 
     result = crossover(
@@ -2180,6 +2316,8 @@ end
         parent_b;
         rng=MersenneTwister(1111),
         global_consts_ty=global_types,
+        target_a=target_ty,
+        target_b=target_ty,
     )
 
     @test !(result isa Err)
@@ -2196,7 +2334,7 @@ end
     using Test
     using Random
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover, crossover
     using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
     using LambdaRegression.TypeSystem:
         IntTy, TyFun, TyLike, TyMu, infer, iscompatible, make_tyvar_factory
@@ -2214,8 +2352,8 @@ end
         :period_one => period_one,
         :period_two => period_two,
     )
-    parent_a = Individual(AstTree(ConstNode(:period_one)), period_one)
-    parent_b = Individual(AstTree(ConstNode(:period_two)), period_two)
+    parent_a = Program(AstTree(ConstNode(:period_one)))
+    parent_b = Program(AstTree(ConstNode(:period_two)))
 
     result = crossover(
         TypedSubtreeSwapCrossover(
@@ -2227,6 +2365,8 @@ end
         parent_b;
         rng=MersenneTwister(1234),
         global_consts_ty=global_types,
+        target_a=period_one,
+        target_b=period_two,
     )
 
     @test !(result isa Err)
@@ -2234,5 +2374,92 @@ end
         child_a, child_b = result
         @test iscompatible(infer(child_a.tree, global_types), period_one)
         @test iscompatible(infer(child_b.tree, global_types), period_two)
+    end
+end
+
+@testitem "Populations crossover keeps FunctionDef self captures role-safe" begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, FunctionDefNode, IndexNode
+    using LambdaRegression.Mutations.Populations:
+        Program, CrossoverSite, TypedSubtreeSwapCrossover,
+        prepare_typed_analysis, typed_analysis_site_ids, typed_analysis_path
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
+    using LambdaRegression.Utils: Err
+
+    target = TyFun(TyFun(IntTy, IntTy), TyFun(IntTy, IntTy))
+    self_parent = Program(AstTree(AbsNode(
+        :h,
+        FunctionDefNode(AbsNode(:x, AppNode(IndexNode(1), IndexNode(0)))),
+    )))
+    ordinary_parent = Program(AstTree(AbsNode(
+        :h,
+        AbsNode(:k, AppNode(IndexNode(1), IndexNode(0))),
+    )))
+    empty = Dict{Symbol,TyLike}()
+    self_analysis = prepare_typed_analysis(self_parent, empty; target_ty=target)
+    ordinary_analysis = prepare_typed_analysis(ordinary_parent, empty; target_ty=target)
+    @test !(self_analysis isa Err)
+    @test !(ordinary_analysis isa Err)
+    if !(self_analysis isa Err || ordinary_analysis isa Err)
+        self_id = only(filter(
+            id -> typed_analysis_path(self_analysis, id) == (1, 1, 1, 1),
+            typed_analysis_site_ids(self_analysis),
+        ))
+        ordinary_id = only(filter(
+            id -> typed_analysis_path(ordinary_analysis, id) == (1, 1, 1),
+            typed_analysis_site_ids(ordinary_analysis),
+        ))
+        self_site = CrossoverSite(self_analysis, self_id)
+        ordinary_site = CrossoverSite(ordinary_analysis, ordinary_id)
+        for require_compatible_binders in (false, true)
+            op = TypedSubtreeSwapCrossover(
+                require_same_depth=false,
+                require_compatible_binders=require_compatible_binders,
+            )
+            @test !LambdaRegression.Mutations.Populations._captures_fit(
+                op, self_site, ordinary_site,
+            )
+            @test !LambdaRegression.Mutations.Populations._captures_fit(
+                op, ordinary_site, self_site,
+            )
+        end
+    end
+end
+
+@testitem "Populations IndependentCrossover returns both directed children" begin
+    using Test
+    using Random
+    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
+    using LambdaRegression.Mutations.Populations:
+        Program, IndependentCrossover, PathCrossoverSelectionPolicy,
+        TypedSubtreeSwapCrossover, crossover
+    using LambdaRegression.TypeSystem: IntTy, TyLike
+    using LambdaRegression.Utils: Err
+
+    left = Program(AstTree(ConstNode(:left)))
+    right = Program(AstTree(ConstNode(:right)))
+    op = IndependentCrossover(TypedSubtreeSwapCrossover(
+        max_try=1,
+        min_sites=1,
+        allow_root=true,
+        selection=PathCrossoverSelectionPolicy(Int[], Int[]),
+    ))
+    result = crossover(
+        op,
+        left,
+        right;
+        rng=MersenneTwister(42),
+        global_consts_ty=Dict{Symbol,TyLike}(:left => IntTy, :right => IntTy),
+        target_a=IntTy,
+        target_b=IntTy,
+    )
+    @test !(result isa Err)
+    if !(result isa Err)
+        child_left, child_right = result
+        @test child_left.tree == right.tree
+        @test child_right.tree == left.tree
+        @test left.tree == AstTree(ConstNode(:left))
+        @test right.tree == AstTree(ConstNode(:right))
     end
 end

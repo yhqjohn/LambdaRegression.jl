@@ -3,10 +3,9 @@
 using TestItems
 
 using ...ASTs.NodeASTs:
-    AstTree, AstNode, AbsNode, AppNode, ConstNode, IndexNode, LetNode, VarNode,
+    AstTree, AstNode, AbsNode, AppNode, ConstNode, FunctionDefNode, IndexNode, VarNode,
     children
 using ...ASTs.LexicalContexts: BinderId
-using ...Procedural: FunctionDefNode
 using ...Utils: Err
 
 export TransportMissingBindingErr, TransportTargetBindingErr
@@ -36,8 +35,6 @@ end
 @inline _transport_introduced(::AppNode, ::Int) = 0
 @inline _transport_introduced(::AbsNode, child_index::Int) =
     child_index == 1 ? 1 : throw(BoundsError())
-@inline _transport_introduced(::LetNode, child_index::Int) =
-    child_index == 2 ? 1 : 0
 @inline _transport_introduced(::FunctionDefNode, child_index::Int) =
     child_index == 1 ? 1 : throw(BoundsError())
 
@@ -101,8 +98,7 @@ function _transport_rewrite(
 
     rewritten_children = AstNode[]
     for (child_index, child) in enumerate(children(node))
-        # `_transport_introduced` deliberately has no ScopeNode method. Index
-        # arithmetic avoids comparing locally introduced BinderIds across trees.
+        # Index arithmetic avoids comparing locally introduced BinderIds across trees.
         rewritten = _transport_rewrite(
             child,
             local_depth + _transport_introduced(node, child_index),
@@ -118,8 +114,6 @@ function _transport_rewrite(
         return AbsNode(node.name, rewritten_children[1])
     elseif node isa AppNode
         return AppNode(rewritten_children[1], rewritten_children[2])
-    elseif node isa LetNode
-        return LetNode(node.name, rewritten_children[1], rewritten_children[2])
     elseif node isa FunctionDefNode
         return FunctionDefNode(rewritten_children[1])
     end
@@ -164,20 +158,23 @@ end
 @testitem "binder transport maps an arbitrary ancestor" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs:
-        AbsNode, AstTree, ConstNode, IndexNode, LetNode
+        AbsNode, AstTree, IndexNode
     using LambdaRegression.Mutations.Populations:
-        prepare_core_snapshot, transport_subtree
+        prepare_typed_analysis, typed_analysis_site_ids, typed_analysis_site,
+        transport_subtree
     using LambdaRegression.TypeSystem: IntTy, TyLike
 
     donor_tree = AstTree(AbsNode(:x, AbsNode(:y, IndexNode(1))))
-    recipient_tree = AstTree(LetNode(:z, ConstNode(:one), AbsNode(:q, IndexNode(0))))
-    donor_snapshot = prepare_core_snapshot(donor_tree, Dict{Symbol,TyLike}())
-    recipient_snapshot = prepare_core_snapshot(
-        recipient_tree,
-        Dict{Symbol,TyLike}(:one => IntTy),
+    recipient_tree = AstTree(AbsNode(:z, AbsNode(:q, IndexNode(0))))
+    donor_snapshot = prepare_typed_analysis(donor_tree, Dict{Symbol,TyLike}())
+    recipient_snapshot = prepare_typed_analysis(recipient_tree, Dict{Symbol,TyLike}())
+    donor_site = typed_analysis_site(
+        donor_snapshot, only(typed_analysis_site_ids(donor_snapshot; site_path=[1])),
     )
-    donor_site = only(filter(site -> site.path == (1,), donor_snapshot.sites))
-    recipient_site = only(filter(site -> site.path == (2,), recipient_snapshot.sites))
+    recipient_site = typed_analysis_site(
+        recipient_snapshot,
+        only(typed_analysis_site_ids(recipient_snapshot; site_path=[1])),
+    )
     source = first(donor_site.boundary_visible)
     target = first(recipient_site.boundary_visible)
     transported = transport_subtree(
@@ -195,15 +192,21 @@ end
     using Test
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, IndexNode
     using LambdaRegression.Mutations.Populations:
-        prepare_core_snapshot, transport_subtree
+        prepare_typed_analysis, typed_analysis_site_ids, typed_analysis_site,
+        transport_subtree
     using LambdaRegression.TypeSystem: TyLike
 
     donor_tree = AstTree(AbsNode(:x, AbsNode(:y, AppNode(IndexNode(1), IndexNode(0)))))
     recipient_tree = AstTree(AbsNode(:z, AbsNode(:w, IndexNode(0))))
-    donor_snapshot = prepare_core_snapshot(donor_tree, Dict{Symbol,TyLike}())
-    recipient_snapshot = prepare_core_snapshot(recipient_tree, Dict{Symbol,TyLike}())
-    donor_site = only(filter(site -> site.path == (1,), donor_snapshot.sites))
-    recipient_site = only(filter(site -> site.path == (1, 1), recipient_snapshot.sites))
+    donor_snapshot = prepare_typed_analysis(donor_tree, Dict{Symbol,TyLike}())
+    recipient_snapshot = prepare_typed_analysis(recipient_tree, Dict{Symbol,TyLike}())
+    donor_site = typed_analysis_site(
+        donor_snapshot, only(typed_analysis_site_ids(donor_snapshot; site_path=[1])),
+    )
+    recipient_site = typed_analysis_site(
+        recipient_snapshot,
+        only(typed_analysis_site_ids(recipient_snapshot; site_path=[1, 1])),
+    )
     source = first(donor_site.boundary_visible)
     target = recipient_site.boundary_visible[2]
     transported = transport_subtree(
@@ -221,17 +224,23 @@ end
     using Test
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
     using LambdaRegression.Mutations.Populations:
-        prepare_core_snapshot, transport_subtree, TransportRoleMismatchErr
-    using LambdaRegression.Procedural: FunctionDefNode, prepare_procedural_snapshot
+        prepare_typed_analysis, typed_analysis_site_ids, typed_analysis_site,
+        transport_subtree, TransportRoleMismatchErr
+    using LambdaRegression.ASTs.NodeASTs: FunctionDefNode
     using LambdaRegression.TypeSystem: TyLike
     using LambdaRegression.Utils: Err
 
     donor_tree = AstTree(FunctionDefNode(IndexNode(0)))
     recipient_tree = AstTree(AbsNode(:x, IndexNode(0)))
-    donor_snapshot = prepare_procedural_snapshot(donor_tree, Dict{Symbol,TyLike}())
-    recipient_snapshot = prepare_core_snapshot(recipient_tree, Dict{Symbol,TyLike}())
-    donor_site = only(filter(site -> site.path == (1,), donor_snapshot.sites))
-    recipient_site = only(filter(site -> site.path == (1,), recipient_snapshot.sites))
+    donor_snapshot = prepare_typed_analysis(donor_tree, Dict{Symbol,TyLike}())
+    recipient_snapshot = prepare_typed_analysis(recipient_tree, Dict{Symbol,TyLike}())
+    donor_site = typed_analysis_site(
+        donor_snapshot, only(typed_analysis_site_ids(donor_snapshot; site_path=[1])),
+    )
+    recipient_site = typed_analysis_site(
+        recipient_snapshot,
+        only(typed_analysis_site_ids(recipient_snapshot; site_path=[1])),
+    )
     result = transport_subtree(
         donor_tree,
         donor_site,
@@ -247,14 +256,17 @@ end
     using Test
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
     using LambdaRegression.Mutations.Populations:
-        prepare_core_snapshot, transport_subtree
+        prepare_typed_analysis, typed_analysis_site_ids, typed_analysis_site,
+        transport_subtree
     using LambdaRegression.TypeSystem: TyLike
     using LambdaRegression.Utils: Err
 
     donor_tree = AstTree(AbsNode(:x, AbsNode(:y, IndexNode(1))))
     before = deepcopy(donor_tree)
-    snapshot = prepare_core_snapshot(donor_tree, Dict{Symbol,TyLike}())
-    donor_site = only(filter(site -> site.path == (1,), snapshot.sites))
+    snapshot = prepare_typed_analysis(donor_tree, Dict{Symbol,TyLike}())
+    donor_site = typed_analysis_site(
+        snapshot, only(typed_analysis_site_ids(snapshot; site_path=[1])),
+    )
     result = transport_subtree(donor_tree, donor_site, donor_site, Dict())
     @test result isa Err
     @test donor_tree == before
@@ -264,7 +276,8 @@ end
     using Test
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, IndexNode
     using LambdaRegression.Mutations.Populations:
-        prepare_core_snapshot, transport_subtree
+        prepare_typed_analysis, typed_analysis_site_ids, typed_analysis_site,
+        transport_subtree
     using LambdaRegression.TypeSystem: TyLike
 
     # The donor's nested binder has the same structural BinderId as the
@@ -275,14 +288,17 @@ end
     recipient_tree = AstTree(
         AbsNode(:a, AbsNode(:b, AbsNode(:c, IndexNode(0)))),
     )
-    donor_snapshot = prepare_core_snapshot(donor_tree, Dict{Symbol,TyLike}())
-    recipient_snapshot = prepare_core_snapshot(
+    donor_snapshot = prepare_typed_analysis(donor_tree, Dict{Symbol,TyLike}())
+    recipient_snapshot = prepare_typed_analysis(
         recipient_tree,
         Dict{Symbol,TyLike}(),
     )
-    donor_site = only(filter(site -> site.path == (1,), donor_snapshot.sites))
-    recipient_site = only(
-        filter(site -> site.path == (1, 1, 1), recipient_snapshot.sites),
+    donor_site = typed_analysis_site(
+        donor_snapshot, only(typed_analysis_site_ids(donor_snapshot; site_path=[1])),
+    )
+    recipient_site = typed_analysis_site(
+        recipient_snapshot,
+        only(typed_analysis_site_ids(recipient_snapshot; site_path=[1, 1, 1])),
     )
     source = first(donor_site.boundary_visible)
     target = recipient_site.boundary_visible[2]
@@ -295,20 +311,4 @@ end
     @test transported isa AstTree
     transported isa AstTree || return
     @test transported.root == AbsNode(:y, IndexNode(2))
-end
-
-@testitem "binder transport leaves Scope IR unsupported" begin
-    using Test
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.Procedural: ScopeNode
-    using LambdaRegression.Mutations.Populations: transport_subtree
-
-    struct _TransportTestSite
-        path::Tuple
-        boundary_visible::Tuple
-    end
-
-    tree = AstTree(ScopeNode([ConstNode(:x)], ConstNode(:body)))
-    site = _TransportTestSite((), ())
-    @test_throws MethodError transport_subtree(tree, site, site, Dict())
 end

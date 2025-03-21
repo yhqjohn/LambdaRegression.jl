@@ -154,7 +154,7 @@ function _register_root_inputs!(hole::SourceHole, language::Language)
     return true
 end
 
-function _same_root_type(source::SourceAnalysis, hole::SourceHole, language::Language)
+function _same_root_type(source::TypedAnalysis, hole::SourceHole, language::Language)
     left = intern_type!(language.types, source.root_type)
     left isa Err && return left
     right = intern_type!(language.types, hole.source.root_type)
@@ -178,7 +178,7 @@ at that boundary may contain an expanded donor β-redex and therefore need not
 be independently accepted by `import_hole`; `term` is the compact body that
 retains the already certified `SourceProgram` leaf instead.
 """
-function prepare_root_hole(source::SourceAnalysis, language::Language, type_context;
+function prepare_root_hole(source::TypedAnalysis, language::Language, type_context;
                            arity::Int)
     arity >= 0 || return _root_fail(:invalid_arity, arity)
     root_hole = source_hole(source)
@@ -273,7 +273,7 @@ root types must match exactly.  Root-input leaves use the existing anchor and
 their original positional De Bruijn index, so same-typed inputs are never
 merged merely because their type ids agree.
 """
-function import_root_body(source::SourceAnalysis, language::Language, hole::SourceHole)
+function import_root_body(source::TypedAnalysis, language::Language, hole::SourceHole)
     arity = length(hole.path)
     all(edge -> edge == 1, hole.path) || return _root_fail(:not_a_root_interface, hole.path)
     same = _same_root_type(source, hole, language)
@@ -292,7 +292,7 @@ end
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
     using LambdaRegression.TypedSearch
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
 
     float_to_float = TyFun(FloatTy, FloatTy)
     target = TyFun(float_to_float, float_to_float)
@@ -305,7 +305,7 @@ end
     @test validate(prepared.term, language) === true
     @test prepared.term.nodes[end].kind != ABS
     exported = export_hole(prepared.term, language, prepared.hole)
-    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa SourceAnalysis
+    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa TypedAnalysis
 end
 
 @testitem "TypedSearch root body preserves positions and internal binders" begin
@@ -313,7 +313,7 @@ end
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.TypedSearch
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
 
     target = TyFun(IntTy, TyFun(IntTy, TyFun(IntTy, IntTy)))
     source = prepare_source(AstTree(AbsNode(:x, AbsNode(:y, AbsNode(:z, IndexNode(1))))),
@@ -324,8 +324,8 @@ end
     @test validate(prepared.term, language) === true
     @test prepared.term.nodes[end].kind == ABS
     roundtrip = export_hole(prepared.term, language, prepared.hole)
-    @test prepare_source(roundtrip, Dict{Symbol,TyLike}(), target) isa SourceAnalysis
-    @test evaluate_procedural(roundtrip, Dict{Symbol,Any}(); args=(1, 2, 3)) == 2
+    @test prepare_source(roundtrip, Dict{Symbol,TyLike}(), target) isa TypedAnalysis
+    @test evaluate_native(roundtrip, Dict{Symbol,Any}(); args=(1, 2, 3)) == 2
 end
 
 @testitem "TypedSearch shared root imports keep same-typed input identities" begin
@@ -354,7 +354,7 @@ end
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.TypedSearch
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
 
     target = TyFun(IntTy, TyFun(IntTy, IntTy))
     # The second root input is intentionally ignored by the ancestor.
@@ -382,8 +382,8 @@ end
     candidate = TypedTerm(TermNode[leaf_node(intid, unused_leaf)])
     @test validate(candidate, language) === true
     exported = export_hole(candidate, language, prepared.hole)
-    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa SourceAnalysis
-    @test evaluate_procedural(exported, Dict{Symbol,Any}(); args=(1, 2)) == 2
+    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa TypedAnalysis
+    @test evaluate_native(exported, Dict{Symbol,Any}(); args=(1, 2)) == 2
 end
 
 @testitem "TypedSearch root interface rejects bad arity and task type" begin
@@ -409,7 +409,7 @@ end
     using LambdaRegression.TypedSearch
     using LambdaRegression.TypedSearch: SourceProgram
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
 
@@ -441,8 +441,8 @@ end
         @test validate(prepared.term, language) === true
         @test written_complexity(prepared.term, language) == 6
         exported = export_hole(prepared.term, language, prepared.hole)
-        @test prepare_source(exported, Dict{Symbol,TyLike}(), higher) isa SourceAnalysis
-        @test evaluate_procedural(exported, Dict{Symbol,Any}();
+        @test prepare_source(exported, Dict{Symbol,TyLike}(), higher) isa TypedAnalysis
+        @test evaluate_native(exported, Dict{Symbol,Any}();
             args=(x -> x + 1, 7)) == 8
     end
 
@@ -460,8 +460,8 @@ end
         positional_export = export_hole(positional.term, positional_language,
             positional.hole)
         @test prepare_source(positional_export, Dict{Symbol,TyLike}(),
-            positional_target) isa SourceAnalysis
-        @test evaluate_procedural(positional_export, Dict{Symbol,Any}();
+            positional_target) isa TypedAnalysis
+        @test evaluate_native(positional_export, Dict{Symbol,Any}();
             args=(4, 5, 6)) == 4
     end
 

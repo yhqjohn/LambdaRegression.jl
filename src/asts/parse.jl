@@ -2,7 +2,7 @@ module Parse
 
 using ..NodeASTs: AstNode, AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, setchild!, ScopeState, hasname
 using ...Trees: PointerState, traverse, getstate
-using ....Utils
+using ...Utils
 using TestItems
 
 export parse_lambda, @terms

@@ -469,7 +469,7 @@ end
 @testitem "TypedSearch direct evaluator roots and native oracle" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
     using LambdaRegression.TypeSystem: IntTy
     using LambdaRegression.TypedSearch
 
@@ -484,7 +484,7 @@ end
     prepared = prepare_typed(identity, language)
     @test prepared isa PreparedTyped
     @test run_typed(prepared, Any[]; args=(42,)) == 42
-    @test evaluate_procedural(
+    @test evaluate_native(
         AstTree(AbsNode(:x, IndexNode(0))), Dict{Symbol,Any}(); args=(42,)
     ) == run_typed(prepared, Any[]; args=(42,))
 
@@ -499,7 +499,7 @@ end
     using Test
     using LambdaRegression.ASTs.NodeASTs:
         AbsNode, AppNode, AstTree, ConstNode, IndexNode
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
     using LambdaRegression.TypeSystem: IntTy
     using LambdaRegression.TypedSearch
 
@@ -524,7 +524,7 @@ end
     native = AstTree(AbsNode(:x, AbsNode(:y,
         AppNode(AppNode(ConstNode(:add), IndexNode(1)), IndexNode(0)))))
     @test run_typed(prepared, values; args=(2, 3)) ==
-        evaluate_procedural(native, Dict{Symbol,Any}(:add => values[1]); args=(2, 3))
+        evaluate_native(native, Dict{Symbol,Any}(:add => values[1]); args=(2, 3))
 
     capture = TypedTerm(TermNode[
         var_node(int, 1),
@@ -539,7 +539,7 @@ end
     using Test
     using LambdaRegression.ASTs.NodeASTs:
         AbsNode, AppNode, AstTree, ConstNode, IndexNode
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
     using LambdaRegression.TypeSystem: IntTy
     using LambdaRegression.TypedSearch
     using LambdaRegression.Utils: Err
@@ -568,7 +568,7 @@ end
     native_map = AstTree(AppNode(AppNode(ConstNode(:map1),
         AbsNode(:y, AppNode(ConstNode(:inc), IndexNode(0)))), ConstNode(:three)))
     @test run_typed(prepare_typed(map_term, map_language), map_values) ==
-        evaluate_procedural(native_map, Dict{Symbol,Any}(
+        evaluate_native(native_map, Dict{Symbol,Any}(
             :map1 => map1, :inc => map_values[2], :three => 3,
         ))
 

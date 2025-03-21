@@ -1,42 +1,42 @@
-abstract type ProceduralEvaluationError <: Exception end
+abstract type NativeEvaluationError <: Exception end
 
-"""The native procedural evaluator exhausted its shared reduction budget."""
-struct ProceduralStepLimitError <: ProceduralEvaluationError
+"""Native evaluation exhausted its shared reduction budget."""
+struct NativeStepLimitError <: NativeEvaluationError
     steps::Int
 end
 
-"""A procedural program finished as syntax or an unresolved value."""
-struct ProceduralNonValueError <: ProceduralEvaluationError
+"""A native program finished as syntax or an unresolved value."""
+struct NativeNonValueError <: NativeEvaluationError
     value_kind::Symbol
 end
 
 """A De Bruijn reference escaped the lexical environment."""
-struct ProceduralUnboundIndexError <: ProceduralEvaluationError
+struct NativeUnboundIndexError <: NativeEvaluationError
     index::Int
 end
 
 """A constant required at runtime was absent from the evaluation context."""
-struct ProceduralMissingConstantError <: ProceduralEvaluationError
+struct NativeMissingConstantError <: NativeEvaluationError
     name::Symbol
 end
 
 """A call-by-need thunk recursively demanded itself before producing a value."""
-struct ProceduralEvaluationCycleError <: ProceduralEvaluationError end
+struct NativeEvaluationCycleError <: NativeEvaluationError end
 
 """
-    PreparedProcedural
+    PreparedNativeEvaluator
 
 Prepared immutable-by-convention program handle for repeated native evaluation.
-Use [`prepare_procedural`](@ref) once per individual, then [`run_procedural`](@ref)
+Use [`prepare_native_evaluator`](@ref) once per individual, then [`run_native_evaluator`](@ref)
 for each sample. Runtime environments and budgets are created per run.
 """
-struct PreparedProcedural
+struct PreparedNativeEvaluator
     root::AstNode
 end
 
-abstract type _ProceduralValue end
+abstract type _NativeValue end
 
-struct _HostValue <: _ProceduralValue
+struct _HostValue <: _NativeValue
     value
 end
 
@@ -44,18 +44,18 @@ mutable struct _EvalThunk
     node::Union{Nothing,AstNode}
     env::Vector{_EvalThunk}
     names::Vector{Union{Nothing,Symbol}}
-    value::Union{Nothing,_ProceduralValue}
+    value::Union{Nothing,_NativeValue}
     state::UInt8
 end
 
-struct _ClosureValue <: _ProceduralValue
+struct _ClosureValue <: _NativeValue
     name::Symbol
     body::AstNode
     env::Vector{_EvalThunk}
     names::Vector{Union{Nothing,Symbol}}
 end
 
-struct _FixValue <: _ProceduralValue
+struct _FixValue <: _NativeValue
     body::AstNode
     env::Vector{_EvalThunk}
     names::Vector{Union{Nothing,Symbol}}
@@ -76,18 +76,18 @@ _node_thunk(
     env::Vector{_EvalThunk},
     names::Vector{Union{Nothing,Symbol}},
 ) = _EvalThunk(node, env, names, nothing, 0x00)
-_value_thunk(value::_ProceduralValue) =
+_value_thunk(value::_NativeValue) =
     _EvalThunk(nothing, _EvalThunk[], Union{Nothing,Symbol}[], value, 0x02)
 
 function _tick!(state::_EvaluationState)
-    state.budget.remaining > 0 || throw(ProceduralStepLimitError(state.budget.initial))
+    state.budget.remaining > 0 || throw(NativeStepLimitError(state.budget.initial))
     state.budget.remaining -= 1
     return nothing
 end
 
 function _force!(thunk::_EvalThunk, state::_EvaluationState)
-    thunk.state == 0x02 && return thunk.value::_ProceduralValue
-    thunk.state == 0x01 && throw(ProceduralEvaluationCycleError())
+    thunk.state == 0x02 && return thunk.value::_NativeValue
+    thunk.state == 0x01 && throw(NativeEvaluationCycleError())
     _tick!(state)
     thunk.state = 0x01
     try
@@ -106,7 +106,7 @@ end
 
 function _lookup_index(env::Vector{_EvalThunk}, index::Int)
     position = length(env) - index
-    1 <= position <= length(env) || throw(ProceduralUnboundIndexError(index))
+    1 <= position <= length(env) || throw(NativeUnboundIndexError(index))
     return env[position]
 end
 
@@ -116,18 +116,18 @@ function _lookup_name(
     name::Symbol,
 )
     position = findlast(==(name), names)
-    position === nothing && throw(ProceduralNonValueError(:free_variable))
+    position === nothing && throw(NativeNonValueError(:free_variable))
     return env[position]
 end
 
-struct _ProceduralCallable
-    value::_ProceduralValue
+struct _NativeCallable
+    value::_NativeValue
     state::_EvaluationState
     site_env::Vector{_EvalThunk}
     site_names::Vector{Union{Nothing,Symbol}}
 end
 
-function (callable::_ProceduralCallable)(argument)
+function (callable::_NativeCallable)(argument)
     value = _apply_value!(
         callable.value,
         _value_thunk(_HostValue(argument)),
@@ -140,7 +140,7 @@ end
 
 _to_host(value::_HostValue, state, site_env, site_names) = value.value
 _to_host(value::Union{_ClosureValue,_FixValue}, state, site_env, site_names) =
-    _ProceduralCallable(value, state, copy(site_env), copy(site_names))
+    _NativeCallable(value, state, copy(site_env), copy(site_names))
 
 function _from_host(
     value,
@@ -148,7 +148,7 @@ function _from_host(
     names::Vector{Union{Nothing,Symbol}},
     state::_EvaluationState,
 )
-    value isa _ProceduralValue && return value
+    value isa _NativeValue && return value
     value isa AstTree && return _evaluate_node!(value.root, env, names, state)
     value isa AstNode && return _evaluate_node!(value, env, names, state)
     return _HostValue(value)
@@ -200,13 +200,13 @@ function _apply_value!(
 end
 
 function _apply_value!(
-    function_value::_ProceduralValue,
+    function_value::_NativeValue,
     argument::_EvalThunk,
     site_env::Vector{_EvalThunk},
     site_names::Vector{Union{Nothing,Symbol}},
     state::_EvaluationState,
 )
-    throw(ProceduralNonValueError(:non_callable))
+    throw(NativeNonValueError(:non_callable))
 end
 
 function _evaluate_node!(
@@ -218,7 +218,7 @@ function _evaluate_node!(
     _tick!(state)
     if node isa ConstNode
         haskey(state.context, node.name) ||
-            throw(ProceduralMissingConstantError(node.name))
+            throw(NativeMissingConstantError(node.name))
         return _HostValue(state.context[node.name])
     elseif node isa VarNode
         return _force!(_lookup_name(env, names, node.name), state)
@@ -230,49 +230,37 @@ function _evaluate_node!(
         function_value = _evaluate_node!(node.func, env, names, state)
         argument = _node_thunk(node.arg, copy(env), copy(names))
         return _apply_value!(function_value, argument, env, names, state)
-    elseif node isa LetNode
-        body_env = copy(env)
-        body_names = copy(names)
-        push!(body_env, _node_thunk(node.value, copy(env), copy(names)))
-        push!(body_names, node.name)
-        return _evaluate_node!(node.body, body_env, body_names, state)
-    elseif node isa ScopeNode
-        body_env = copy(env)
-        body_names = copy(names)
-        for binding in node.bindings
-            push!(body_env, _node_thunk(binding, copy(body_env), copy(body_names)))
-            push!(body_names, nothing)
-        end
-        return _evaluate_node!(node.body, body_env, body_names, state)
     elseif node isa FunctionDefNode
         return _FixValue(node.body, copy(env), copy(names))
     end
-    throw(ProceduralNonValueError(:unsupported_node))
+    throw(NativeNonValueError(:unsupported_node))
 end
 
 """
-    prepare_procedural(term; copy_tree=true) -> PreparedProcedural
+    prepare_native_evaluator(term; copy_tree=true) -> PreparedNativeEvaluator
 
-Prepare a procedural or core AST for repeated native evaluation. The default owns
+Prepare a FunctionDef or core AST for repeated native evaluation. The default owns
 a structural copy so later mutation of the source individual cannot change an
 already-prepared program. Internal hot paths may pass `copy_tree=false` when the
 individual is immutable for the duration of the run.
 """
-function prepare_procedural(term::Union{AstNode,AstTree}; copy_tree::Bool=true)
+function prepare_native_evaluator(term::Union{AstNode,AstTree}; copy_tree::Bool=true)
     root = term isa AstTree ? term.root : term
-    return PreparedProcedural(copy_tree ? deepcopy(root) : root)
+    return PreparedNativeEvaluator(copy_tree ? deepcopy(root) : root)
 end
 
 """
-    run_procedural(prepared, context; args=(), max_steps=256)
+    run_native_evaluator(prepared, context; args=(), max_steps=256)
 
 Run a prepared program with positional host arguments. `args` should be a tuple;
 a non-tuple value is treated as one argument. The step budget is shared by all
-recursive calls, thunks, and higher-order callbacks in this run. Expected resource
-and malformed-program failures return `Err`.
+recursive calls, thunks, and higher-order callbacks in this run. Expected
+resource and malformed-program failures from the run return `Err`. A callable
+returned by the run retains its state and budget; later host calls may throw a
+native evaluation error directly when that shared budget is exhausted.
 """
-function run_procedural(
-    prepared::PreparedProcedural,
+function run_native_evaluator(
+    prepared::PreparedNativeEvaluator,
     context;
     args=(),
     max_steps::Int=256,
@@ -294,12 +282,12 @@ function run_procedural(
         end
         return _to_host(value, state, _EvalThunk[], empty_names)
     catch error
-        error isa ProceduralEvaluationError && return Err(error)
+        error isa NativeEvaluationError && return Err(error)
         rethrow()
     end
 end
 
-"""Prepare and run one procedural term. Prefer `prepare_procedural` for batches."""
-function evaluate_procedural(term::Union{AstNode,AstTree}, context; kwargs...)
-    return run_procedural(prepare_procedural(term), context; kwargs...)
+"""Prepare and run one term natively. Prefer `prepare_native_evaluator` for batches."""
+function evaluate_native(term::Union{AstNode,AstTree}, context; kwargs...)
+    return run_native_evaluator(prepare_native_evaluator(term), context; kwargs...)
 end

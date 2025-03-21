@@ -1,17 +1,20 @@
-"""
-    ProceduralMutations
+#=
+    FunctionDefMutation
 
-Typed mutation adapters for the optional procedural AST extension. The module is
-a narrow bridge: ordinary `Mutations` remains independent of `ScopeNode` and
-`FunctionDefNode`, while `Procedural` remains usable without enabling mutation.
+Typed mutation operators for common `FunctionDefNode` programs. This file is
+included into `Mutations`, sharing its site analysis, transaction, and final
+type-validation path while keeping FunctionDef-specific scope transport and
+generation separate by responsibility.
 
 ```julia
-mutation = FunctionDefMutation(
+using LambdaRegression: CanonicalGeneration, Mutations
+
+mutation = Mutations.FunctionDefMutation(
     :recursive_body;
-    functiondef_provider=Procedural.FunctionDefProvider(max_nesting=1, body_attempts=16),
+    functiondef_provider=CanonicalGeneration.FunctionDefProvider(max_nesting=1, body_attempts=16),
     generation_kwargs=(sampling_depth_limit=8, sampling_node_budget=96),
 )
-child = mutate_procedural(parent, target; mutations=[mutation], max_try=16)
+child = Mutations.mutate_tree(parent, target; mutations=[mutation], max_try=16)
 ```
 
 `FunctionDefMutation(mode)` has three explicit modes:
@@ -22,9 +25,13 @@ child = mutate_procedural(parent, target; mutations=[mutation], max_try=16)
   provider, so the replacement contains a genuine self call;
 - `:remove` replaces the whole FunctionDef with a compatible finite witness.
 
-All modes reconstruct the visible outer binders from the authoritative site
-path, preserve maximally generalized `Scope` binders, stage generated constants
-transactionally, reject structural no-ops, and finish with procedural inference.
+On common syntax, every mode reads the selected target and exact outer binder
+schemes from the call's root-constrained `TypedAnalysis`; this preserves
+let-like polymorphism alongside monomorphic lambda and FunctionDef-self slots.
+There is no alternate checker or metadata path: the shared analysis is the only
+source of site and binder facts. Generated constants remain transactional,
+structural no-ops are rejected, and successful edits finish with complete
+shared TypeSystem inference.
 
 Customization is layered and opt-in:
 
@@ -76,23 +83,18 @@ exhausted recursive-body attempts, a forbidden FunctionDef in finite modes, an
 unresolved outer binder, a structural no-op, or failed final inference. Invalid
 callback signatures and non-finite weights throw. Omitting this mutation avoids
 every FunctionDef-specific scan; retaining it with chooser weight zero does not.
-"""
-module ProceduralMutations
-
-using ..Utils: Err
-using ..Trees: children, setchild!
-using ..TypeSystem
+=#
 using ..ASTs.NodeASTs
-using ..ASTs.Contexts: ConstSymbolFactory
+using ..ASTs.LexicalContexts: BinderId
+using ..Programs: ConstSymbolFactory
+using ..Programs: Program, _publish_program
 using ..CanonicalGeneration: GenerationResult
 import ..CanonicalGeneration as CG
-import ..Mutations
-import ..Procedural
+using ..ProgramAnalysis:
+    TypedAnalysis, functiondef_recursion_observations, visible_binder_ids
 
 export FunctionDefMutation, FunctionDefScope, generate_functiondef_replacement
 export DefaultFunctionDefMutationGenerator
-export mutate_procedural
-export FunctionDefTypedSubtreeSwapCrossover, AutoTypedCrossover
 
 const _FUNCTIONDEF_MUTATION_MODES = (:finite_body, :recursive_body, :remove)
 const _FUNCTIONDEF_GENERATION_CONTEXT_KEYS = (
@@ -144,13 +146,13 @@ end
                         deduplicate_provider_values=false)
 
 Create an opt-in complete-FunctionDef mutation. `mode` is `:finite_body`,
-`:recursive_body`, or `:remove`; see the module tutorial for contracts and
-customization points.
+`:recursive_body`, or `:remove`; see the `Mutations` module docstring and
+the custom replacement-generator contract for shared typing and customization.
 """
 function FunctionDefMutation(
     mode::Symbol;
-    functiondef_provider::Procedural.FunctionDefProvider=
-        Procedural.FunctionDefProvider(body_attempts=16),
+    functiondef_provider::CG.FunctionDefProvider=
+        CG.FunctionDefProvider(body_attempts=16),
     generation_kwargs::NamedTuple=(;
         sampling_depth_limit=4,
         sampling_node_budget=64,
@@ -187,7 +189,7 @@ Mutations.is_site_eligible(
     env::Mutations.MutationEnv,
     ctx::NamedTuple,
 ) =
-    site.node isa Procedural.FunctionDefNode
+    site.node isa FunctionDefNode
 
 function Mutations.site_weight(
     m::FunctionDefMutation,
@@ -202,19 +204,6 @@ function Mutations.site_weight(
         "FunctionDef site weight must be finite and nonnegative",
     ))
     return weight
-end
-
-function _inferred_ty(meta, node)
-    haskey(meta, node) || return nothing
-    ty = TypeSystem.prune(meta[node][1])
-    return ty isa Ty ? ty : nothing
-end
-
-function _inferred_binding_scheme(meta, node, level::Int)
-    haskey(meta, node) || return nothing
-    ty = TypeSystem.prune(meta[node][1])
-    ty isa Ty || return nothing
-    return TypeSystem.generalize(ty, level)
 end
 
 function _fresh_scope_placeholder(slot::Int, occupied::Set{Symbol})
@@ -266,88 +255,64 @@ function _functiondef_scope(
     )
 end
 
-function _visible_functiondef_context(tree, path, env, ctx; reserved_names=())
-    meta, meta_node = if env.meta !== nothing && env.tree !== nothing
-        env.meta, env.tree.root
-    else
-        inferred_meta = IdDict{AstNode,Tuple{TyLike,TyLike}}()
-        type_context = merge(ctx.global_consts_ty, ctx.local_consts_ty)
-        inferred = Procedural.infer_procedural(
-            tree,
-            type_context;
-            factory=ctx.tyfactory,
-            meta=inferred_meta,
-        )
-        inferred isa Err && return inferred
-        inferred_meta, tree.root
-    end
-
-    outer_to_inner = TyLike[]
-    node = tree.root
-    level = 0
-    functiondef_depth = 0
-    let_abs_schemes = IdDict{AbsNode,TyScheme}()
+function _analysis_occurrence_at_path(analysis::TypedAnalysis, path::Vector{Int})
+    occurrence = 1
     for child_index in path
-        kids = children(node)
-        meta_kids = children(meta_node)
-        1 <= child_index <= length(kids) || return Err(BoundsError(kids, child_index))
-        length(meta_kids) == length(kids) || return Err(ArgumentError(
-            "prepared mutation metadata no longer matches the FunctionDef path",
+        children_ids = analysis.index.children[occurrence]
+        1 <= child_index <= length(children_ids) || return Err(BoundsError(
+            children_ids,
+            child_index,
         ))
-        if node isa AbsNode && child_index == 1
-            scheme = get(let_abs_schemes, node, nothing)
-            if scheme === nothing
-                node_ty = _inferred_ty(meta, meta_node)
-                node_ty isa TyFun || return Err(ArgumentError(
-                    "cannot recover abstraction binder type at FunctionDef site",
-                ))
-                push!(outer_to_inner, node_ty.arg)
-            else
-                push!(outer_to_inner, scheme)
-            end
-        elseif node isa Procedural.FunctionDefNode && child_index == 1
-            self_ty = _inferred_ty(meta, meta_node)
-            self_ty === nothing && return Err(ArgumentError(
-                "cannot recover outer FunctionDef self type",
-            ))
-            push!(outer_to_inner, self_ty)
-            functiondef_depth += 1
-        elseif node isa Procedural.ScopeNode
-            visible = child_index <= length(node.bindings) ? child_index - 1 : length(node.bindings)
-            for binding in @view meta_node.bindings[1:visible]
-                binding_ty = _inferred_binding_scheme(meta, binding, level)
-                binding_ty === nothing && return Err(ArgumentError(
-                    "cannot recover Scope binding type at FunctionDef site",
-                ))
-                push!(outer_to_inner, binding_ty)
-            end
-            child_index <= length(node.bindings) && (level += 1)
-        elseif node isa LetNode && child_index == 2
-            binding_ty = _inferred_binding_scheme(meta, meta_node.value, level)
-            binding_ty === nothing && return Err(ArgumentError(
-                "cannot recover let binding type at FunctionDef site",
-            ))
-            push!(outer_to_inner, binding_ty)
-        elseif node isa LetNode && child_index == 1
-            level += 1
-        elseif node isa AppNode && node.func isa AbsNode
-            if child_index == 1
-                binding_ty = _inferred_binding_scheme(meta, meta_node.arg, level)
-                binding_ty === nothing && return Err(ArgumentError(
-                    "cannot recover let-like application binder type at FunctionDef site",
-                ))
-                let_abs_schemes[node.func] = binding_ty
-            elseif child_index == 2
-                level += 1
-            end
-        end
-        node = kids[child_index]
-        meta_node = meta_kids[child_index]
+        occurrence = children_ids[child_index]
     end
-    target_ty = isempty(path) ? env.target_ty : _inferred_ty(meta, meta_node)
-    target_ty isa Ty || return Err(ArgumentError(
-        "cannot recover monomorphic FunctionDef target type",
+    return occurrence
+end
+
+function _visible_functiondef_context_from_analysis(
+    tree,
+    path,
+    analysis::TypedAnalysis,
+    ctx;
+    reserved_names=(),
+)
+    occurrence = _analysis_occurrence_at_path(analysis, path)
+    occurrence isa Err && return occurrence
+    source_node = analysis.index.nodes[occurrence]
+    source_node isa FunctionDefNode || return Err(ArgumentError(
+        "prepared common analysis no longer matches the FunctionDef site path",
     ))
+
+    attempt_node = tree.root
+    for child_index in path
+        kids = children(attempt_node)
+        1 <= child_index <= length(kids) || return Err(BoundsError(kids, child_index))
+        attempt_node = kids[child_index]
+    end
+    attempt_node isa FunctionDefNode || return Err(ArgumentError(
+        "attempt tree no longer has a FunctionDef at the prepared site path",
+    ))
+
+    raw_target_ty = get(analysis.metadata, occurrence, nothing)
+    raw_target_ty === nothing && return Err(ArgumentError(
+        "common analysis lacks metadata for the FunctionDef site",
+    ))
+    target_ty = TypeSystem.prune(raw_target_ty[1])
+    target_ty isa Ty || return Err(ArgumentError(
+        "cannot recover monomorphic FunctionDef target type from common analysis",
+    ))
+
+    binder_ids = visible_binder_ids(analysis, occurrence)
+    outer_to_inner = TyLike[]
+    for binder in Iterators.reverse(binder_ids)
+        haskey(analysis.binder_schemes, binder) || return Err(ArgumentError(
+            "common analysis lacks a scheme for visible binder $binder",
+        ))
+        push!(outer_to_inner, analysis.binder_schemes[binder])
+    end
+    functiondef_depth = count(
+        binder -> analysis.index.bindings[binder].kind === :function_def,
+        binder_ids,
+    )
     return (
         scope=_functiondef_scope(
             outer_to_inner,
@@ -355,7 +320,19 @@ function _visible_functiondef_context(tree, path, env, ctx; reserved_names=())
             ctx,
             reserved_names,
         ),
-        target_ty=target_ty,
+        target_ty,
+    )
+end
+
+function _visible_functiondef_context(tree, path, env, ctx; reserved_names=())
+    analysis = Mutations._typed_mutation_analysis(env, ctx)
+    analysis isa Err && return analysis
+    return _visible_functiondef_context_from_analysis(
+        tree,
+        path,
+        analysis,
+        ctx;
+        reserved_names,
     )
 end
 
@@ -458,7 +435,7 @@ end
 function _remaining_functiondef_provider(provider, enclosing_depth::Int)
     remaining = max(provider.max_nesting - enclosing_depth, 0)
     remaining == provider.max_nesting && return provider
-    return Procedural.FunctionDefProvider(
+    return CG.FunctionDefProvider(
         weight_bucket=provider.weight_bucket,
         base_capability_mask=provider.base_capability_mask,
         base_witness=provider.base_witness,
@@ -499,7 +476,7 @@ function generate_functiondef_replacement(
     )
     if mode === :recursive_body
         provider = _remaining_functiondef_provider(functiondef_provider, scope.functiondef_depth)
-        return Procedural.generate_recursive_functiondef_scoped(
+        return CG.generate_functiondef_root_scoped(
             target_ty;
             functiondef_provider=provider,
             kwargs...,
@@ -508,13 +485,17 @@ function generate_functiondef_replacement(
     finite_kwargs = merge(kwargs, (;
         capability_mask=(:function_def, :fixed_point, :opaque),
     ))
-    result = Procedural.generate_procedural_scoped(
+    base_config = haskey(finite_kwargs, :config) ?
+        finite_kwargs.config : CG._generation_config_from_kwargs(finite_kwargs)
+    finite_config = CG.with_functiondef_provider(base_config, nothing)
+    clean_finite_kwargs = Base.structdiff(finite_kwargs, (; config=nothing))
+    result = CG.generate_canonical_scoped(
         target_ty;
-        functiondef_provider=nothing,
-        finite_kwargs...,
+        clean_finite_kwargs...,
+        config=finite_config,
     )
     if result isa Err && result.value isa CG.UnsupportedCanonicalGenerationTarget
-        return Procedural.generate_finite_procedural_scoped(target_ty; kwargs...)
+        return CG.generate_finite_canonical_scoped(target_ty; kwargs...)
     end
     return result
 end
@@ -554,11 +535,7 @@ end
 
 function _procedural_child_depth(node::AstNode, child_index::Int)
     node isa AbsNode && return child_index == 1 ? 1 : 0
-    node isa Procedural.FunctionDefNode && return child_index == 1 ? 1 : 0
-    if node isa Procedural.ScopeNode
-        return child_index <= length(node.bindings) ? child_index - 1 : length(node.bindings)
-    end
-    node isa LetNode && return child_index == 2 ? 1 : 0
+    node isa FunctionDefNode && return child_index == 1 ? 1 : 0
     return 0
 end
 
@@ -634,7 +611,7 @@ function _merge_result_consts!(replacement, result, placeholder_slots, ctx)
 end
 
 function _contains_functiondef(node::AstNode)
-    node isa Procedural.FunctionDefNode && return true
+    node isa FunctionDefNode && return true
     return any(_contains_functiondef, children(node))
 end
 
@@ -647,8 +624,8 @@ function _reserved_generation_names(generation_kwargs)
     return names
 end
 
-function _root_functiondef_has_self_call(node::Procedural.FunctionDefNode)
-    observations = Procedural.functiondef_recursion_observations(node)
+function _root_functiondef_has_self_call(node::FunctionDefNode)
+    observations = functiondef_recursion_observations(node)
     return !isempty(observations) && first(observations).self_calls > 0
 end
 
@@ -659,7 +636,7 @@ function Mutations.apply(
     env::Mutations.MutationEnv,
     ctx::NamedTuple,
 )
-    site.node isa Procedural.FunctionDefNode || return Err(Mutations.NoEligibleSiteErr())
+    site.node isa FunctionDefNode || return Err(Mutations.NoEligibleSiteErr())
     site_context = _visible_functiondef_context(
         tree,
         site.path,
@@ -711,13 +688,13 @@ function Mutations.apply(
         Mutations._replace_site!(tree, site, replacement)
         return tree
     elseif mode === :recursive_body
-        replacement.root isa Procedural.FunctionDefNode || return Err(ArgumentError(
+        replacement.root isa FunctionDefNode || return Err(ArgumentError(
             "recursive_body replacement must have a FunctionDef root",
         ))
         _root_functiondef_has_self_call(replacement.root) || return Err(ArgumentError(
             "recursive_body replacement must call its root self binder",
         ))
-        body = (replacement.root::Procedural.FunctionDefNode).body
+        body = (replacement.root::FunctionDefNode).body
         body == site.node.body && return Err(Mutations.NoEligibleSiteErr())
         site.node.body = deepcopy(body)
         return tree
@@ -727,34 +704,3 @@ function Mutations.apply(
     site.node.body = replacement.root
     return tree
 end
-
-"""
-    mutate_procedural(tree, target_ty; fixed_point=Procedural.fixed_point_witness,
-                      type_inference=nothing, kwargs...)
-
-Run [`Mutations.mutate_tree`](@ref) with lowering-aware procedural inference.
-`fixed_point` is shared by every validation pass. Supply `type_inference` to
-replace the complete checker while retaining the rest of the mutation API.
-"""
-function mutate_procedural(
-    tree::AstTree,
-    target_ty::Ty;
-    fixed_point=Procedural.fixed_point_witness,
-    type_inference=nothing,
-    kwargs...,
-)
-    checker = type_inference === nothing ?
-        ((term, context, factory, meta) -> Procedural.infer_procedural(
-            term,
-            context;
-            factory,
-            meta,
-            fixed_point,
-        )) :
-        type_inference
-    return Mutations.mutate_tree(tree, target_ty; type_inference=checker, kwargs...)
-end
-
-include("ProceduralCrossover.jl")
-
-end # module ProceduralMutations

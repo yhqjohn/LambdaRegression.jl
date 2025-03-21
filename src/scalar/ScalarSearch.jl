@@ -8,15 +8,17 @@ can be converted from supported AST regions and materialised transactionally
 into fixed program scaffolds.
 
 The module provides reference and prepared batched evaluation, a
-DynamicExpressions bridge, bounded generational search, and an optional
-regularized-evolution strategy with age replacement, rank tournaments,
-annealing, adaptive complexity frequencies, and a best-per-complexity archive.
-Both strategies use a conventional scalar mutation palette and independently
-bounded constant polishing. Initial candidates are not deeply polished; after
-structural search, remaining refinement budget may polish evolved candidates
-on the training loss–complexity frontier. The module also provides direct
-shape-preserving `MapPlan` and ordered `FoldPlan` adapters. A minimal evaluation
-path is:
+DynamicExpressions bridge, bounded generational search, and node-native
+regularized evolution with age replacement, rank tournaments, annealing,
+adaptive complexity frequencies, and a best-per-complexity archive. The
+`search_multi_scalar` coordinator advances persistent regularized islands with
+bounded inter-island migration.
+The public strategies share scalar configuration and independently bounded
+constant polishing while retaining their own search loops. Initial candidates
+are not deeply polished; after structural search, remaining refinement budget
+may polish evolved candidates on the training loss–complexity frontier. The
+module also provides direct shape-preserving `MapPlan` and ordered `FoldPlan`
+adapters. A minimal evaluation path is:
 
 ```julia
 expr = scalar_binary(:*, scalar_input(1),
@@ -33,17 +35,21 @@ returned as `Err`; unsupported AST regions remain on the general program path.
 module ScalarSearch
 
 using TestItems
-using Random: AbstractRNG, default_rng, rand, randn
+using Random: AbstractRNG, MersenneTwister, default_rng, rand, randn, shuffle!
 using Optim
 using ..Utils: Err
-using ..ASTs.NodeASTs: AstNode, AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, LetNode
+using ..ASTs.NodeASTs: AstNode, AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode
 using ..TypeSystem: FloatTy, TyLike
+using ..SearchPolicies: _RegularizedFrequency, _regularized_move_window!,
+    _regularized_normalize!, _regularized_frequency,
+    _regularized_acceptance_probability
 
 export ScalarExpr, scalar_input, scalar_constant, scalar_unary, scalar_binary
 export evaluate_scalar_reference, scalar_from_ast, scalar_to_ast
 export PreparedScalarProgram, ScalarWorkspace, prepare_scalar, evaluate_scalar, evaluate_scalar!
 export ScalarSearchConfig, ScalarSearchResult, scalar_complexity
 export scalar_structure_similarity, search_scalar
+export search_multi_scalar
 export FixedScalarCall, FixedScalarScaffold, ScalarMaterialization, materialize_scalar_scaffold
 export ScalarScaffoldErr
 export ScalarMapPlan, ScalarMapWorkspace, prepare_scalar_map, execute_scalar_map, execute_scalar_map!
@@ -72,6 +78,21 @@ struct _ScalarBinary <: ScalarExpr
     left::ScalarExpr
     right::ScalarExpr
 end
+
+_same_scalar_expression(::_ScalarInput, ::ScalarExpr) = false
+_same_scalar_expression(::_ScalarConstant, ::ScalarExpr) = false
+_same_scalar_expression(::_ScalarUnary, ::ScalarExpr) = false
+_same_scalar_expression(::_ScalarBinary, ::ScalarExpr) = false
+_same_scalar_expression(left::_ScalarInput, right::_ScalarInput) =
+    left.index == right.index
+_same_scalar_expression(left::_ScalarConstant, right::_ScalarConstant) =
+    left.value == right.value
+_same_scalar_expression(left::_ScalarUnary, right::_ScalarUnary) =
+    left.op === right.op && _same_scalar_expression(left.arg, right.arg)
+_same_scalar_expression(left::_ScalarBinary, right::_ScalarBinary) =
+    left.op === right.op &&
+    _same_scalar_expression(left.left, right.left) &&
+    _same_scalar_expression(left.right, right.right)
 
 const _UNARY_AST = Dict(:sin => :FSIN, :cos => :FCOS, :sqrt => :FSQRT, :square => :SQR)
 const _BINARY_AST = Dict(:+ => :FADD, :- => :FSUB, :* => :FMUL, :/ => :FDIV)
@@ -444,12 +465,12 @@ evaluate_scalar(expr::ScalarExpr, X::AbstractMatrix{<:Real}) =
     evaluate_scalar(prepare_scalar(expr), X)
 
 include("search.jl")
-include("regularized_search.jl")
 include("dynamic_expressions.jl")
 include("node_regularized.jl")
 include("node_constant_refinement.jl")
 include("node_regularized_search.jl")
 include("node_regularized_state.jl")
+include("multi_island.jl")
 include("scaffolds.jl")
 include("plans.jl")
 
@@ -458,6 +479,14 @@ include("plans.jl")
     using Random
     using LambdaRegression.ScalarSearch
     using LambdaRegression.ASTs.NodeASTs: AppNode, ConstNode
+end
+
+@testitem "Scalar expression equality preserves scalar value semantics" setup=[ScalarSearchBaseImports] begin
+    left = scalar_binary(:+, scalar_input(1), scalar_constant(0.0))
+    same = scalar_binary(:+, scalar_input(1), scalar_constant(-0.0))
+    different = scalar_binary(:+, scalar_input(2), scalar_constant(0.0))
+    @test ScalarSearch._same_scalar_expression(left, same)
+    @test !ScalarSearch._same_scalar_expression(left, different)
 end
 
 @testitem "Scalar reference evaluator agrees with a worked batch and round trips AST" setup=[ScalarSearchBaseImports] begin
@@ -491,13 +520,13 @@ end
     ast = AppNode(ConstNode(:FCOS), ConstNode(:x))
 
     @test evaluate_scalar(expr, X) ≈ cos.(X[1, :])
-    @test LambdaRegression.TypeSystem.get_type(LambdaRegression.TypeSystem.FCOS) ==
+    @test LambdaRegression.TypeSystem.get_type(LambdaRegression.LambdaRegression.Primitives.FCOS) ==
         LambdaRegression.TypeSystem.TyFun(
             LambdaRegression.TypeSystem.FloatTy,
             LambdaRegression.TypeSystem.FloatTy,
         )
     @test LambdaRegression.CanonicalGeneration.test_catalog_consts()[:FCOS] ===
-        LambdaRegression.TypeSystem.FCOS
+        LambdaRegression.LambdaRegression.Primitives.FCOS
     @test scalar_from_ast(ast, [ConstNode(:x)]) isa ScalarExpr
     @test scalar_to_ast(expr, [ConstNode(:x)]) == ast
 end
@@ -1049,19 +1078,19 @@ end
     second_materialized = materialize_scalar_scaffold(scaffold, candidate)
     @test second_materialized.local_consts !== materialized.local_consts
     @test second_materialized.tree !== materialized.tree
-    prepared = LambdaRegression.Procedural.prepare_procedural(materialized.tree)
+    prepared = LambdaRegression.Execution.prepare_native_evaluator(materialized.tree)
     context = merge(
-        Dict{Symbol,Any}(:FADD => LambdaRegression.TypeSystem.FADD,
-            :SQR => LambdaRegression.TypeSystem.SQR),
+        Dict{Symbol,Any}(:FADD => LambdaRegression.LambdaRegression.Primitives.FADD,
+            :SQR => LambdaRegression.LambdaRegression.Primitives.SQR),
         materialized.local_consts,
     )
-    @test LambdaRegression.Procedural.run_procedural(
+    @test LambdaRegression.Execution.run_native_evaluator(
         prepared, context; args=(1.0, 2.0, 3.0), max_steps=256) ≈ 15.5
     inferred = LambdaRegression.TypeSystem.infer(
         materialized.tree,
         merge(LambdaRegression.TypeSystem.get_type_ctx(Dict{Symbol,Any}(
-            :FADD => LambdaRegression.TypeSystem.FADD,
-            :SQR => LambdaRegression.TypeSystem.SQR,
+            :FADD => LambdaRegression.LambdaRegression.Primitives.FADD,
+            :SQR => LambdaRegression.LambdaRegression.Primitives.SQR,
         )), materialized.local_consts_ty),
     )
     expected = LambdaRegression.TypeSystem.TyFun(
@@ -1092,12 +1121,12 @@ end
 
     @test materialized isa ScalarMaterialization
     @test length(materialized.local_consts) == 1
-    prepared = LambdaRegression.Procedural.prepare_procedural(materialized.tree)
+    prepared = LambdaRegression.Execution.prepare_native_evaluator(materialized.tree)
     context = merge(
-        Dict{Symbol,Any}(:FADD => LambdaRegression.TypeSystem.FADD),
+        Dict{Symbol,Any}(:FADD => LambdaRegression.LambdaRegression.Primitives.FADD),
         materialized.local_consts,
     )
-    @test LambdaRegression.Procedural.run_procedural(
+    @test LambdaRegression.Execution.run_native_evaluator(
         prepared, context; args=(1.0,), max_steps=256) ≈ 2.5
 
     cyclic = FixedScalarScaffold(
@@ -1110,6 +1139,57 @@ end
     issue = materialize_scalar_scaffold(cyclic, candidate)
     @test issue isa LambdaRegression.Utils.Err
     @test issue.value == ScalarScaffoldErr(:cyclic_dependency, :PHI_A)
+end
+
+@testitem "Fixed scalar scaffold preserves a let-like application template" setup=[ScalarSearchBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, IndexNode
+
+    scaffold = FixedScalarScaffold(
+        AstTree(AppNode(
+            AbsNode(:x, ConstNode(:PHI)),
+            ConstNode(:two),
+        )),
+        [FixedScalarCall(:PHI, [IndexNode(0)])],
+    )
+    materialized = materialize_scalar_scaffold(scaffold, scalar_input(1))
+
+    @test materialized isa ScalarMaterialization
+    @test materialized.tree.root isa AppNode
+    @test materialized.tree.root.func isa AbsNode
+    @test materialized.tree.root.func.name == :x
+    @test materialized.tree.root.func.body == IndexNode(0)
+    @test materialized.tree.root.arg == ConstNode(:two)
+    @test LambdaRegression.Execution.evaluate_native(
+        materialized.tree, Dict{Symbol,Any}(:two => 2.0)) == 2.0
+end
+
+@testitem "Fixed scalar scaffold preserves polymorphic let-like RHS" setup=[ScalarSearchBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, IndexNode
+    using LambdaRegression.TypeSystem:
+        BoolTy, IntTy, TyFun, TyLike, TyProd, infer
+
+    template = AstTree(AppNode(
+        AbsNode(:id, AppNode(
+            AppNode(ConstNode(:PAIR), ConstNode(:PHI)),
+            AppNode(IndexNode(0), ConstNode(:yes)),
+        )),
+        AbsNode(:y, IndexNode(0)),
+    ))
+    scaffold = FixedScalarScaffold(template, [FixedScalarCall(
+        :PHI, [AppNode(IndexNode(0), ConstNode(:one))])])
+    materialized = materialize_scalar_scaffold(scaffold, scalar_input(1))
+    context = Dict{Symbol,TyLike}(
+        :PAIR => TyFun(IntTy, TyFun(BoolTy, TyProd(IntTy, BoolTy))),
+        :one => IntTy,
+        :yes => BoolTy,
+    )
+
+    @test materialized isa ScalarMaterialization
+    @test materialized.tree.root isa AppNode
+    @test materialized.tree.root.func isa AbsNode
+    @test infer(materialized.tree, context) == TyProd(IntTy, BoolTy)
 end
 
 @testitem "Direct scalar map preserves dense and nested shapes" setup=[ScalarSearchBaseImports] begin

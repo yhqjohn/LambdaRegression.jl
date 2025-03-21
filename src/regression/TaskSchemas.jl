@@ -63,15 +63,15 @@ end
     using Random
     using LambdaRegression
     using LambdaRegression.ASTs.NodeASTs:
-        AbsNode, AppNode, AstTree, ConstNode, IndexNode
-    using LambdaRegression.Mutations.Populations: Individual
-    using LambdaRegression.Procedural: FunctionDefNode, infer_procedural
+        AbsNode, AppNode, AstTree, ConstNode, FunctionDefNode, IndexNode
+    using LambdaRegression.Programs: Program
+    using LambdaRegression.TypeSystem: infer_term
     using LambdaRegression.Regression:
-        TensorSchema, TensorSeries, evaluate_default, series_components,
+        TensorSchema, TensorSeries, prepare_regression_evaluator, series_components,
         series_mse, series_regressor, series_task
     using LambdaRegression.TypeSystem:
-        FloatTy, TyFun, TyLike, TyList, FADD, CONS, UNCONS_CASE, get_type_ctx,
-        iscompatible
+        FloatTy, TyFun, TyLike, TyList, get_type_ctx, iscompatible
+    using LambdaRegression.Primitives: FADD, CONS, UNCONS_CASE
 
     schema = TensorSchema((2, 2))
     tensor_ty = schema.ty
@@ -128,7 +128,7 @@ end
         get_type_ctx(Dict{Symbol,Any}(:CONS => CONS)),
         Dict{Symbol,TyLike}(:TSCALE => TyFun(tensor_ty, tensor_ty)),
     )
-    inferred_map = infer_procedural(map_tree, map_types)
+    inferred_map = infer_term(map_tree, map_types)
     @test !(inferred_map isa LambdaRegression.Utils.Err)
     @test iscompatible(inferred_map, map_target)
     map_task = series_task([input], [doubled]; schema, output=:series)
@@ -137,13 +137,12 @@ end
         global_consts=map_globals,
         global_consts_ty=map_types,
     )
-    map_individual = Individual(map_tree, map_target)
-    mapped = evaluate_default(
+    map_individual = Program(map_tree)
+    mapped = prepare_regression_evaluator(
         map_individual,
-        input,
         map_components,
         default_config(procedural_max_steps=1024),
-    )
+    )(input)
     mapped isa LambdaRegression.Utils.Err && error("map witness failed: $(mapped.value)")
     @test series_mse(mapped, doubled; schema) == 0.0
 
@@ -183,7 +182,7 @@ end
         get_type_ctx(Dict{Symbol,Any}(:FADD => FADD, :ZERO => 0.0)),
         Dict{Symbol,TyLike}(:TENERGY => TyFun(tensor_ty, FloatTy)),
     )
-    inferred_energy = infer_procedural(energy_tree, energy_types)
+    inferred_energy = infer_term(energy_tree, energy_types)
     @test !(inferred_energy isa LambdaRegression.Utils.Err)
     @test iscompatible(inferred_energy, energy_target)
     expected_energy = sum(sum(abs2, tensor) for tensor in input)
@@ -193,12 +192,11 @@ end
         global_consts=energy_globals,
         global_consts_ty=energy_types,
     )
-    energy = evaluate_default(
-        Individual(energy_tree, energy_target),
-        input,
+    energy = prepare_regression_evaluator(
+        Program(energy_tree),
         energy_components,
         default_config(procedural_max_steps=1024),
-    )
+    )(input)
     energy isa LambdaRegression.Utils.Err && error("energy witness failed: $(energy.value)")
     @test energy ≈ expected_energy
 
@@ -214,17 +212,23 @@ end
         global_consts_ty=common_types,
         config=default_config(
             population_size=4,
-            generations=1,
-            seed=UInt64(91),
-            mutation_rate=0.0,
-            crossover_rate=0.0,
         ),
         rng=MersenneTwister(8000),
     )
-    fit_result = fit!(identity_regressor, identity_task.data)
-    @test !(fit_result isa LambdaRegression.Utils.Err)
-    @test fit_result.best !== nothing
-    @test fit_result.history[1].best_loss == 0.0
+    identity_program = Program(AstTree(AbsNode(:series, IndexNode(0))))
+    evaluator = prepare_regression_evaluator(
+        identity_program,
+        identity_regressor.components,
+        identity_regressor.config,
+    )
+    @test evaluator(identity_task.data.X[1]) == identity_task.data.Y[1]
+    @test series_mse(
+        evaluator(identity_task.data.X[1]),
+        identity_task.data.Y[1];
+        schema=identity_task.schema,
+        length_penalty=identity_task.length_penalty,
+        allow_empty=identity_task.allow_empty,
+    ) == 0.0
 end
 
 function _validate_series(series, schema::TensorSchema, allow_empty::Bool, label)

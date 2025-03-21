@@ -1,10 +1,11 @@
 """
     GraftSite
 
-Attempt-local recipient view passed to Graft routing callbacks. `path` is the
-1-based root path, `node` is the current core AST node, `ty` is its
-occurrence-specific inferred type, and `depth` is its lexical binder depth.
-Treat `path` as read-only and do not retain the view after the mutation call.
+Read-only recipient view from the source analysis snapshot passed to Graft
+routing callbacks. `path` is the 1-based root path, `node` is that snapshot's
+AST node, `ty` is its occurrence-specific inferred type, and `depth` is its
+lexical binder depth. AST node identity with `env.tree` or an attempt copy is
+not guaranteed. Callbacks must not retain the view or mutate its path or node.
 """
 struct GraftSite
     path::Vector{Int}
@@ -16,7 +17,8 @@ end
 """
     GraftBinding
 
-Attempt-local existing HM let binding that may be referenced by a Graft.
+Read-only existing HM let binding from the source analysis snapshot that may
+be referenced by a Graft.
 `path` identifies the complete let-like application, `rhs_path` identifies its
 unchanged RHS, and `scheme` is the maximally generalized RHS type used by
 Algorithm W at that binding.
@@ -84,8 +86,12 @@ preset. It requires only the ordinary `mutate_tree` context fields. Expected
 failure includes no visible compatible binding, a CSE-equal RHS/recipient pair,
 an existing dependency, an HM-role change, or final inference rejection;
 unsupported non-core AST nodes are rejected finitely by the scoped resolver.
-Injected callbacks are trusted to terminate and treat their attempt-local views
-as read-only.
+For the common syntax, recipient types and let-like schemes come from the call's
+root-constrained `TypedAnalysis`; the scoped tree is retained only for binding
+identity and role-safe rewriting. Routing callbacks receive read-only views of
+that source snapshot: AST node identity is not guaranteed to match `env.tree`
+or any attempt copy, and callbacks must not retain or modify those views.
+Injected callbacks are trusted to terminate.
 """
 struct GraftMutation{R,D} <: AbstractMutation
     recipient_weight::R
@@ -134,26 +140,24 @@ function _scoped_alpha_key(term::_ScopedTerm)
     return walk(term)
 end
 
-function _collect_graft_analysis!(
+function _collect_graft_indexed_analysis!(
     recipients::Vector{_GraftRecipient},
     by_path::Dict{Tuple,_GraftRecipient},
     bindings::Vector{_GraftBindingRecord},
-    ast::AstNode,
+    analysis::TypedAnalysis,
+    occurrence::Int,
     scoped::_ScopedTerm,
-    metadata::Dict{Tuple,Tuple{TyLike,TyLike}},
-    tree::AstTree,
-    target_ty::Ty,
     path::Vector{Int},
     lexical_depth::Int,
-    inference_level::Int,
 )
+    index = analysis.index
+    ast = index.nodes[occurrence]
     key = Tuple(path)
-    if haskey(metadata, key)
-        raw_ty = metadata[key][1]
+    if haskey(analysis.metadata, occurrence)
+        raw_ty = analysis.metadata[occurrence][1]
         if raw_ty isa Ty
-            ty = _target_refined_site_ty(tree, path, target_ty, raw_ty)
             recipient = _GraftRecipient(
-                GraftSite(copy(path), ast, ty, lexical_depth),
+                GraftSite(copy(path), ast, TypeSystem.prune(raw_ty), lexical_depth),
                 scoped,
             )
             push!(recipients, recipient)
@@ -161,74 +165,73 @@ function _collect_graft_analysis!(
         end
     end
 
-    if ast isa AbsNode && scoped isa _ScopedAbs
+    child_ids = index.children[occurrence]
+    if ast isa AbsNode
+        scoped isa _ScopedAbs || throw(ArgumentError(
+            "typed index and scoped tree disagree at AbsNode occurrence $occurrence",
+        ))
+        length(child_ids) == 1 || throw(ArgumentError(
+            "typed index has invalid AbsNode children at occurrence $occurrence",
+        ))
         push!(path, 1)
-        _collect_graft_analysis!(
-            recipients,
-            by_path,
-            bindings,
-            ast.body,
-            scoped.body,
-            metadata,
-            tree,
-            target_ty,
-            path,
-            lexical_depth + 1,
-            inference_level,
+        _collect_graft_indexed_analysis!(
+            recipients, by_path, bindings, analysis, child_ids[1], scoped.body,
+            path, lexical_depth + 1,
         )
         pop!(path)
-    elseif ast isa AppNode && scoped isa _ScopedApp
-        is_let = ast.func isa AbsNode && scoped.func isa _ScopedAbs
-        if is_let
+    elseif ast isa AppNode
+        scoped isa _ScopedApp || throw(ArgumentError(
+            "typed index and scoped tree disagree at AppNode occurrence $occurrence",
+        ))
+        length(child_ids) == 2 || throw(ArgumentError(
+            "typed index has invalid AppNode children at occurrence $occurrence",
+        ))
+        func_id, rhs_id = child_ids
+        is_let = index.nodes[func_id] isa AbsNode && scoped.func isa _ScopedAbs
+        if is_let && haskey(analysis.metadata, rhs_id) &&
+                analysis.metadata[rhs_id][1] isa Ty
+            binder_id = index.owner_binder[func_id]
+            binder_id != 0 || throw(ArgumentError(
+                "let-like AbsNode at occurrence $func_id has no owner binder",
+            ))
+            haskey(analysis.binder_schemes, binder_id) || throw(ArgumentError(
+                "typed analysis lacks the recorded scheme for let binder $binder_id",
+            ))
+            scheme = analysis.binder_schemes[binder_id]
+            scheme isa TypeSystem.TyScheme || throw(ArgumentError(
+                "let-like binder $binder_id was not recorded as a TyScheme",
+            ))
             rhs_path = [path; 2]
-            rhs_meta = get(metadata, Tuple(rhs_path), nothing)
-            if rhs_meta !== nothing && rhs_meta[1] isa Ty
-                scheme = TypeSystem.generalize(rhs_meta[1], inference_level)
-                push!(bindings, _GraftBindingRecord(
-                    GraftBinding(
-                        copy(path),
-                        rhs_path,
-                        scoped.func.name,
-                        scheme,
-                    ),
-                    scoped.func.binder_id,
-                    [path; 1; 1],
-                    _scoped_alpha_key(scoped.arg),
-                ))
-            end
+            push!(bindings, _GraftBindingRecord(
+                GraftBinding(
+                    copy(path),
+                    rhs_path,
+                    scoped.func.name,
+                    scheme,
+                ),
+                scoped.func.binder_id,
+                [path; 1; 1],
+                _scoped_alpha_key(scoped.arg),
+            ))
         end
 
         push!(path, 1)
-        _collect_graft_analysis!(
-            recipients,
-            by_path,
-            bindings,
-            ast.func,
-            scoped.func,
-            metadata,
-            tree,
-            target_ty,
-            path,
-            lexical_depth,
-            inference_level,
+        _collect_graft_indexed_analysis!(
+            recipients, by_path, bindings, analysis, func_id, scoped.func,
+            path, lexical_depth,
         )
         pop!(path)
 
         push!(path, 2)
-        _collect_graft_analysis!(
-            recipients,
-            by_path,
-            bindings,
-            ast.arg,
-            scoped.arg,
-            metadata,
-            tree,
-            target_ty,
-            path,
-            lexical_depth,
-            is_let ? inference_level + 1 : inference_level,
+        _collect_graft_indexed_analysis!(
+            recipients, by_path, bindings, analysis, rhs_id, scoped.arg,
+            path, lexical_depth,
         )
         pop!(path)
+    elseif !isempty(child_ids)
+        throw(ArgumentError(
+            "scoped Graft scan encountered non-core node with children at occurrence $occurrence",
+        ))
     end
     return nothing
 end
@@ -238,22 +241,19 @@ function _graft_analysis(env::MutationEnv, ctx::NamedTuple)
         env.tree === nothing && return Err(NoEligibleSiteErr())
         scoped = _resolved_scoped(env)
         scoped isa Err && return scoped
-        metadata = _typed_occurrence_metadata(env, ctx)
-        metadata isa Err && return metadata
         recipients = _GraftRecipient[]
         by_path = Dict{Tuple,_GraftRecipient}()
         bindings = _GraftBindingRecord[]
-        _collect_graft_analysis!(
+        typed = _typed_mutation_analysis(env, ctx)
+        typed isa Err && return typed
+        _collect_graft_indexed_analysis!(
             recipients,
             by_path,
             bindings,
-            env.tree.root,
+            typed,
+            1,
             scoped.root,
-            metadata,
-            env.tree,
-            env.target_ty,
             Int[],
-            0,
             0,
         )
         return _GraftAnalysis(scoped, recipients, by_path, bindings)
@@ -452,13 +452,7 @@ function apply(
     materialized isa Err && return materialized
     materialized == tree && return Err(NoEligibleSiteErr())
     factory = haskey(ctx, :tyfactory) ? ctx.tyfactory : newtyvar
-    inferred = _run_mutation_inference(
-        ctx,
-        materialized,
-        env.type_ctx,
-        factory,
-        nothing,
-    )
+    inferred = _infer_mutation_type(materialized, env.type_ctx, factory)
     inferred isa Err && return inferred
     iscompatible(inferred, env.target_ty) ||
         return Err(TypeInvariantErr(env.target_ty, inferred))
@@ -669,6 +663,52 @@ end
         ),
     )
     @test infer(result, type_ctx) == IntTy
+end
+
+@testitem "Graft consumes recorded indexed schemes including empty quantification" begin
+    using Test
+    using Random
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
+    using LambdaRegression.Mutations:
+        AdaptivePolicy, BloatPolicy, MutationEnv, _graft_analysis
+    using LambdaRegression.ProgramAnalysis: TypedAnalysis, analyze_program
+    using LambdaRegression.TypeSystem: IntTy, TyLike, TyScheme
+
+    type_ctx = Dict{Symbol,TyLike}(:one => IntTy)
+    tree = AstTree(AppNode(
+        AbsNode(:fixed, AppNode(
+            AbsNode(:id, AppNode(IndexNode(0), ConstNode(:one))),
+            AbsNode(:value, IndexNode(0)),
+        )),
+        ConstNode(:one),
+    ))
+    analysis = analyze_program(tree, type_ctx; target_ty=IntTy)
+    @test analysis isa TypedAnalysis
+    analysis isa TypedAnalysis || return
+
+    env = MutationEnv(
+        MersenneTwister(8000), IntTy, type_ctx, tree, nothing, false,
+        IdDict{Any,Any}(), AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(), BloatPolicy(),
+    )
+    indexed = _graft_analysis(env, (; typed_analysis=analysis))
+    @test indexed isa LambdaRegression.Mutations._GraftAnalysis
+    indexed isa LambdaRegression.Mutations._GraftAnalysis || return
+    @test length(indexed.bindings) == 2
+    @test env.analysis === analysis
+
+    outer_abs = analysis.index.children[1][1]
+    inner_app = analysis.index.children[outer_abs][1]
+    inner_abs = analysis.index.children[inner_app][1]
+    outer_scheme = analysis.binder_schemes[analysis.index.owner_binder[outer_abs]]
+    inner_scheme = analysis.binder_schemes[analysis.index.owner_binder[inner_abs]]
+    @test outer_scheme isa TyScheme && isempty(outer_scheme.vars)
+    @test inner_scheme isa TyScheme && length(inner_scheme.vars) == 1
+
+    outer_binding = only(filter(binding -> isempty(binding.view.path), indexed.bindings))
+    inner_binding = only(filter(binding -> binding.view.path == [1, 1], indexed.bindings))
+    @test outer_binding.view.scheme === outer_scheme
+    @test inner_binding.view.scheme === inner_scheme
 end
 
 @testitem "GraftMutation rejects RHS, existing-use, CSE, and HM-role pairs" begin
@@ -1048,14 +1088,15 @@ end
     )
 end
 
-@testitem "GraftMutation rejects final validation transactionally" begin
+@testitem "GraftMutation bloat rejection does not commit the successful attempt" begin
     using Test
     using Random
     using LambdaRegression.ASTs.NodeASTs:
         AbsNode, AppNode, AstTree, ConstNode
     using LambdaRegression.Mutations:
-        GraftMutation, IndexedProvider, WeightedPairChooser, mutate_tree
-    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer
+        BloatPolicy, GraftMutation, IndexedProvider, MutationAttemptRecorder,
+        WeightedPairChooser, mutation_recorder_summary, mutate_tree
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
 
     original = AstTree(
@@ -1079,14 +1120,13 @@ end
         :two => IntTy,
         :rhs => IntTy,
     )
-    checker = function (tree, context, factory, meta)
-        meta === nothing && return Err(ArgumentError("reject final Graft"))
-        return infer(tree, context, factory, meta)
-    end
     mutation = GraftMutation(
         recipient_weight=(site, _, _) ->
             site.path == [1, 1, 1, 2] ? 1.0 : 0.0,
+        donor_weight=(binding, _, _, _) ->
+            isempty(binding.path) ? 1.0 : 0.0,
     )
+    recorder = MutationAttemptRecorder()
 
     result = mutate_tree(
         original,
@@ -1101,11 +1141,17 @@ end
             cache_eligibility=true,
         ),
         provider=IndexedProvider(),
-        type_inference=checker,
         max_try=1,
+        bloat_policy=BloatPolicy(
+            enabled=true,
+            max_nodes=length(original) - 1,
+            max_nodes_delta=length(original),
+        ),
+        recorder,
     )
 
     @test result isa Err
+    @test mutation_recorder_summary(recorder).totals.bloat_exceeded == 1
     @test original == snapshot
     @test local_consts == Dict{Symbol,Any}(:kept => 3)
     @test local_consts_ty == Dict{Symbol,TyLike}(:kept => IntTy)

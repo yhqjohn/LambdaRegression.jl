@@ -1,7 +1,7 @@
 module Utils
 
 using MLStyle, TestItems
-export @check, Err, @✓, MultipleMapView
+export @check, Err, @✓
 
 ########################################################
 # Rust-style error handling
@@ -73,35 +73,5 @@ end
     @test baz(-1) == Err(-1)
 
 end
-
-struct MultipleMapView
-    maps::Vector
-    MultipleMapView(maps::Vector) = new(maps)
-    MultipleMapView(maps...) = new(maps)
-end
-Base.getindex(view::MultipleMapView, key) = get(view, key) do 
-    throw(KeyError(key))
-end
-
-function Base.get(view::MultipleMapView, key, default)
-    for map in view.maps
-        if haskey(map, key)
-            return map[key]
-        end
-    end
-    return default
-end
-
-function Base.get(f::Base.Callable, view::MultipleMapView, key)
-    for map in view.maps
-        if haskey(map, key)
-            return map[key]
-        end
-    end
-    return f()
-end
-
-Base.haskey(view::MultipleMapView, key) = any(haskey(map, key) for map in view.maps)
-
 
 end # module Utils

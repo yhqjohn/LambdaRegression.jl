@@ -39,7 +39,8 @@ The module provides several categories of AST nodes:
 - [`ConstNode`](@ref): Constants and built-in functions
 
 ### Extended Nodes
-- [`LetNode`](@ref): Let-binding (deprecated in favor of application form)
+- [`FunctionDefNode`](@ref): Recursive function definition with one anonymous
+  self binder
 
 ## Tree Iteration and Traversal
 
@@ -99,9 +100,8 @@ display(app_tree)
 # Create application with constant: f pi
 const_app = AppNode(VarNode(:f), ConstNode(:pi))
 
-# Create let-binding equivalent: let x = M in N
-# Note: Prefer λx.N M form over LetNode
-let_equivalent = AppNode(AbsNode(:x, VarNode(:x)), VarNode(:y))
+# Create a let-like binding: (λx. x) y
+let_like = AppNode(AbsNode(:x, VarNode(:x)), VarNode(:y))
 ```
 
 # Implementation Notes
@@ -124,10 +124,10 @@ using TestItems
 
 # Export statements
 export AstNode, AstTree
-export AppNode, AbsNode, VarNode, ConstNode, IndexNode, LetNode
+export AppNode, AbsNode, VarNode, ConstNode, IndexNode, FunctionDefNode
+export copy_occurrences
 export SymbolGenerator, generate_fresh_name
 export ScopeState, AbstractionDepthState
-export parse_lambda_literal, collect_constants!, parse_lambda, @terms
 
 
 ########################################################
@@ -386,52 +386,60 @@ setchild!(node::IndexNode, index::Int, newchild::AstNode) = _throw_children_boun
 arity(::IndexNode) = 0
 isleaf(::IndexNode) = true
 
-########################################################
-# Extension for Hindley-Milner System
-########################################################
-
 """
-    LetNode <: AstNode
+    FunctionDefNode <: AstNode
 
-Let-binding node for the Hindley-Milner type system.
-
-# Fields
-- `name::Symbol`: The bound variable name
-- `value::AstNode`: The value being bound
-- `body::AstNode`: The expression where the binding is in scope
-
-# Mathematical Notation
-Displayed as: `let x = M in N`.
-
-# Examples
-```julia
-# Create let x = 5 in x + 1
-LetNode(:x, ConstNode(:5), AppNode(AppNode(VarNode(:add), VarNode(:x)), ConstNode(:1)))
-```
-
-# Deprecation Note
-**This node type is not recommended for general use.** All λx.N M forms can be
-regarded as equivalent to `let x = M in N`, making explicit let-bindings redundant.
+Recursive function definition with one anonymous monomorphic self binder. The
+self binder occupies De Bruijn index `#0` at the root of `body`; ordinary
+lambda binders introduced below it push the self binder outward in the usual
+locally nameless order.
 """
-mutable struct LetNode <: AstNode
-    name::Symbol
-    value::AstNode
+mutable struct FunctionDefNode <: AstNode
     body::AstNode
 end
 
-children(node::LetNode) = [node.value, node.body]
-function setchild!(node::LetNode, index::Int, newchild::AstNode)
-    if index == 1
-        node.value = newchild
-    elseif index == 2
-        node.body = newchild
-    else
-        _throw_children_boundserror(node, index)
-    end
+children(node::FunctionDefNode) = AstNode[node.body]
+arity(::FunctionDefNode) = 1
+isleaf(::FunctionDefNode) = false
+
+function setchild!(node::FunctionDefNode, index::Int, newchild::AstNode)
+    index == 1 || _throw_children_boundserror(node, index)
+    node.body = newchild
     return node
 end
-arity(::LetNode) = 2
-isleaf(::LetNode) = false
+
+function _copy_occurrence(node::AstNode, active::IdDict{AstNode,Nothing})
+    node isa Union{ConstNode,VarNode,IndexNode} && return node
+    haskey(active, node) && throw(ArgumentError("cyclic host AST occurrence"))
+    active[node] = nothing
+    try
+        if node isa AppNode
+            return AppNode(
+                _copy_occurrence(node.func, active),
+                _copy_occurrence(node.arg, active),
+            )
+        elseif node isa AbsNode
+            return AbsNode(node.name, _copy_occurrence(node.body, active))
+        elseif node isa FunctionDefNode
+            return FunctionDefNode(_copy_occurrence(node.body, active))
+        end
+        throw(ArgumentError("unsupported AST node $(typeof(node))"))
+    finally
+        delete!(active, node)
+    end
+end
+
+"""
+    copy_occurrences(node::AstNode)
+    copy_occurrences(tree::AstTree)
+
+Copy a host AST by syntactic occurrence. Mutable expression nodes are rebuilt,
+so two references to one host subtree become two independent syntax occurrences;
+immutable leaves may be reused. A cycle on the active host path is rejected,
+while ordinary sharing across sibling positions remains valid.
+"""
+copy_occurrences(node::AstNode) = _copy_occurrence(node, IdDict{AstNode,Nothing}())
+copy_occurrences(tree::AstTree) = AstTree(copy_occurrences(tree.root))
 
 ########################################################
 # Display System
@@ -456,13 +464,12 @@ _show_plain(node::AbsNode) = "AbsNode($(repr(node.name)), $(node.body))"
 _show_plain(node::VarNode) = "VarNode($(repr(node.name)))"
 _show_plain(node::ConstNode) = "ConstNode($(repr(node.name)))"
 _show_plain(node::IndexNode) = "IndexNode($(node.index))"
-_show_plain(node::LetNode) = "LetNode($(repr(node.name)), $(node.value), $(node.body))"
+_show_plain(node::FunctionDefNode) = "FunctionDefNode($(repr(node.body)))"
 
 # Pretty show implementations (mathematical notation) using multiple dispatch
 # Precedence levels: 0 = lowest, 3 = highest
 # Lambda abstraction: precedence 1
-# Application: precedence 2  
-# Let: precedence 1
+# Application: precedence 2
 
 _show_pretty(node::AstNode, precedence::Int = 0) = _show_plain(node)  # Fallback
 
@@ -471,9 +478,7 @@ _show_pretty(node::ConstNode, precedence::Int) = string(node.name)
 _show_pretty(node::IndexNode, precedence::Int) = "#$(node.index)"
 
 function _show_pretty(node::AppNode, precedence::Int)
-    # For function part: use precedence 2 when the function is a lambda/let to get parentheses
-    func_precedence = (node.func isa AbsNode || node.func isa LetNode) ? 2 : 2
-    func_str = _show_pretty(node.func, func_precedence)
+    func_str = _show_pretty(node.func, 2)
     # For argument part: use precedence 3 to add parentheses when needed
     arg_str = _show_pretty(node.arg, 3)
     
@@ -487,12 +492,62 @@ function _show_pretty(node::AbsNode, precedence::Int)
     return precedence > 1 ? "(" * result * ")" : result
 end
 
-function _show_pretty(node::LetNode, precedence::Int)
-    value_str = _show_pretty(node.value, 0)
-    body_str = _show_pretty(node.body, 0)
-    result = "let $(node.name) = $value_str in $body_str"
-    return precedence > 1 ? "($result)" : result
+const _FUNCTIONDEF_NAMES = Tuple(Symbol(char) for char in 'f':'z')
+const _FUNCTIONDEF_VALUE_NAMES = (
+    :x, :y, :z,
+    Tuple(Symbol(char) for char in 'a':'w')...,
+)
+
+_functiondef_binder_name(names, depth::Int) = names[mod1(depth + 1, length(names))]
+
+function _show_functiondef_pretty(
+    node::AstNode,
+    precedence::Int,
+    function_depth::Int,
+    value_depth::Int,
+)
+    if node isa FunctionDefNode
+        name = _functiondef_binder_name(_FUNCTIONDEF_NAMES, function_depth)
+        if node.body isa AbsNode
+            argument = _functiondef_binder_name(_FUNCTIONDEF_VALUE_NAMES, value_depth)
+            body = _show_functiondef_pretty(
+                node.body.body,
+                1,
+                function_depth + 1,
+                value_depth + 1,
+            )
+            result = "fn $name($argument). $body"
+        else
+            body = _show_functiondef_pretty(
+                node.body,
+                1,
+                function_depth + 1,
+                value_depth,
+            )
+            result = "fn $name. $body"
+        end
+        return precedence > 1 ? "($result)" : result
+    elseif node isa AppNode
+        func = _show_functiondef_pretty(node.func, 2, function_depth, value_depth)
+        arg = _show_functiondef_pretty(node.arg, 3, function_depth, value_depth)
+        result = "$func $arg"
+        return precedence > 2 ? "($result)" : result
+    elseif node isa AbsNode
+        name = _functiondef_binder_name(_FUNCTIONDEF_VALUE_NAMES, value_depth)
+        body = _show_functiondef_pretty(
+            node.body,
+            1,
+            function_depth,
+            value_depth + 1,
+        )
+        result = "λ$name·$body"
+        return precedence > 1 ? "($result)" : result
+    end
+    return _show_pretty(node, precedence)
 end
+
+_show_pretty(node::FunctionDefNode, precedence::Int=0) =
+    _show_functiondef_pretty(node, precedence, 0, 0)
 
 ########################################################
 # Utility Functions
@@ -510,7 +565,7 @@ function eliminate_bound_variables!(tree::AstTree)
     traverse(tree, ScopeState, PointerState) do tree, node, bag
         if node isa VarNode
             abstractions = getstate(bag, ScopeState).abstractions
-            i = findlast(x->x.name == node.name, abstractions)
+            i = findlast(x -> x isa AbsNode && x.name == node.name, abstractions)
             if !isnothing(i)
                 pointer = getstate(bag, PointerState{AstNode})
                 setchild!(tree, pointer.parent, pointer.child_index, IndexNode(length(abstractions) - i))
@@ -552,27 +607,34 @@ end
 """
     ScopeState <: AbstractTraverseState
 
-A traverse state that provides lazy access to all abstraction nodes (AbsNode) in
-the current scope chain. Depends on (`AncestorsState`)[@ref] for ancestor information.
+A traverse state that provides lazy access to all anonymous binders in the
+current scope chain. It includes `AbsNode` and `FunctionDefNode`, while named
+lookup skips the anonymous FunctionDef self binder. Depends on
+(`AncestorsState`)[@ref] for ancestor information.
 
 # Fields
-- `abstractions::Vector{AbsNode}`: Current abstraction nodes in scope
+- `abstractions::Vector{AstNode}`: Current binder nodes in scope
 """
 mutable struct ScopeState <: AbstractTraverseState
-    abstractions::Vector{AbsNode}
+    abstractions::Vector{AstNode}
 end
 
 requires(::Type{ScopeState}, tree::AbstractTree) = (ScopeState, AncestorsState{NodeIndex(tree)})
-init(::Type{ScopeState}, tree::AbstractTree, root_node) = ScopeState(AbsNode[])
+init(::Type{ScopeState}, tree::AbstractTree, root_node) = ScopeState(AstNode[])
 enter!(::ScopeState, ::AbstractTree, ::AstNode) = nothing
 leave!(::ScopeState, ::AbstractTree, ::AstNode) = nothing
 function getstate(bag::StateBag, ::Type{ScopeState})
     scopestate = bag.lookup[ScopeState]
     ancestors = getstate(bag, AncestorsState{AstNode})
-    scopestate.abstractions = AbsNode[node for node in ancestors.ancestors if node isa AbsNode]
+    scopestate.abstractions = AstNode[
+        node for node in ancestors.ancestors if node isa Union{AbsNode,FunctionDefNode}
+    ]
     return scopestate
 end
-hasname(state::ScopeState, name::Symbol) = any(x -> x.name == name, state.abstractions)
+hasname(state::ScopeState, name::Symbol) = any(
+    x -> x isa AbsNode && x.name == name,
+    state.abstractions,
+)
 
 """
     AbstractionDepthState <: AbstractTraverseState
@@ -666,7 +728,7 @@ Base.hash(node::AbsNode, h::UInt) = hash(node.body, hash(:AbsNode, h))
 Base.hash(node::VarNode, h::UInt) = hash(node.name, hash(:VarNode, h))
 Base.hash(node::ConstNode, h::UInt) = hash(node.name, hash(:ConstNode, h))
 Base.hash(node::IndexNode, h::UInt) = hash(node.index, hash(:IndexNode, h))
-Base.hash(node::LetNode, h::UInt) = hash(node.name, hash(node.value, hash(node.body, hash(:LetNode, h))))
+Base.hash(node::FunctionDefNode, h::UInt) = hash(node.body, hash(:FunctionDefNode, h))
 
 """
     Base.:(==)(a::AstNode, b::AstNode)
@@ -683,21 +745,11 @@ Base.:(==)(a::AbsNode, b::AbsNode) = a.body == b.body
 Base.:(==)(a::VarNode, b::VarNode) = a.name == b.name
 Base.:(==)(a::ConstNode, b::ConstNode) = a.name == b.name
 Base.:(==)(a::IndexNode, b::IndexNode) = a.index == b.index
-Base.:(==)(a::LetNode, b::LetNode) = a.name == b.name && a.value == b.value && a.body == b.body
+Base.:(==)(a::FunctionDefNode, b::FunctionDefNode) = a.body == b.body
 Base.:(==)(a::AstNode, b::AstNode) = false # Different types are never equal
 
 Base.hash(t::AstTree, h::UInt) = hash(t.root, hash(:AstTree, h))
 Base.:(==)(a::AstTree, b::AstTree) = a.root == b.root
-
-########################################################
-# Parse Submodule
-########################################################
-
-# Include the Parse submodule
-include("parse.jl")
-
-# Import parsing functionality 
-using .Parse: parse_lambda_literal, collect_constants!, parse_lambda, @terms
 
 ########################################################
 # Test Items
@@ -711,8 +763,8 @@ using .Parse: parse_lambda_literal, collect_constants!, parse_lambda, @terms
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, AncestorsState, ScopeState, AbstractionDepthState, getstate, AstNode
     using LambdaRegression.Trees: traverse
     using LambdaRegression.ASTs.NodeASTs: _index_to_italic, _display_var, _throw_children_boundserror, VarNode, ConstNode
-    using LambdaRegression.ASTs.NodeASTs: AppNode, AbsNode, LetNode, VarNode, setchild!
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode, LetNode
+    using LambdaRegression.ASTs.NodeASTs: AppNode, AbsNode, VarNode, setchild!
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, ConstNode, IndexNode
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, AbsNode, VarNode, IndexNode, eliminate_bound_variables!
     using LambdaRegression.ASTs.NodeASTs: IndexNode, _show_pretty
     using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, VarNode, setroot!, root
@@ -999,6 +1051,41 @@ end
     @test abs_node.body === var_y
 end
 
+@testitem "FunctionDefNode core ownership preserves anonymous binder slots" begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs:
+        AstNode, AstTree, AbsNode, ConstNode, FunctionDefNode, IndexNode,
+        VarNode, apply_node!, arity, children, eliminate_bound_variables!, isleaf,
+        setchild!, shift_free_variables!
+
+    node = FunctionDefNode(ConstNode(:body))
+    @test children(node) == AstNode[ConstNode(:body)]
+    @test arity(node) == 1
+    @test !isleaf(node)
+    setchild!(node, 1, IndexNode(0))
+    @test node == FunctionDefNode(IndexNode(0))
+    @test hash(node) == hash(FunctionDefNode(IndexNode(0)))
+    @test_throws BoundsError setchild!(node, 2, ConstNode(:bad))
+
+    # A FunctionDef self slot is a real De Bruijn depth, but has no named
+    # binder. Named lookup still finds the lambda parameter below it.
+    named = AstTree(FunctionDefNode(AbsNode(:x, VarNode(:x))))
+    eliminate_bound_variables!(named)
+    @test named.root.body.body == IndexNode(0)
+    unbound_name = AstTree(FunctionDefNode(VarNode(:x)))
+    eliminate_bound_variables!(unbound_name)
+    @test unbound_name.root.body == VarNode(:x)
+
+    # The self slot must count when shifting free indices and applying an
+    # outer lambda across a recursive definition.
+    shifted = AstTree(FunctionDefNode(AbsNode(:x, IndexNode(1))))
+    shift_free_variables!(shifted, 1)
+    @test shifted.root.body.body == IndexNode(1)
+    func = AbsNode(:x, FunctionDefNode(IndexNode(1)))
+    applied = apply_node!(AstTree(func), func, ConstNode(:arg))
+    @test applied.root == FunctionDefNode(ConstNode(:arg))
+end
+
 @testitem "Display methods and show functions" setup=[NodeASTsBaseImports] begin
     # Test Base.show methods (currently untested)
     var_x = VarNode(:x)
@@ -1006,7 +1093,6 @@ end
     index_0 = IndexNode(0)
     abs_node = AbsNode(:f, var_x)
     app_node = AppNode(var_x, const_pi)
-    let_node = LetNode(:y, const_pi, var_x)
     tree = AstTree(abs_node)
     
     # Test plain show for nodes
@@ -1025,9 +1111,6 @@ end
     
     show(io, app_node)
     @test String(take!(io)) == "AppNode(VarNode(:x), ConstNode(:pi))"
-    
-    show(io, let_node)
-    @test String(take!(io)) == "LetNode(:y, ConstNode(:pi), VarNode(:x))"
     
     # Test pretty show for nodes
     show(io, MIME"text/plain"(), var_x)

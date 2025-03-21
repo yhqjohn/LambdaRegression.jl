@@ -404,18 +404,18 @@ end
     using LambdaRegression.ASTs.NodeASTs
     using LambdaRegression.TypeSystem: FloatTy, TyLike
     using LambdaRegression.TypedSearch
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
 
     target = LambdaRegression.TypeSystem.TyFun(FloatTy, FloatTy)
     source = prepare_source(AstTree(AbsNode(:x, IndexNode(0))),
         Dict{Symbol,TyLike}(), target)
-    @test source isa SourceAnalysis
+    @test source isa TypedAnalysis
     hole = source_hole(source)
     language = Language(TypeTable())
     imported = import_hole(hole, language)
     expanded = eta_move_at(imported, length(imported.nodes), language; direction=:expand)
     @test expanded isa TypedTerm
     exported = export_hole(expanded, language, hole)
-    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa SourceAnalysis
-    @test evaluate_procedural(exported, Dict{Symbol,Any}(); args=(2.0,)) == 2.0
+    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa TypedAnalysis
+    @test evaluate_native(exported, Dict{Symbol,Any}(); args=(2.0,)) == 2.0
 end

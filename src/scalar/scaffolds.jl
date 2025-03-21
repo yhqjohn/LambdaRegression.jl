@@ -48,9 +48,6 @@ function _collect_constant_names!(names::Set{Symbol}, node::AstNode)
         _collect_constant_names!(names, node.arg)
     elseif node isa AbsNode
         _collect_constant_names!(names, node.body)
-    elseif node isa LetNode
-        _collect_constant_names!(names, node.value)
-        _collect_constant_names!(names, node.body)
     end
     return names
 end
@@ -71,12 +68,6 @@ function _rebuild_scalar_ast(replace_const, node::AstNode)
         body = _rebuild_scalar_ast(replace_const, node.body)
         body isa Err && return body
         return AbsNode(node.name, body)
-    elseif node isa LetNode
-        value = _rebuild_scalar_ast(replace_const, node.value)
-        value isa Err && return value
-        body = _rebuild_scalar_ast(replace_const, node.body)
-        body isa Err && return body
-        return LetNode(node.name, value, body)
     end
     return Err(ScalarScaffoldErr(:unsupported_template_node, nothing))
 end

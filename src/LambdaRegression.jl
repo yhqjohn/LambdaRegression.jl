@@ -12,13 +12,31 @@ include("asts/ASTs.jl")
 using .ASTs
 export ASTs
 
-include("reduce/Reduce.jl")
-using .Reduces
-export Reduces
-
 include("typesystem/TypeSystem.jl")
 using .TypeSystem
 export TypeSystem
+
+include("search/SearchPolicies.jl")
+
+include("programs/Programs.jl")
+using .Programs
+export Programs
+
+include("analysis/ProgramAnalysis.jl")
+using .ProgramAnalysis
+export ProgramAnalysis
+
+include("transforms/Transforms.jl")
+using .Transforms
+export Transforms
+
+include("primitives/Primitives.jl")
+using .Primitives
+export Primitives
+
+include("execution/Execution.jl")
+using .Execution
+export Execution
 
 include("scalar/ScalarSearch.jl")
 using .ScalarSearch
@@ -32,33 +50,28 @@ include("generate/CanonicalGeneration.jl")
 using .CanonicalGeneration
 export CanonicalGeneration
 
-include("procedural/Procedural.jl")
-using .Procedural
-export Procedural
-
 include("mutate/Mutations.jl")
 using .Mutations
 export Mutations
 using .Mutations: mutate_tree
 export mutate_tree
 
-include("procedural/ProceduralMutations.jl")
-using .ProceduralMutations
-export ProceduralMutations
-
 include("typedsearch/TypedSearch.jl")
 export TypedSearch
-#
 include("regression/Regression.jl")
 using .Regression
 export Regression
-using .Regression: Regressor, SupervisedDataset, FitResult, fit!, default_config, default_components, default_regressor
-using .Regression: PreparedDefaultEvaluator, prepare_default_evaluator, evaluate_default
+using .Regression: Regressor, SupervisedDataset, default_config, default_components, default_regressor
+using .Execution: PreparedDefaultEvaluator, prepare_default_evaluator, evaluate_default
 using .Regression: TensorSchema, TensorSeries, SeriesTask, series_task
 using .Regression: series_mse, series_components, series_regressor
-export Regressor, SupervisedDataset, FitResult, fit!, default_config, default_components, default_regressor
+export Regressor, SupervisedDataset, default_config, default_components, default_regressor
 export PreparedDefaultEvaluator, prepare_default_evaluator, evaluate_default
 export TensorSchema, TensorSeries, SeriesTask, series_task
 export series_mse, series_components, series_regressor
+
+include("workflows/Workflows.jl")
+using .Workflows
+export Workflows
 
 end # module LambdaRegression

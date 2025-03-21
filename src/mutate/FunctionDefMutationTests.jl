@@ -1,63 +1,45 @@
-@testitem "FunctionDef crossover is binder-aware and Scope has no population route" begin
+@testitem "FunctionDef crossover reads the common analysis contract" begin
     using Test
     using Random
     using LambdaRegression
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Mutations.Populations:
-        Individual, TypedSubtreeSwapCrossover, crossover
+        Program, TypedSubtreeSwapCrossover, crossover,
+        prepare_typed_analysis, typed_analysis_site_ids, typed_analysis_path
     using LambdaRegression.Utils: Err
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
     target = TyFun(IntTy, IntTy)
     type_context = Dict{Symbol,TyLike}(:one => IntTy)
-    left = Individual(
-        AstTree(Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0)))),
-        target,
+    left = Program(
+        AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, IndexNode(0)))),
     )
-    right = Individual(
-        AstTree(Procedural.FunctionDefNode(AbsNode(:x, ConstNode(:one)))),
-        target,
+    right = Program(
+        AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, ConstNode(:one)))),
     )
     left_snapshot, right_snapshot = deepcopy(left.tree), deepcopy(right.tree)
 
-    @test_throws MethodError crossover(
-        TypedSubtreeSwapCrossover(min_sites=1),
-        left,
-        right;
-        global_consts_ty=type_context,
-    )
-
-    op = ProceduralMutations.FunctionDefTypedSubtreeSwapCrossover(
-        max_try=100,
-        min_sites=1,
-    )
     bounded_core = TypedSubtreeSwapCrossover(
+        max_try=100,
         max_open_answers_per_pair=2,
         require_same_depth=false,
+        min_sites=1,
     )
-    forwarded = ProceduralMutations._functiondef_directional_operator(
-        bounded_core,
-        op,
-    )
-    @test forwarded.max_open_answers_per_pair == 2
-    @test forwarded.require_same_depth == bounded_core.require_same_depth
-    @test forwarded.max_try == op.max_try
-    @test forwarded.min_sites == op.min_sites
 
     result = crossover(
-        ProceduralMutations.AutoTypedCrossover(core=bounded_core, procedural=op),
+        bounded_core,
         left,
         right;
         rng=MersenneTwister(2000),
         global_consts_ty=type_context,
+        target_a=target,
+        target_b=target,
     )
     @test !(result isa Err)
     @test left.tree == left_snapshot
     @test right.tree == right_snapshot
     for child in result
-        inferred = Procedural.infer_procedural(child.tree, type_context)
+        inferred = LambdaRegression.TypeSystem.infer_term(child.tree, type_context)
         @test !(inferred isa Err)
         @test LambdaRegression.TypeSystem.iscompatible(inferred, target)
     end
@@ -65,51 +47,37 @@
     # Algorithm W treats `(λx. body) arg` as let-like and therefore does not
     # attach metadata to the intermediate `AbsNode`; its body must still remain
     # reachable as a crossover site.
-    letlike = AstTree(Procedural.FunctionDefNode(AbsNode(
+    letlike = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(
         :z,
         AppNode(AbsNode(:x, IndexNode(0)), ConstNode(:one)),
     )))
-    sites = ProceduralMutations._collect_functiondef_sites(
-        letlike,
-        type_context,
-        LambdaRegression.TypeSystem.make_tyvar_factory(),
-    )
+    analysis = prepare_typed_analysis(letlike, type_context; target_ty=target)
+    sites = analysis isa Err ? analysis : [
+        typed_analysis_path(analysis, id) for id in typed_analysis_site_ids(analysis)
+    ]
     @test !(sites isa Err)
-    @test any(site -> site.path == [1, 1, 1, 1], sites)
-
-    scope_parent = Individual(
-        AstTree(Procedural.ScopeNode([AbsNode(:x, IndexNode(0))], IndexNode(0))),
-        target,
-    )
-    @test_throws MethodError crossover(
-        ProceduralMutations.AutoTypedCrossover(procedural=op),
-        scope_parent,
-        right;
-        rng=MersenneTwister(1),
-        global_consts_ty=type_context,
-    )
+    @test any(path -> path == (1, 1, 1, 1), sites)
 end
 
-@testitem "Auto typed crossover uses contextual directional transport" begin
+@testitem "Typed crossover uses contextual directional transport" begin
     using Test
     using Random
     using LambdaRegression
     using LambdaRegression.ASTs.NodeASTs:
         AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
         crossover
-    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
     using LambdaRegression.Utils: Err
 
-    ProceduralMutations = LambdaRegression.ProceduralMutations
     int_function = TyFun(IntTy, IntTy)
     type_context = Dict{Symbol,TyLike}(
         :ADD => TyFun(IntTy, TyFun(IntTy, IntTy)),
         :ZERO => IntTy,
         :USE_FUN => TyFun(int_function, IntTy),
     )
-    left = Individual(
+    left = Program(
         AstTree(AbsNode(
             :x,
             AppNode(
@@ -117,9 +85,8 @@ end
                 ConstNode(:ZERO),
             ),
         )),
-        int_function,
     )
-    right = Individual(
+    right = Program(
         AstTree(AbsNode(
             :x,
             AppNode(
@@ -128,12 +95,11 @@ end
                     :y,
                     AppNode(
                         AppNode(ConstNode(:ADD), IndexNode(1)),
-                        IndexNode(0),
+                        ConstNode(:ZERO),
                     ),
                 ),
             ),
         )),
-        int_function,
     )
     left_before, right_before = deepcopy(left), deepcopy(right)
     core = TypedSubtreeSwapCrossover(
@@ -142,16 +108,18 @@ end
         min_sites=1,
         selection=PathCrossoverSelectionPolicy(
             [1, 1, 2],
-            [1, 2, 1],
+            [1, 2, 1, 2],
         ),
     )
 
     result = crossover(
-        ProceduralMutations.AutoTypedCrossover(core=core),
+        core,
         left,
         right;
         rng=MersenneTwister(8000),
         global_consts_ty=type_context,
+        target_a=int_function,
+        target_b=int_function,
     )
 
     @test !(result isa Err)
@@ -159,8 +127,8 @@ end
         child_left, child_right = result
         @test child_left.tree != left.tree
         @test child_right.tree != right.tree
-        @test infer(child_left.tree, type_context) == int_function
-        @test infer(child_right.tree, type_context) == int_function
+        @test iscompatible(infer(child_left.tree, type_context), int_function)
+        @test iscompatible(infer(child_right.tree, type_context), int_function)
     end
     @test left.tree == left_before.tree
     @test left.local_consts == left_before.local_consts
@@ -178,18 +146,15 @@ end
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, iscompatible
     using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser, mutate_tree
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     target = TyFun(FloatTy, FloatTy)
     type_context = Dict{Symbol,TyLike}(:SQR => TyFun(FloatTy, FloatTy))
-    source = AstTree(Procedural.FunctionDefNode(
+    source = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
         AbsNode(:x, AppNode(ConstNode(:SQR), IndexNode(0))),
     ))
-    checker = (tree, ctx, factory, meta) ->
-        Procedural.infer_procedural(tree, ctx; factory, meta)
-    mutation = ProceduralMutations.FunctionDefMutation(
+    mutation = Mutations.FunctionDefMutation(
         :recursive_body;
-        functiondef_provider=Procedural.FunctionDefProvider(
+        functiondef_provider=LambdaRegression.CanonicalGeneration.FunctionDefProvider(
             max_nesting=1,
             body_attempts=24,
         ),
@@ -206,19 +171,18 @@ end
         rng=MersenneTwister(2000),
         mutations=[mutation],
         chooser=WeightedPairChooser(
-            weights=Dict{Type,Float64}(ProceduralMutations.FunctionDefMutation => 1.0),
+            weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
             cache_eligibility=true,
         ),
         provider=IndexedProvider(),
         max_try=8,
         global_consts_ty=type_context,
-        type_inference=checker,
     )
 
     @test result isa AstTree
-    @test result.root isa Procedural.FunctionDefNode
-    @test Procedural.functiondef_recursion_summary(result).self_calls > 0
-    @test iscompatible(Procedural.infer_procedural(result, type_context), target)
+    @test result.root isa LambdaRegression.ASTs.NodeASTs.FunctionDefNode
+    @test LambdaRegression.ProgramAnalysis.functiondef_recursion_summary(result).self_calls > 0
+    @test iscompatible(LambdaRegression.TypeSystem.infer_term(result, type_context), target)
 end
 
 @testitem "FunctionDef recursive admissibility distinguishes calls from passed self values" begin
@@ -227,7 +191,6 @@ end
     using LambdaRegression.TypeSystem: FloatTy, TyFun
 
     CG = LambdaRegression.CanonicalGeneration
-    Procedural = LambdaRegression.Procedural
     target = TyFun(FloatTy, FloatTy)
     base = CG.VariableDerivation(0, target)
     passed_self = CG.LambdaDerivation(
@@ -246,24 +209,22 @@ end
             CG.CoreDerivation[CG.VariableDerivation(0, FloatTy)],
         ),
     )
-    filter = Procedural.GenuineSelfCallFilter(candidate -> true)
+    filter = LambdaRegression.CanonicalGeneration.GenuineSelfCallFilter(candidate -> true)
 
-    @test !filter(Procedural.FunctionDefCandidate(target, passed_self, base, 0))
-    @test filter(Procedural.FunctionDefCandidate(target, called_self, base, 0))
+    @test !filter(LambdaRegression.CanonicalGeneration.FunctionDefCandidate(target, passed_self, base, 0))
+    @test filter(LambdaRegression.CanonicalGeneration.FunctionDefCandidate(target, called_self, base, 0))
 end
 
-@testitem "FunctionDef finite-body mutation preserves polymorphic Scope binders" begin
+@testitem "FunctionDef finite-body mutation preserves polymorphic let-like binders" begin
     using Test
     using Random
     using LambdaRegression
-    using LambdaRegression.ASTs.NodeASTs: AstNode, AstTree, AbsNode, AppNode, ConstNode, IndexNode
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, TyScheme, get_type_ctx, iscompatible
     using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser, mutate_tree
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     CG = LambdaRegression.CanonicalGeneration
-    TS = LambdaRegression.TypeSystem
 
     mutable struct SchemeUsingGenerator
         saw_scheme::Bool
@@ -279,7 +240,7 @@ end
         provider,
         generation_kwargs,
     )
-        @test scope isa ProceduralMutations.FunctionDefScope
+        @test scope isa Mutations.FunctionDefScope
         slot = findfirst(ty -> ty isa TyScheme && !isempty(ty.vars), scope.binder_types)
         @test slot !== nothing
         generator.saw_scheme = true
@@ -319,42 +280,41 @@ end
     end
 
     values = Dict{Symbol,Any}(
-        :SQR => TS.SQR,
-        :TRUE => TS.TRUE,
-        :COND => TS.COND,
+        :SQR => LambdaRegression.Primitives.SQR,
+        :TRUE => LambdaRegression.Primitives.TRUE,
+        :COND => LambdaRegression.Primitives.COND,
     )
     types = get_type_ctx(values)
     type_only_name = Symbol("##functiondef_scope_1_1")
     types[type_only_name] = TyFun(FloatTy, FloatTy)
     target = TyFun(FloatTy, FloatTy)
-    source = AstTree(Procedural.ScopeNode(
-        AstNode[AbsNode(:id_arg, IndexNode(0))],
-        Procedural.FunctionDefNode(
-            AbsNode(:x, AppNode(ConstNode(:SQR), IndexNode(0))),
+    source = AstTree(AppNode(
+        AbsNode(:identity_binding,
+            LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
+                AbsNode(:x, AppNode(ConstNode(:SQR), IndexNode(0))),
+            ),
         ),
+        AbsNode(:id_arg, IndexNode(0)),
     ))
-    checker = (tree, ctx, factory, meta) ->
-        Procedural.infer_procedural(tree, ctx; factory, meta)
     preset_name = Symbol("##functiondef_scope_1")
     generator = SchemeUsingGenerator(false, nothing, nothing)
-    mutation = ProceduralMutations.FunctionDefMutation(
+    mutation = Mutations.FunctionDefMutation(
         :finite_body;
         replacement_generator=generator,
         generation_kwargs=(;
-            presets=Dict{Symbol,Any}(preset_name => TS.SQR),
+            presets=Dict{Symbol,Any}(preset_name => LambdaRegression.Primitives.SQR),
             preset_types=Dict{Symbol,TyLike}(preset_name => TyFun(FloatTy, FloatTy)),
         ),
     )
     local_values = Dict{Symbol,Any}()
     local_types = Dict{Symbol,TyLike}()
-
     result = mutate_tree(
         source,
         target;
         rng=MersenneTwister(555),
         mutations=[mutation],
         chooser=WeightedPairChooser(
-            weights=Dict{Type,Float64}(ProceduralMutations.FunctionDefMutation => 1.0),
+            weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
             cache_eligibility=true,
         ),
         provider=IndexedProvider(),
@@ -363,7 +323,6 @@ end
         global_consts_ty=types,
         local_consts=local_values,
         local_consts_ty=local_types,
-        type_inference=checker,
     )
 
     @test result isa AstTree
@@ -375,13 +334,156 @@ end
     @test length(generator.result.local_consts) == 2
     @test isempty(local_values)
     @test isempty(local_types)
-    @test iscompatible(Procedural.infer_procedural(result, types), target)
-    function_def = (result.root::Procedural.ScopeNode).body::Procedural.FunctionDefNode
+    @test iscompatible(LambdaRegression.TypeSystem.infer_term(result, types), target)
+    function_def = result.root.func.body::LambdaRegression.ASTs.NodeASTs.FunctionDefNode
     identity_refs = count(
         node -> node isa IndexNode && node.index == 2,
         AstTree(function_def.body),
     )
     @test identity_refs == 3
+end
+
+@testitem "FunctionDef mutation uses root-constrained binder schemes" begin
+    using Test
+    using Random
+    using LambdaRegression
+    using LambdaRegression.ASTs.NodeASTs:
+        AstTree, AbsNode, AppNode, FunctionDefNode, IndexNode
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyScheme
+    using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser, mutate_tree
+    using LambdaRegression.Utils: Err
+
+    TypeSystem = LambdaRegression.TypeSystem
+    Mutations = LambdaRegression.Mutations
+
+    target = TyFun(FloatTy, TyFun(FloatTy, FloatTy))
+    source = AstTree(AppNode(
+        AbsNode(:id, FunctionDefNode(AbsNode(
+            :x,
+            FunctionDefNode(AbsNode(:y, IndexNode(0))),
+        ))),
+        AbsNode(:z, IndexNode(0)),
+    ))
+    captured = Ref{Any}(nothing)
+    generator = function (
+        mode,
+        target_ty,
+        scope,
+        env,
+        ctx,
+        provider,
+        generation_kwargs,
+    )
+        captured[] = (scope=scope, env=env, ctx=ctx)
+        return Err(Mutations.NoEligibleSiteErr())
+    end
+    mutation = Mutations.FunctionDefMutation(
+        :finite_body;
+        site_weight=(mode, site, env, ctx) -> site.path == [1, 1, 1, 1] ? 1.0 : 0.0,
+        replacement_generator=generator,
+    )
+
+    result = mutate_tree(
+        source,
+        target;
+        rng=MersenneTwister(1),
+        mutations=[mutation],
+        chooser=WeightedPairChooser(
+            weights=Dict{Type,Float64}(typeof(mutation) => 1.0),
+            cache_eligibility=true,
+        ),
+        provider=IndexedProvider(),
+        max_try=1,
+    )
+
+    @test result isa Err
+    @test captured[] !== nothing
+    scope = captured[].scope
+    @test scope.functiondef_depth == 1
+    @test length(scope.binder_types) == 3
+
+    lambda_scheme, self_scheme, let_scheme = scope.binder_types
+    @test lambda_scheme isa TyScheme && isempty(lambda_scheme.vars)
+    @test TypeSystem.iscompatible(lambda_scheme.ty, FloatTy)
+    @test self_scheme isa TyScheme && isempty(self_scheme.vars)
+    @test TypeSystem.iscompatible(self_scheme.ty, target)
+    @test let_scheme isa TyScheme && length(let_scheme.vars) == 1
+    @test let_scheme.ty isa TyFun
+    @test let_scheme.ty.arg === let_scheme.ty.res
+
+    @test scope.full_slot_by_scope_index == [1, 2]
+    @test haskey(scope.placeholder_by_slot, 3)
+    @test captured[].ctx.typed_analysis isa
+        LambdaRegression.ProgramAnalysis.TypedAnalysis
+    @test captured[].env.tree.root !== captured[].ctx.typed_analysis.index.tree.root
+end
+
+@testitem "FunctionDef mutation carries analysis through a provider wrapper" begin
+    using Test
+    using Random
+    using LambdaRegression
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
+    using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser, mutate_tree
+    using LambdaRegression.Utils: Err
+
+    Mutations = LambdaRegression.Mutations
+
+    mutable struct DecoratedIndexedProvider <: Mutations.AbstractSiteProvider
+        inner::IndexedProvider
+    end
+    Mutations.reset!(provider::DecoratedIndexedProvider) = Mutations.reset!(provider.inner)
+    Mutations.prepare!(
+        provider::DecoratedIndexedProvider,
+        tree::AstTree,
+        type_ctx::Dict{Symbol,<:TyLike},
+        env::Any,
+        ctx::NamedTuple,
+    ) =
+        Mutations.prepare!(provider.inner, tree, type_ctx, env, ctx)
+    Mutations.sites(provider::DecoratedIndexedProvider) = Mutations.sites(provider.inner)
+    Mutations.sites_by_kind(provider::DecoratedIndexedProvider, kind::Symbol) =
+        Mutations.sites_by_kind(provider.inner, kind)
+
+    captured = Ref{Any}(nothing)
+    generator = function (mode, target_ty, scope, env, ctx, provider, generation_kwargs)
+        captured[] = (scope=scope, env=env, ctx=ctx)
+        return Err(Mutations.NoEligibleSiteErr())
+    end
+    mutation = Mutations.FunctionDefMutation(
+        :finite_body;
+        replacement_generator=generator,
+    )
+    source = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
+        AbsNode(:x, IndexNode(0)),
+    ))
+    target = TyFun(FloatTy, FloatTy)
+    chooser = WeightedPairChooser(
+        weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
+        cache_eligibility=true,
+    )
+
+    function probe()
+        captured[] = nothing
+        provider = DecoratedIndexedProvider(IndexedProvider())
+        result = mutate_tree(
+            source,
+            target;
+            rng=MersenneTwister(2000),
+            mutations=[mutation],
+            chooser,
+            provider,
+            max_try=1,
+        )
+        @test result isa Err
+        @test result.value isa Mutations.MaxTryReachedErr
+        @test captured[] !== nothing
+        @test captured[].scope.functiondef_depth == 0
+        return captured[].ctx.typed_analysis
+    end
+
+    analysis = probe()
+    @test analysis isa LambdaRegression.ProgramAnalysis.TypedAnalysis
 end
 
 @testitem "FunctionDef finite modes reject FunctionDef replacements" begin
@@ -393,8 +495,7 @@ end
     using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser
     using LambdaRegression.Utils: Err
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     CG = LambdaRegression.CanonicalGeneration
 
     struct NestedFunctionDefGenerator end
@@ -408,7 +509,7 @@ end
         generation_kwargs,
     )
         return CG.GenerationResult(
-            AstTree(Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0)))),
+            AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, IndexNode(0)))),
             target_ty,
             Dict{Symbol,Any}(),
             Dict{Symbol,TyLike}(),
@@ -417,17 +518,17 @@ end
     end
 
     target = TyFun(FloatTy, FloatTy)
-    source = AstTree(Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0))))
+    source = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, IndexNode(0))))
     chooser = WeightedPairChooser(
-        weights=Dict{Type,Float64}(ProceduralMutations.FunctionDefMutation => 1.0),
+        weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
         cache_eligibility=true,
     )
     for mode in (:finite_body, :remove)
-        mutation = ProceduralMutations.FunctionDefMutation(
+        mutation = Mutations.FunctionDefMutation(
             mode;
             replacement_generator=NestedFunctionDefGenerator(),
         )
-        result = ProceduralMutations.mutate_procedural(
+        result = Mutations.mutate_tree(
             source,
             target;
             rng=MersenneTwister(8000),
@@ -449,8 +550,7 @@ end
     using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser
     using LambdaRegression.Utils: Err
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     CG = LambdaRegression.CanonicalGeneration
 
     mutable struct ConfigInspectingGenerator
@@ -470,9 +570,9 @@ end
     end
 
     target = TyFun(FloatTy, FloatTy)
-    source = AstTree(Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0))))
+    source = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, IndexNode(0))))
     generator = ConfigInspectingGenerator(false)
-    mutation = ProceduralMutations.FunctionDefMutation(
+    mutation = Mutations.FunctionDefMutation(
         :finite_body;
         replacement_generator=generator,
         generation_kwargs=(;
@@ -480,13 +580,13 @@ end
         ),
     )
     caller_rng = MersenneTwister(1234)
-    result = ProceduralMutations.mutate_procedural(
+    result = Mutations.mutate_tree(
         source,
         target;
         rng=caller_rng,
         mutations=[mutation],
         chooser=WeightedPairChooser(
-            weights=Dict{Type,Float64}(ProceduralMutations.FunctionDefMutation => 1.0),
+            weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
             cache_eligibility=true,
         ),
         provider=IndexedProvider(),
@@ -505,18 +605,15 @@ end
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, TyMu, iscompatible, make_tyvar_factory
     using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser, mutate_tree
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     binder = make_tyvar_factory()(0)
     target = TyMu(binder, TyFun(IntTy, binder))
     values = Dict{Symbol,Any}(:step => identity)
     type_context = Dict{Symbol,TyLike}(:step => TyFun(IntTy, target))
-    source = AstTree(Procedural.FunctionDefNode(ConstNode(:step)))
-    checker = (tree, ctx, factory, meta) ->
-        Procedural.infer_procedural(tree, ctx; factory, meta)
-    mutation = ProceduralMutations.FunctionDefMutation(
+    source = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(ConstNode(:step)))
+    mutation = Mutations.FunctionDefMutation(
         :remove;
-        functiondef_provider=Procedural.FunctionDefProvider(max_nesting=1),
+        functiondef_provider=LambdaRegression.CanonicalGeneration.FunctionDefProvider(max_nesting=1),
         include_local_consts=true,
         generation_kwargs=(;
             sampling_depth_limit=5,
@@ -531,19 +628,18 @@ end
         rng=MersenneTwister(42),
         mutations=[mutation],
         chooser=WeightedPairChooser(
-            weights=Dict{Type,Float64}(ProceduralMutations.FunctionDefMutation => 1.0),
+            weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
             cache_eligibility=true,
         ),
         provider=IndexedProvider(),
         max_try=1,
         local_consts=values,
         local_consts_ty=type_context,
-        type_inference=checker,
     )
 
     @test result isa AstTree
-    @test !(result.root isa Procedural.FunctionDefNode)
-    @test iscompatible(Procedural.infer_procedural(result, type_context), target)
+    @test !(result.root isa LambdaRegression.ASTs.NodeASTs.FunctionDefNode)
+    @test iscompatible(LambdaRegression.TypeSystem.infer_term(result, type_context), target)
 end
 
 @testitem "FunctionDef mutation keeps nonredundant local candidates" begin
@@ -551,7 +647,7 @@ end
     using LambdaRegression
     using LambdaRegression.TypeSystem: FloatTy, TyArray, TyFun, TyLike, TyNat
 
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     unary = TyFun(FloatTy, FloatTy)
     global_values = Dict{Symbol,Any}(:GLOBAL_SQR => abs2)
     global_types = Dict{Symbol,TyLike}(:GLOBAL_SQR => unary)
@@ -570,7 +666,7 @@ end
         local_consts_ty=local_types,
     )
 
-    candidates, candidate_types = ProceduralMutations._candidate_local_context(ctx)
+    candidates, candidate_types = Mutations._candidate_local_context(ctx)
 
     @test candidates == Dict{Symbol,Any}(:float_factory_value => 1.25)
     @test candidate_types == Dict{Symbol,TyLike}(:float_factory_value => FloatTy)
@@ -588,7 +684,7 @@ end
         global_consts=Dict{Symbol,Any}(),
         global_consts_ty=Dict{Symbol,TyLike}(),
         local_consts=Dict{Symbol,Any}(
-            :materialized_amap => LambdaRegression.TypeSystem.AMAP,
+            :materialized_amap => LambdaRegression.LambdaRegression.Primitives.AMAP,
             :factory_array => [0.25, -0.5],
         ),
         local_consts_ty=Dict{Symbol,TyLike}(
@@ -596,7 +692,7 @@ end
             :factory_array => vector_ty,
         ),
     )
-    generated_candidates, generated_types = ProceduralMutations._candidate_local_context(
+    generated_candidates, generated_types = Mutations._candidate_local_context(
         generated_ctx,
         LambdaRegression.CanonicalGeneration.test_catalog_providers(),
     )
@@ -604,7 +700,7 @@ end
     @test Set(keys(generated_types)) == Set((:materialized_amap, :factory_array))
 
     deduplicated_candidates, deduplicated_types =
-        ProceduralMutations._candidate_local_context(
+        Mutations._candidate_local_context(
             generated_ctx,
             LambdaRegression.CanonicalGeneration.test_catalog_providers();
             deduplicate_provider_values=true,
@@ -612,8 +708,8 @@ end
     @test collect(keys(deduplicated_candidates)) == [:factory_array]
     @test collect(keys(deduplicated_types)) == [:factory_array]
 
-    default_mutation = ProceduralMutations.FunctionDefMutation(:finite_body)
-    opted_in_mutation = ProceduralMutations.FunctionDefMutation(
+    default_mutation = Mutations.FunctionDefMutation(:finite_body)
+    opted_in_mutation = Mutations.FunctionDefMutation(
         :finite_body;
         deduplicate_provider_values=true,
     )
@@ -621,7 +717,7 @@ end
     @test opted_in_mutation.deduplicate_provider_values
 end
 
-@testitem "FunctionDef scope recovery reuses prepared type metadata" begin
+@testitem "FunctionDef scope recovery reuses shared typed analysis" begin
     using Test
     using Random
     using LambdaRegression
@@ -629,19 +725,21 @@ end
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
 
     Mutations = LambdaRegression.Mutations
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
     target = TyFun(FloatTy, FloatTy)
-    tree = AstTree(Procedural.FunctionDefNode(AbsNode(:inner, IndexNode(0))))
-    meta = Dict{LambdaRegression.ASTs.NodeASTs.AstNode,Tuple{TyLike,TyLike}}()
-    inferred = Procedural.infer_procedural(tree, Dict{Symbol,TyLike}(); meta)
-    @test inferred isa TyFun
+    tree = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:inner, IndexNode(0))))
+    type_context = Dict{Symbol,TyLike}()
+    analysis = LambdaRegression.ProgramAnalysis.analyze_program(
+        tree,
+        type_context;
+        target_ty=target,
+    )
+    @test analysis isa LambdaRegression.ProgramAnalysis.TypedAnalysis
     env = Mutations.MutationEnv(
         Random.Xoshiro(1111),
         target,
-        Dict{Symbol,TyLike}(),
+        type_context,
         tree,
-        meta,
+        analysis,
         false,
         IdDict{Any,Any}(),
         Mutations.AdaptivePolicy(),
@@ -656,10 +754,57 @@ end
         tyfactory=(args...) -> error("scope recovery unexpectedly repeated inference"),
     )
 
-    recovered = ProceduralMutations._visible_functiondef_context(tree, Int[], env, ctx)
+    recovered = Mutations._visible_functiondef_context(tree, Int[], env, ctx)
 
     @test recovered.target_ty == target
     @test isempty(recovered.scope.scope_tys)
+end
+
+@testitem "FunctionDef scope recovery preserves the caller type variables" begin
+    using Test
+    using Random
+    using LambdaRegression
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, get_type_ctx,
+        make_tyvar_factory
+    using LambdaRegression.Primitives: FADD
+
+    Mutations = LambdaRegression.Mutations
+    factory = make_tyvar_factory()
+    α = factory(0)
+    target = TyFun(α, α)
+    tree = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
+        AbsNode(:inner, AppNode(AppNode(ConstNode(:FADD), IndexNode(0)),
+            ConstNode(:ONE)))))
+    type_context = get_type_ctx(Dict{Symbol,Any}(:FADD => FADD, :ONE => 1.0))
+    analysis = LambdaRegression.ProgramAnalysis.analyze_program(
+        tree,
+        type_context;
+        target_ty=target,
+    )
+    @test analysis isa LambdaRegression.ProgramAnalysis.TypedAnalysis
+    env = Mutations.MutationEnv(
+        Random.Xoshiro(1234),
+        target,
+        type_context,
+        tree,
+        analysis,
+        false,
+        IdDict{Any,Any}(),
+        Mutations.AdaptivePolicy(),
+        IdDict{DataType,Mutations.MutationStat}(),
+        Mutations.BloatPolicy(),
+    )
+    ctx = (;
+        global_consts=Dict{Symbol,Any}(:FADD => FADD, :ONE => 1.0),
+        global_consts_ty=type_context,
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        tyfactory=make_tyvar_factory(),
+    )
+    recovered = Mutations._visible_functiondef_context(tree, Int[], env, ctx)
+    @test recovered.target_ty == TyFun(FloatTy, FloatTy)
+    @test α.instance === nothing
 end
 
 @testitem "FunctionDef mutation spends the enclosing nesting budget" begin
@@ -671,21 +816,18 @@ end
     using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser, mutate_tree
     using LambdaRegression.Utils: Err
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     target = TyFun(FloatTy, FloatTy)
     type_context = Dict{Symbol,TyLike}(:SQR => target)
-    source = AstTree(Procedural.FunctionDefNode(
-        Procedural.FunctionDefNode(
+    source = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
+        LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
             AbsNode(:x, AppNode(ConstNode(:SQR), IndexNode(0))),
         ),
     ))
-    checker = (tree, ctx, factory, meta) ->
-        Procedural.infer_procedural(tree, ctx; factory, meta)
     inner_only = (mode, site, env, ctx) -> length(site.path) == 1 ? 1.0 : 0.0
-    mutation = ProceduralMutations.FunctionDefMutation(
+    mutation = Mutations.FunctionDefMutation(
         :recursive_body;
-        functiondef_provider=Procedural.FunctionDefProvider(
+        functiondef_provider=LambdaRegression.CanonicalGeneration.FunctionDefProvider(
             max_nesting=1,
             body_attempts=24,
         ),
@@ -703,13 +845,12 @@ end
         rng=MersenneTwister(2000),
         mutations=[mutation],
         chooser=WeightedPairChooser(
-            weights=Dict{Type,Float64}(ProceduralMutations.FunctionDefMutation => 1.0),
+            weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
             cache_eligibility=true,
         ),
         provider=IndexedProvider(),
         max_try=1,
         global_consts_ty=type_context,
-        type_inference=checker,
     )
 
     @test result isa Err
@@ -724,8 +865,7 @@ end
     using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser, mutate_tree
     using LambdaRegression.Utils: Err
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     CG = LambdaRegression.CanonicalGeneration
 
     struct PassedSelfGenerator end
@@ -740,7 +880,7 @@ end
     )
         body = AbsNode(:x, AppNode(ConstNode(:consume_function), IndexNode(1)))
         return CG.GenerationResult(
-            AstTree(Procedural.FunctionDefNode(body)),
+            AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(body)),
             target_ty,
             Dict{Symbol,Any}(),
             Dict{Symbol,TyLike}(),
@@ -751,10 +891,8 @@ end
     target = TyFun(FloatTy, FloatTy)
     values = Dict{Symbol,Any}(:consume_function => _ -> 0.0)
     type_context = Dict{Symbol,TyLike}(:consume_function => TyFun(target, FloatTy))
-    source = AstTree(Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0))))
-    checker = (tree, ctx, factory, meta) ->
-        Procedural.infer_procedural(tree, ctx; factory, meta)
-    mutation = ProceduralMutations.FunctionDefMutation(
+    source = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, IndexNode(0))))
+    mutation = Mutations.FunctionDefMutation(
         :recursive_body;
         replacement_generator=PassedSelfGenerator(),
     )
@@ -765,20 +903,19 @@ end
         rng=MersenneTwister(555),
         mutations=[mutation],
         chooser=WeightedPairChooser(
-            weights=Dict{Type,Float64}(ProceduralMutations.FunctionDefMutation => 1.0),
+            weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
             cache_eligibility=true,
         ),
         provider=IndexedProvider(),
         max_try=1,
         global_consts=values,
         global_consts_ty=type_context,
-        type_inference=checker,
     )
 
     @test result isa Err
 end
 
-@testitem "procedural mutation wrapper supplies lowering-aware inference" begin
+@testitem "FunctionDef removal uses shared mutation validation" begin
     using Test
     using Random
     using LambdaRegression
@@ -786,23 +923,22 @@ end
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, iscompatible
     using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     target = TyFun(FloatTy, FloatTy)
     values = Dict{Symbol,Any}(:SQR => abs2)
     type_context = Dict{Symbol,TyLike}(:SQR => target)
-    source = AstTree(Procedural.FunctionDefNode(
+    source = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
         AbsNode(:x, AppNode(ConstNode(:SQR), IndexNode(0))),
     ))
-    mutation = ProceduralMutations.FunctionDefMutation(:remove)
+    mutation = Mutations.FunctionDefMutation(:remove)
 
-    result = ProceduralMutations.mutate_procedural(
+    result = Mutations.mutate_tree(
         source,
         target;
         rng=MersenneTwister(1234),
         mutations=[mutation],
         chooser=WeightedPairChooser(
-            weights=Dict{Type,Float64}(ProceduralMutations.FunctionDefMutation => 1.0),
+            weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
             cache_eligibility=true,
         ),
         provider=IndexedProvider(),
@@ -812,8 +948,8 @@ end
     )
 
     @test result isa AstTree
-    @test !(result.root isa Procedural.FunctionDefNode)
-    @test iscompatible(Procedural.infer_procedural(result, type_context), target)
+    @test !(result.root isa LambdaRegression.ASTs.NodeASTs.FunctionDefNode)
+    @test iscompatible(LambdaRegression.TypeSystem.infer_term(result, type_context), target)
 end
 
 @testitem "FunctionDef body mutation rejects a structural no-op" begin
@@ -825,8 +961,7 @@ end
     using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser
     using LambdaRegression.Utils: Err
 
-    Procedural = LambdaRegression.Procedural
-    ProceduralMutations = LambdaRegression.ProceduralMutations
+    Mutations = LambdaRegression.Mutations
     CG = LambdaRegression.CanonicalGeneration
 
     struct SameBodyGenerator end
@@ -849,18 +984,18 @@ end
     end
 
     target = TyFun(FloatTy, FloatTy)
-    source = AstTree(Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0))))
-    mutation = ProceduralMutations.FunctionDefMutation(
+    source = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, IndexNode(0))))
+    mutation = Mutations.FunctionDefMutation(
         :finite_body;
         replacement_generator=SameBodyGenerator(),
     )
-    result = ProceduralMutations.mutate_procedural(
+    result = Mutations.mutate_tree(
         source,
         target;
         rng=MersenneTwister(42),
         mutations=[mutation],
         chooser=WeightedPairChooser(
-            weights=Dict{Type,Float64}(ProceduralMutations.FunctionDefMutation => 1.0),
+            weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
             cache_eligibility=true,
         ),
         provider=IndexedProvider(),
@@ -868,4 +1003,57 @@ end
     )
 
     @test result isa Err
+end
+
+@testitem "FunctionDef failed final typing does not commit tree or constants" begin
+    using Test
+    using Random
+    using LambdaRegression
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, ConstNode, FunctionDefNode, IndexNode
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
+    using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser
+    using LambdaRegression.Utils: Err
+
+    struct WrongRootReplacement end
+    function (::WrongRootReplacement)(mode, target_ty, scope, env, ctx, provider, kwargs)
+        return LambdaRegression.CanonicalGeneration.GenerationResult(
+            AstTree(ConstNode(:attempt_value)),
+            target_ty,
+            Dict{Symbol,Any}(:attempt_value => 2.5),
+            Dict{Symbol,TyLike}(:attempt_value => FloatTy),
+            Dict{Symbol,Any}(),
+        )
+    end
+
+    Mutations = LambdaRegression.Mutations
+    target = TyFun(FloatTy, FloatTy)
+    source = AstTree(FunctionDefNode(AbsNode(:x, IndexNode(0))))
+    source_before = deepcopy(source)
+    local_consts = Dict{Symbol,Any}(:stable => 1.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:stable => FloatTy)
+    consts_before = copy(local_consts)
+    types_before = copy(local_consts_ty)
+    mutation = Mutations.FunctionDefMutation(
+        :remove;
+        replacement_generator=WrongRootReplacement(),
+    )
+
+    result = Mutations.mutate_tree(
+        source,
+        target;
+        rng=MersenneTwister(1),
+        mutations=[mutation],
+        chooser=WeightedPairChooser(
+            weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
+        ),
+        provider=IndexedProvider(),
+        max_try=1,
+        local_consts,
+        local_consts_ty,
+    )
+
+    @test result isa Err
+    @test source == source_before
+    @test local_consts == consts_before
+    @test local_consts_ty == types_before
 end

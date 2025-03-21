@@ -1,7 +1,7 @@
-@testitem "Procedural FunctionDef generation requires a finite base witness" begin
+@testitem "FunctionDef FunctionDef generation requires a finite base witness" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Procedural, TypeSystem
+    using LambdaRegression: CanonicalGeneration, TypeSystem
     using LambdaRegression.TypeSystem: BoolTy, FloatTy, IntTy, Ty, TyFun, TyMu, TyScheme, make_tyvar_factory
 
     CG = CanonicalGeneration
@@ -14,7 +14,7 @@
     end
 
     counter = Ref(0)
-    provider = Procedural.FunctionDefProvider(
+    provider = CanonicalGeneration.FunctionDefProvider(
         base_witness=CountingBaseWitness(counter),
         max_nesting=2,
         body_attempts=1,
@@ -58,11 +58,11 @@
     )
     @test 1 <= counter[] <= provider.max_nesting
 
-    cacheable = Procedural.FunctionDefProvider(max_nesting=2, body_attempts=4)
+    cacheable = CanonicalGeneration.FunctionDefProvider(max_nesting=2, body_attempts=4)
     @test CG.generation_provider_cache_key(provider) === nothing
     @test CG.generation_provider_cache_key(cacheable) !== nothing
     @test CG.generation_provider_cache_key(
-        Procedural.FunctionDefProvider(max_nesting=2, body_attempts=5),
+        CanonicalGeneration.FunctionDefProvider(max_nesting=2, body_attempts=5),
     ) != CG.generation_provider_cache_key(cacheable)
 
     changing_target = TyFun(FloatTy, BoolTy)
@@ -83,7 +83,7 @@
         option -> option.value.provider === cacheable,
         CG._generation_extension_options(changing_relation, changing_query),
     )).value.option
-    @test Procedural._functiondef_base_witness(
+    @test CanonicalGeneration._functiondef_base_witness(
         cacheable,
         changing_relation,
         changing_option,
@@ -91,7 +91,7 @@
     ) !== nothing
     delete!(changing_relation.global_consts, :truth)
     delete!(changing_relation.global_consts_ty, :truth)
-    @test Procedural._functiondef_base_witness(
+    @test CanonicalGeneration._functiondef_base_witness(
         cacheable,
         changing_relation,
         changing_option,
@@ -100,12 +100,11 @@
 
     alpha = make_tyvar_factory()(0)
     impossible = TyScheme([alpha], TyFun(TyFun(alpha, alpha), alpha))
-    @test Procedural.generate_procedural(
+    @test CanonicalGeneration.generate_canonical(
         impossible;
-        functiondef_provider=cacheable,
         config=CG.GenerationConfig(
             rng=Random.Xoshiro(42),
-            providers=(CG.ContextHeadProvider(),),
+            providers=(CG.ContextHeadProvider(), cacheable),
             weights=CG.GenerationWeights(default=1, function_def=1),
             sampling_depth_limit=8,
             sampling_node_budget=64,
@@ -132,7 +131,7 @@
     )
     @test length(CG._generation_extension_options(recursive_relation, recursive_query)) == 1
 
-    exhausted = Procedural.FunctionDefProvider(max_nesting=0)
+    exhausted = CanonicalGeneration.FunctionDefProvider(max_nesting=0)
     exhausted_relation = CG.CoreRelation(
         providers=(CG.ContextHeadProvider(), exhausted),
         weights=CG.GenerationWeights(default=1, function_def=1),
@@ -140,15 +139,15 @@
     @test isempty(CG._generation_extension_options(exhausted_relation, query))
 end
 
-@testitem "Procedural FunctionDef default body sampling does not require self" begin
+@testitem "FunctionDef FunctionDef default body sampling does not require self" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.TypeSystem: FloatTy, TyFun
 
     CG = CanonicalGeneration
     target = TyFun(FloatTy, FloatTy)
-    provider = Procedural.FunctionDefProvider(
+    provider = CanonicalGeneration.FunctionDefProvider(
         max_nesting=1,
         body_attempts=1,
     )
@@ -193,16 +192,16 @@ end
         query,
     )
 
-    @test derivation isa Procedural.FunctionDefDerivation
-    derivation isa Procedural.FunctionDefDerivation || return
+    @test derivation isa CanonicalGeneration.FunctionDefDerivation
+    derivation isa CanonicalGeneration.FunctionDefDerivation || return
     @test !CG.derivation_uses_scope_binder(derivation.body, 0)
     @test !CG.derivation_calls_scope_binder(derivation.body, 0)
 end
 
-@testitem "Procedural subtree replacement can introduce and revisit FunctionDef" begin
+@testitem "FunctionDef subtree replacement can introduce and revisit FunctionDef" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Mutations, Procedural
+    using LambdaRegression: CanonicalGeneration, Mutations
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AstNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.CanonicalGeneration: GenerationResult
     using LambdaRegression.Mutations: DefaultSiteLockPolicy, IndexedProvider
@@ -216,23 +215,18 @@ end
     target = TyFun(FloatTy, FloatTy)
     original = AstTree(AbsNode(:x, IndexNode(0)))
     function contains_functiondef(node::AstNode)
-        node isa Procedural.FunctionDefNode && return true
+        node isa LambdaRegression.ASTs.NodeASTs.FunctionDefNode && return true
         return any(contains_functiondef, children(node))
     end
-    function procedural_inference(tree, type_ctx, factory, meta)
-        return Procedural.infer_procedural(tree, type_ctx; factory, meta)
-    end
-
-    functiondef = Procedural.FunctionDefProvider(max_nesting=1, body_attempts=8)
+    functiondef = CanonicalGeneration.FunctionDefProvider(max_nesting=1, body_attempts=8)
     replacement = SubtreeReplacementMutation(
         site_lock=DefaultSiteLockPolicy(spine_only=false),
         site_selection=PathSiteSelectionPolicy(Int[]),
         replacement_generator=ScopedReplacementGenerator(
-            Procedural.generate_procedural_scoped,
+            CanonicalGeneration.generate_canonical_scoped,
         ),
         generation_kwargs=(;
-            functiondef_provider=functiondef,
-            providers=CG.test_catalog_providers(),
+            providers=(CG.test_catalog_providers()..., functiondef),
             weights=CG.GenerationWeights(default=1, function_def=100),
             sampling_depth_limit=10,
             sampling_node_budget=96,
@@ -244,7 +238,7 @@ end
     )
 
     function conflicting_scoped(target_ty; kwargs...)
-        tree = AstTree(Procedural.FunctionDefNode(AbsNode(:x, ConstNode(:k))))
+        tree = AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, ConstNode(:k))))
         return GenerationResult(
             tree,
             target_ty,
@@ -267,13 +261,12 @@ end
         mutations=[conflict_mutation],
         chooser,
         provider=IndexedProvider(),
-        type_inference=procedural_inference,
         local_consts=conflict_consts,
         local_consts_ty=conflict_types,
         max_try=1,
     )
     @test conflicted isa AstTree
-    @test conflicted.root isa Procedural.FunctionDefNode
+    @test conflicted.root isa LambdaRegression.ASTs.NodeASTs.FunctionDefNode
     renamed_const = conflicted.root.body.body
     @test renamed_const isa ConstNode
     @test renamed_const.name != :k
@@ -291,7 +284,6 @@ end
             mutations=[replacement],
             chooser,
             provider=IndexedProvider(),
-            type_inference=procedural_inference,
             local_consts,
             local_consts_ty=local_const_types,
             max_try=1,
@@ -305,7 +297,7 @@ end
     first = found[]
     @test first isa AstTree
     @test contains_functiondef(first.root)
-    @test !(Procedural.infer_procedural(first, local_const_types) isa Err)
+    @test !(LambdaRegression.TypeSystem.infer_term(first, local_const_types) isa Err)
 
     second = Mutations.mutate_tree(
         first,
@@ -314,18 +306,17 @@ end
         mutations=[replacement],
         chooser,
         provider=IndexedProvider(),
-        type_inference=procedural_inference,
         local_consts,
         local_consts_ty=local_const_types,
         max_try=8,
     )
     @test second isa AstTree
-    @test !(Procedural.infer_procedural(second, local_const_types) isa Err)
+    @test !(LambdaRegression.TypeSystem.infer_term(second, local_const_types) isa Err)
 end
 
-@testitem "Procedural DirectKnotFilter tracks the exact recursive binder" begin
+@testitem "FunctionDef DirectKnotFilter tracks the exact recursive binder" begin
     using Test
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, ConstNode, IndexNode
     using LambdaRegression.TypeSystem: FloatTy, Ty, TyFun, TyList
 
@@ -354,11 +345,11 @@ end
         CG.ScopeApplicationDerivation(1, F, CG.CoreDerivation[one]),
     )
 
-    filter = Procedural.DirectKnotFilter()
-    @test !filter(Procedural.FunctionDefCandidate(F, direct, base, 0))
-    @test !filter(Procedural.FunctionDefCandidate(F, eta, base, 0))
-    @test !filter(Procedural.FunctionDefCandidate(F, changed, base, 0))
-    @test filter(Procedural.FunctionDefCandidate(F, CG.VariableDerivation(1, F), base, 0))
+    filter = CanonicalGeneration.DirectKnotFilter()
+    @test !filter(CanonicalGeneration.FunctionDefCandidate(F, direct, base, 0))
+    @test !filter(CanonicalGeneration.FunctionDefCandidate(F, eta, base, 0))
+    @test !filter(CanonicalGeneration.FunctionDefCandidate(F, changed, base, 0))
+    @test filter(CanonicalGeneration.FunctionDefCandidate(F, CG.VariableDerivation(1, F), base, 0))
     fadd_head = CG.HeadEntry(
         :FADD,
         :constant,
@@ -380,7 +371,7 @@ end
             ],
         ),
     )
-    @test !filter(Procedural.FunctionDefCandidate(
+    @test !filter(CanonicalGeneration.FunctionDefCandidate(
         F,
         wrapped_unchanged_derivation,
         base,
@@ -405,7 +396,7 @@ end
             FloatTy,
         ),
     )
-    candidate = Procedural.FunctionDefCandidate(ListF, safe, list_base, 0)
+    candidate = CanonicalGeneration.FunctionDefCandidate(ListF, safe, list_base, 0)
     @test CG.derivation_uses_scope_binder(safe, 0)
     @test filter(candidate)
 
@@ -424,54 +415,54 @@ end
             FloatTy,
         ),
     )
-    @test !filter(Procedural.FunctionDefCandidate(
+    @test !filter(CanonicalGeneration.FunctionDefCandidate(
         ListF,
         unsafe_fallback,
         list_base,
         0,
     ))
 
-    direct_node = Procedural.FunctionDefNode(IndexNode(0))
-    eta_node = Procedural.FunctionDefNode(AbsNode(
+    direct_node = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(IndexNode(0))
+    eta_node = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(
         :x,
         AppNode(IndexNode(1), IndexNode(0)),
     ))
-    changed_node = Procedural.FunctionDefNode(AbsNode(
+    changed_node = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(
         :x,
         ConstNode(:ONE),
     ))
-    redirected_node = Procedural.FunctionDefNode(AbsNode(
+    redirected_node = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(
         :x,
         AppNode(IndexNode(1), ConstNode(:ONE)),
     ))
-    wrapped_unchanged = Procedural.FunctionDefNode(AbsNode(
+    wrapped_unchanged = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(
         :x,
         AppNode(
             AppNode(ConstNode(:FADD), AppNode(IndexNode(1), IndexNode(0))),
             ConstNode(:ZERO),
         ),
     ))
-    deferred_unchanged = Procedural.FunctionDefNode(AbsNode(
+    deferred_unchanged = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(
         :x,
         AppNode(
             ConstNode(:K),
             AbsNode(:y, AppNode(IndexNode(2), IndexNode(1))),
         ),
     ))
-    @test Procedural.obvious_functiondef_loop_reason(direct_node) === :direct_self
-    @test Procedural.obvious_functiondef_loop_reason(eta_node) ===
+    @test LambdaRegression.ProgramAnalysis.obvious_functiondef_loop_reason(direct_node) === :direct_self
+    @test LambdaRegression.ProgramAnalysis.obvious_functiondef_loop_reason(eta_node) ===
         :eta_self_forwarding
-    @test Procedural.obvious_functiondef_loop_reason(changed_node) === nothing
-    @test Procedural.obvious_functiondef_loop_reason(redirected_node) ===
+    @test LambdaRegression.ProgramAnalysis.obvious_functiondef_loop_reason(changed_node) === nothing
+    @test LambdaRegression.ProgramAnalysis.obvious_functiondef_loop_reason(redirected_node) ===
         :unconditional_self_call
-    @test Procedural.obvious_functiondef_loop_reason(wrapped_unchanged) ===
+    @test LambdaRegression.ProgramAnalysis.obvious_functiondef_loop_reason(wrapped_unchanged) ===
         :unchanged_self_call
-    @test Procedural.obvious_functiondef_loop_reason(deferred_unchanged) === nothing
+    @test LambdaRegression.ProgramAnalysis.obvious_functiondef_loop_reason(deferred_unchanged) === nothing
 end
 
-@testitem "Procedural DirectKnotFilter honors custom derivation signatures" begin
+@testitem "FunctionDef DirectKnotFilter honors custom derivation signatures" begin
     using Test
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.TypeSystem: BoolTy, FloatTy, TyFun
 
     CG = CanonicalGeneration
@@ -515,22 +506,22 @@ end
         CG.ScopeApplicationDerivation(1, F, CG.CoreDerivation[safe_argument]),
     )
 
-    filter = Procedural.DirectKnotFilter()
-    @test !filter(Procedural.FunctionDefCandidate(F, eta, base, 0))
+    filter = CanonicalGeneration.DirectKnotFilter()
+    @test !filter(CanonicalGeneration.FunctionDefCandidate(F, eta, base, 0))
     @test isempty(CG.derivation_capabilities(safe_argument))
-    @test !filter(Procedural.FunctionDefCandidate(F, unsafe_body, base, 0))
+    @test !filter(CanonicalGeneration.FunctionDefCandidate(F, unsafe_body, base, 0))
 end
 
-@testitem "Procedural FunctionDef generation is opt in and post verified" begin
+@testitem "FunctionDef FunctionDef generation is opt in and post verified" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Procedural, TypeSystem
+    using LambdaRegression: CanonicalGeneration, TypeSystem
     using LambdaRegression.TypeSystem: FloatTy, TyFun, iscompatible
 
     CG = CanonicalGeneration
     target = TyFun(FloatTy, FloatTy)
-    provider = Procedural.FunctionDefProvider(max_nesting=2, body_attempts=8)
-    global_consts = Dict{Symbol,Any}(:FADD => TypeSystem.FADD)
+    provider = CanonicalGeneration.FunctionDefProvider(max_nesting=2, body_attempts=8)
+    global_consts = Dict{Symbol,Any}(:FADD => LambdaRegression.Primitives.FADD)
     weights = CG.GenerationWeights(
         default=0,
         lambda=1,
@@ -547,39 +538,37 @@ end
         sampling_node_budget=96,
     )
 
-    canonical = Procedural.generate_procedural(
+    canonical = CanonicalGeneration.generate_canonical(
         target;
-        functiondef_provider=nothing,
         global_consts,
         config=base_config,
     )
     @test canonical isa CG.GenerationResult
-    @test !(canonical.tree.root isa Procedural.FunctionDefNode)
-    @test canonical.metadata[:procedural_verification] == :not_needed
+    @test !(canonical.tree.root isa LambdaRegression.ASTs.NodeASTs.FunctionDefNode)
+    @test canonical.metadata[:functiondef_verification] == :not_needed
 
     observed = Ref{Any}(nothing)
     for seed in 902:933
-        result = Procedural.generate_procedural(
+        result = CanonicalGeneration.generate_canonical(
             target;
-            functiondef_provider=provider,
             global_consts,
             config=CG.GenerationConfig(;
                 rng=Random.Xoshiro(seed),
-                providers=(CG.ContextHeadProvider(),),
+                providers=(CG.ContextHeadProvider(), provider),
                 weights,
                 sampling_depth_limit=10,
                 sampling_node_budget=96,
             ),
         )
         result isa CG.GenerationResult || continue
-        result.tree.root isa Procedural.FunctionDefNode || continue
+        result.tree.root isa LambdaRegression.ASTs.NodeASTs.FunctionDefNode || continue
         observed[] = result
         break
     end
 
     @test observed[] isa CG.GenerationResult
     result = observed[]
-    inferred = Procedural.infer_procedural(result.tree, result.local_const_types)
+    inferred = LambdaRegression.TypeSystem.infer_term(result.tree, result.local_const_types)
     @test iscompatible(inferred, target)
     metadata = result.metadata[:derivation_metadata][:function_defs]
     @test length(metadata) >= 1
@@ -588,20 +577,19 @@ end
     @test :function_def in metadata[1][:used_capabilities]
     @test :recursive_type_query in metadata[1][:provider_capabilities]
     @test CG._signature_contains(result.metadata[:derivation], :function_def)
-    @test result.metadata[:procedural_verification] == :verified
+    @test result.metadata[:functiondef_verification] == :verified
 end
 
-@testitem "Procedural generation verifies global and scoped contexts" begin
+@testitem "FunctionDef generation verifies global and scoped contexts" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.ASTs.NodeASTs: ConstNode, IndexNode
     using LambdaRegression.TypeSystem: FloatTy, Ty, iscompatible
 
     CG = CanonicalGeneration
-    global_result = Procedural.generate_procedural(
+    global_result = CanonicalGeneration.generate_canonical(
         FloatTy;
-        functiondef_provider=nothing,
         global_consts=Dict{Symbol,Any}(:ONE => 1.0),
         global_consts_ty=Dict{Symbol,Any}(:ONE => FloatTy),
         config=CG.GenerationConfig(;
@@ -615,14 +603,13 @@ end
     @test global_result isa CG.GenerationResult
     @test global_result.tree.root == ConstNode(:ONE)
     @test iscompatible(
-        Procedural.infer_procedural(global_result.tree, global_result.local_const_types),
+        LambdaRegression.TypeSystem.infer_term(global_result.tree, global_result.local_const_types),
         FloatTy,
     )
 
-    scoped_result = Procedural.generate_procedural_scoped(
+    scoped_result = CanonicalGeneration.generate_canonical_scoped(
         FloatTy;
         scope_tys=Ty[FloatTy],
-        functiondef_provider=nothing,
         config=CG.GenerationConfig(;
             rng=Random.Xoshiro(42),
             providers=(CG.ContextHeadProvider(),),
@@ -688,8 +675,8 @@ end
     scope = Ty[TyList(Vec2), Vec2, Matrix32, F]
     relation = CG.CoreRelation(
         global_consts=Dict{Symbol,Any}(
-            :FADD => TypeSystem.FADD,
-            :LENF => TypeSystem.LENF,
+            :FADD => LambdaRegression.Primitives.FADD,
+            :LENF => LambdaRegression.Primitives.LENF,
         ),
         providers=(CG.ContextHeadProvider(),),
         weights=CG.GenerationWeights(
@@ -827,7 +814,7 @@ end
 
     rejecting_planner = (derivations, args...) -> empty(derivations)
     rejected_relation = CG.CoreRelation(
-        global_consts=Dict{Symbol,Any}(:FADD => TypeSystem.FADD),
+        global_consts=Dict{Symbol,Any}(:FADD => LambdaRegression.Primitives.FADD),
         providers=(CG.ContextHeadProvider(),),
         argument_planner=rejecting_planner,
         weights=CG.GenerationWeights(
@@ -868,7 +855,7 @@ end
 
     tri = x -> y -> z -> x + y + z
     weighted_relation = CG.CoreRelation(
-        global_consts=Dict{Symbol,Any}(:FADD => TypeSystem.FADD, :TRI => tri),
+        global_consts=Dict{Symbol,Any}(:FADD => LambdaRegression.Primitives.FADD, :TRI => tri),
         global_consts_ty=Dict{Symbol,Any}(
             :FADD => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
             :TRI => TyFun(FloatTy, TyFun(FloatTy, TyFun(FloatTy, FloatTy))),
@@ -1134,17 +1121,17 @@ end
     )
 end
 
-@testitem "Procedural Known0 rejects opaque AST presets" begin
+@testitem "FunctionDef Known0 rejects opaque AST presets" begin
     using Test
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.ASTs.NodeASTs: IndexNode
     using LambdaRegression.TypeSystem: FloatTy, TyFun
 
     CG = CanonicalGeneration
     target = TyFun(FloatTy, FloatTy)
-    provider = Procedural.FunctionDefProvider()
+    provider = CanonicalGeneration.FunctionDefProvider()
     relation = CG.CoreRelation(
-        presets=Dict{Symbol,Any}(:recursive_preset => Procedural.FunctionDefNode(IndexNode(0))),
+        presets=Dict{Symbol,Any}(:recursive_preset => LambdaRegression.ASTs.NodeASTs.FunctionDefNode(IndexNode(0))),
         preset_types=Dict{Symbol,Any}(:recursive_preset => target),
         providers=(CG.ContextHeadProvider(), provider),
         weights=CG.GenerationWeights(default=1, function_def=1),
@@ -1166,10 +1153,10 @@ end
     @test length(CG._generation_extension_options(relation, query)) == 1
 end
 
-@testitem "Procedural provider retries and configuration are finite and explicit" begin
+@testitem "FunctionDef provider retries and configuration are finite and explicit" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.TypeSystem: FloatTy, TyFun
 
     CG = CanonicalGeneration
@@ -1183,7 +1170,7 @@ end
 
     target = TyFun(FloatTy, FloatTy)
     rejection = RejectAll(Ref(0))
-    provider = Procedural.FunctionDefProvider(
+    provider = CanonicalGeneration.FunctionDefProvider(
         admissibility=rejection,
         body_attempts=3,
     )
@@ -1194,12 +1181,11 @@ end
         scope_application=2,
         function_def=1.0e6,
     )
-    result = Procedural.generate_procedural(
+    result = CanonicalGeneration.generate_canonical(
         target;
-        functiondef_provider=provider,
         config=CG.GenerationConfig(;
             rng=Random.Xoshiro(2000),
-            providers=(CG.ContextHeadProvider(),),
+            providers=(CG.ContextHeadProvider(), provider),
             weights,
             sampling_depth_limit=8,
             sampling_node_budget=64,
@@ -1207,43 +1193,97 @@ end
     )
     @test result isa CG.GenerationResult
     @test 0 < rejection.calls[] <= provider.body_attempts * provider.max_nesting
-    @test !(result.tree.root isa Procedural.FunctionDefNode)
+    @test !(result.tree.root isa LambdaRegression.ASTs.NodeASTs.FunctionDefNode)
 
     embedded = CG.GenerationConfig(;
         rng=Random.Xoshiro(1),
-        providers=(CG.ContextHeadProvider(), Procedural.FunctionDefProvider()),
+        providers=(CG.ContextHeadProvider(), CanonicalGeneration.FunctionDefProvider()),
         weights,
     )
-    disabled = Procedural._with_functiondef_provider(embedded, nothing)
-    @test !any(provider -> provider isa Procedural.FunctionDefProvider, disabled.providers)
+    disabled = CanonicalGeneration.with_functiondef_provider(embedded, nothing)
+    @test !any(provider -> provider isa CanonicalGeneration.FunctionDefProvider, disabled.providers)
 
     custom_sampler = (rng, sample_set) -> first(sample_set.derivations)
     unsupported = CG.GenerationConfig(;
         rng=Random.Xoshiro(1111),
-        providers=(CG.ContextHeadProvider(),),
+        providers=(CG.ContextHeadProvider(), CanonicalGeneration.FunctionDefProvider()),
         weights,
         sampler=custom_sampler,
     )
-    @test_throws ArgumentError Procedural.generate_procedural(
+    @test_throws ArgumentError CanonicalGeneration.generate_canonical(
         target;
-        functiondef_provider=Procedural.FunctionDefProvider(),
         config=unsupported,
+    )
+
+    unsupported_planner = CG.GenerationConfig(;
+        rng=Random.Xoshiro(1234),
+        providers=(CG.ContextHeadProvider(), CanonicalGeneration.FunctionDefProvider()),
+        weights,
+        argument_planner=(args...) -> args,
+    )
+    @test_throws ArgumentError CanonicalGeneration.generate_canonical(
+        target;
+        config=unsupported_planner,
+    )
+    @test_throws ArgumentError CanonicalGeneration.generate_canonical_scoped(
+        target;
+        config=unsupported_planner,
     )
 end
 
-@testitem "Procedural FunctionDef composes with safe-list tail recursion" begin
+@testitem "Canonical FunctionDef verification skips only proven core configurations" begin
+    using Test
+    using LambdaRegression: CanonicalGeneration
+    using LambdaRegression.ASTs.NodeASTs: ConstNode, FunctionDefNode
+
+    CG = CanonicalGeneration
+    core = CG.GenerationConfig(providers=(CG.ContextHeadProvider(),))
+    @test !CG._functiondef_verification_required(core, Dict{Symbol,Any}())
+
+    custom_sampler = CG.GenerationConfig(
+        providers=(CG.ContextHeadProvider(),),
+        sampler=(rng, candidates) -> first(candidates.derivations),
+    )
+    @test CG._functiondef_verification_required(custom_sampler, Dict{Symbol,Any}())
+
+    custom_planner = CG.GenerationConfig(
+        providers=(CG.ContextHeadProvider(),),
+        argument_planner=(args...) -> args,
+    )
+    @test CG._functiondef_verification_required(custom_planner, Dict{Symbol,Any}())
+
+    custom_materializer = CG.GenerationConfig(
+        providers=(CG.ContextHeadProvider(),),
+        materializer=(args...) -> nothing,
+    )
+    @test CG._functiondef_verification_required(custom_materializer, Dict{Symbol,Any}())
+
+    custom_collector = CG.GenerationConfig(
+        providers=(
+            CG.ContextHeadProvider(),
+            CG.SafeListAccessProvider(source_collectors=((relation, scope) -> (),)),
+        ),
+    )
+    @test CG._functiondef_verification_required(custom_collector, Dict{Symbol,Any}())
+    @test CG._functiondef_verification_required(
+        core,
+        Dict{Symbol,Any}(:recursive => FunctionDefNode(ConstNode(:value))),
+    )
+end
+
+@testitem "FunctionDef FunctionDef composes with safe-list tail recursion" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyList, iscompatible
 
     CG = CanonicalGeneration
     ListFloat = TyList(FloatTy)
     target = TyFun(ListFloat, FloatTy)
-    provider = Procedural.FunctionDefProvider(
+    provider = CanonicalGeneration.FunctionDefProvider(
         max_nesting=1,
         body_attempts=8,
-        admissibility=Procedural.GenuineSelfCallFilter(),
+        admissibility=CanonicalGeneration.GenuineSelfCallFilter(),
     )
     weights = CG.GenerationWeights(
         default=0,
@@ -1273,14 +1313,13 @@ end
     observed = Ref{Any}(nothing)
     unguarded_recursive_argument = Ref(false)
     for seed in 1:32
-        result = Procedural.generate_procedural(
+        result = CanonicalGeneration.generate_canonical(
             target;
-            functiondef_provider=provider,
             global_consts=Dict{Symbol,Any}(:ZERO => 0.0),
             global_consts_ty=Dict{Symbol,Any}(:ZERO => FloatTy),
             config=CG.GenerationConfig(;
                 rng=Random.Xoshiro(seed),
-                providers=(CG.ContextHeadProvider(), CG.SafeListAccessProvider()),
+                providers=(CG.ContextHeadProvider(), CG.SafeListAccessProvider(), provider),
                 weights,
                 sampling_depth_limit=10,
                 sampling_node_budget=96,
@@ -1315,7 +1354,7 @@ end
     observed[] isa CG.GenerationResult || return
     result = observed[]
     @test iscompatible(
-        Procedural.infer_procedural(result.tree, result.local_const_types),
+        LambdaRegression.TypeSystem.infer_term(result.tree, result.local_const_types),
         target,
     )
     entry = result.metadata[:derivation_metadata][:function_defs][1]
@@ -1329,103 +1368,85 @@ end
 
 @testitem "FunctionDef observations distinguish self use from recursive calls" begin
     using Test
-    using LambdaRegression: Procedural
-    using LambdaRegression.ASTs.NodeASTs: AstNode, AbsNode, AppNode, ConstNode, IndexNode, LetNode
+    using LambdaRegression: ProgramAnalysis
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, ConstNode, IndexNode
 
-    nonrecursive = Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0)))
-    returned_self = Procedural.FunctionDefNode(AbsNode(:x, IndexNode(1)))
-    recursive = Procedural.FunctionDefNode(
+    nonrecursive = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, IndexNode(0)))
+    returned_self = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(AbsNode(:x, IndexNode(1)))
+    recursive = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
         AbsNode(:x, AppNode(IndexNode(1), IndexNode(0))),
     )
-    passed_self = Procedural.FunctionDefNode(
+    passed_self = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
         AbsNode(:x, AppNode(IndexNode(0), IndexNode(1))),
     )
-    curried_recursive = Procedural.FunctionDefNode(
+    curried_recursive = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
         AbsNode(:x, AbsNode(
             :y,
             AppNode(AppNode(IndexNode(2), IndexNode(1)), IndexNode(0)),
         )),
     )
-    nested_outer_call = Procedural.FunctionDefNode(
-        AbsNode(:x, Procedural.FunctionDefNode(
+    nested_outer_call = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
+        AbsNode(:x, LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
             AbsNode(:y, AppNode(IndexNode(3), IndexNode(0))),
         )),
     )
-    scoped_call = Procedural.FunctionDefNode(
-        AbsNode(:x, Procedural.ScopeNode(
-            AstNode[ConstNode(:base), IndexNode(0)],
-            AppNode(IndexNode(3), IndexNode(0)),
-        )),
-    )
-    let_call = Procedural.FunctionDefNode(
-        AbsNode(:x, LetNode(
-            :value,
+    let_like_call = LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
+        AbsNode(:x, AppNode(
+            AbsNode(:value, AppNode(IndexNode(2), IndexNode(0))),
             ConstNode(:base),
-            AppNode(IndexNode(2), IndexNode(0)),
         )),
     )
 
-    @test Procedural.functiondef_recursion_summary(nonrecursive) == (
+    @test LambdaRegression.ProgramAnalysis.functiondef_recursion_summary(nonrecursive) == (
         definitions=1,
         recursive_definitions=0,
         self_references=0,
         self_calls=0,
     )
-    @test Procedural.functiondef_recursion_summary(returned_self) == (
+    @test LambdaRegression.ProgramAnalysis.functiondef_recursion_summary(returned_self) == (
         definitions=1,
         recursive_definitions=0,
         self_references=1,
         self_calls=0,
     )
-    @test Procedural.functiondef_recursion_summary(recursive) == (
+    @test LambdaRegression.ProgramAnalysis.functiondef_recursion_summary(recursive) == (
         definitions=1,
         recursive_definitions=1,
         self_references=1,
         self_calls=1,
     )
-    @test Procedural.functiondef_recursion_summary(passed_self) == (
+    @test LambdaRegression.ProgramAnalysis.functiondef_recursion_summary(passed_self) == (
         definitions=1,
         recursive_definitions=0,
         self_references=1,
         self_calls=0,
     )
-    @test Procedural.functiondef_recursion_summary(curried_recursive) == (
+    @test LambdaRegression.ProgramAnalysis.functiondef_recursion_summary(curried_recursive) == (
         definitions=1,
         recursive_definitions=1,
         self_references=1,
         self_calls=1,
     )
-    @test Procedural.functiondef_recursion_summary(nested_outer_call) == (
+    @test LambdaRegression.ProgramAnalysis.functiondef_recursion_summary(nested_outer_call) == (
         definitions=2,
         recursive_definitions=1,
         self_references=1,
         self_calls=1,
     )
-    @test Procedural.functiondef_recursion_summary(scoped_call) == (
-        definitions=1,
-        recursive_definitions=1,
-        self_references=1,
-        self_calls=1,
-    )
-    @test Procedural.functiondef_recursion_summary(let_call) == (
-        definitions=1,
-        recursive_definitions=1,
-        self_references=1,
-        self_calls=1,
-    )
+    @test LambdaRegression.ProgramAnalysis.functiondef_recursion_summary(let_like_call).self_calls == 1
 end
 
-@testitem "Procedural Known0 rejects mu-aliased fixed-point scope heads when selected" begin
+@testitem "FunctionDef Known0 rejects mu-aliased fixed-point scope heads when selected" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.TypeSystem: BoolTy, FloatTy, Ty, TyFun, TyMu, make_tyvar_factory
 
     CG = CanonicalGeneration
     F = TyFun(FloatTy, BoolTy)
     binder = make_tyvar_factory()(0)
     fixed_point_alias = TyMu(binder, TyFun(TyFun(F, F), F))
-    provider = Procedural.FunctionDefProvider(max_nesting=1)
+    provider = CanonicalGeneration.FunctionDefProvider(max_nesting=1)
     relation = CG.CoreRelation(
         providers=(CG.ContextHeadProvider(), provider),
         weights=CG.GenerationWeights(default=1, function_def=1),
@@ -1527,7 +1548,7 @@ end
 
 @testitem "FunctionDef metadata aggregates derivation capabilities" begin
     using Test
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.TypeSystem: FloatTy, TyFun
 
     CG = CanonicalGeneration
@@ -1541,7 +1562,7 @@ end
         metadata=(value=identity, capabilities=(:randomness,)),
     )
     body = CG.ConstantDerivation(random_head)
-    derivation = Procedural.FunctionDefDerivation(
+    derivation = CanonicalGeneration.FunctionDefDerivation(
         F,
         body,
         body,
@@ -1554,52 +1575,92 @@ end
     @test :randomness in entry[:used_capabilities]
 end
 
-@testitem "Procedural verification inspects actual FunctionDef nodes" begin
+@testitem "FunctionDef verification inspects actual FunctionDef nodes" begin
     using Test
-    using LambdaRegression: CanonicalGeneration, Procedural
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.TypeSystem: FloatTy, TyLike
+    using LambdaRegression: CanonicalGeneration
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, ConstNode
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
 
     result = CanonicalGeneration.GenerationResult(
-        AstTree(Procedural.FunctionDefNode(ConstNode(:ZERO))),
+        AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(ConstNode(:ZERO))),
         FloatTy,
         Dict{Symbol,Any}(:ZERO => 0.0),
         Dict{Symbol,TyLike}(:ZERO => FloatTy),
         Dict{Symbol,Any}(),
     )
 
-    verified = Procedural._verify_procedural_generation(
+    verified = CanonicalGeneration._verify_functiondef_result(
         result,
         FloatTy;
-        fixed_point=Procedural.fixed_point_witness,
         kwargs=(;),
     )
 
     @test verified isa Err
+
+    global_values = Dict{Symbol,Any}(:v => 1.0)
+    valid = CanonicalGeneration.GenerationResult(
+        AstTree(LambdaRegression.ASTs.NodeASTs.FunctionDefNode(
+            AbsNode(:x, ConstNode(:v)),
+        )),
+        TyFun(FloatTy, FloatTy),
+        Dict{Symbol,Any}(),
+        Dict{Symbol,TyLike}(),
+        Dict{Symbol,Any}(),
+    )
+    context = CanonicalGeneration._verification_context(
+        valid,
+        (; global_consts=global_values),
+    )
+    @test context[:v] == FloatTy
+    verified_global = CanonicalGeneration._verify_functiondef_result(
+        valid,
+        TyFun(FloatTy, FloatTy);
+        kwargs=(; global_consts=global_values),
+    )
+    @test verified_global isa CanonicalGeneration.GenerationResult
+    @test verified_global.metadata[:functiondef_verification] == :verified
+
+    shadowed = CanonicalGeneration.GenerationResult(
+        valid.tree,
+        valid.target_ty,
+        Dict{Symbol,Any}(:v => 1.0),
+        Dict{Symbol,TyLike}(:v => FloatTy),
+        Dict{Symbol,Any}(),
+    )
+    shadow_context = CanonicalGeneration._verification_context(
+        shadowed,
+        (; global_consts_ty=Dict{Symbol,Any}(:v => BoolTy), local_consts=Dict{Symbol,Any}(:v => 1.0)),
+    )
+    @test shadow_context[:v] == FloatTy
+    verified_shadow = CanonicalGeneration._verify_functiondef_result(
+        shadowed,
+        TyFun(FloatTy, FloatTy);
+        kwargs=(; global_consts_ty=Dict{Symbol,Any}(:v => BoolTy), local_consts=Dict{Symbol,Any}(:v => 1.0)),
+    )
+    @test verified_shadow isa CanonicalGeneration.GenerationResult
 end
 
-@testitem "Procedural FunctionDef samples recursive mu heads under budget" begin
+@testitem "FunctionDef FunctionDef samples recursive mu heads under budget" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyMu, iscompatible, make_tyvar_factory
 
     CG = CanonicalGeneration
     binder = make_tyvar_factory()(0)
     target = TyMu(binder, TyFun(IntTy, binder))
-    result = Procedural.generate_procedural(
+    result = CanonicalGeneration.generate_canonical(
         target;
-        functiondef_provider=Procedural.FunctionDefProvider(
-            max_nesting=1,
-            body_attempts=4,
-            admissibility=Procedural.GenuineSelfCallFilter(Procedural.AcceptFunctionDef()),
-        ),
         global_consts=Dict{Symbol,Any}(:mk => identity, :seed => 1),
         global_consts_ty=Dict{Symbol,Any}(:mk => TyFun(IntTy, target), :seed => IntTy),
         config=CG.GenerationConfig(;
             rng=Random.Xoshiro(2000),
-            providers=(CG.ContextHeadProvider(),),
+            providers=(CG.ContextHeadProvider(), CanonicalGeneration.FunctionDefProvider(
+                max_nesting=1,
+                body_attempts=4,
+                admissibility=CanonicalGeneration.GenuineSelfCallFilter(CanonicalGeneration.AcceptFunctionDef()),
+            )),
             weights=CG.GenerationWeights(
                 default=0,
                 variable=1,
@@ -1613,20 +1674,20 @@ end
     )
 
     @test result isa CG.GenerationResult
-    @test result.tree.root isa Procedural.FunctionDefNode
+    @test result.tree.root isa LambdaRegression.ASTs.NodeASTs.FunctionDefNode
     @test result.metadata[:sampling_nodes_used] <= 12
     @test iscompatible(
-        Procedural.infer_procedural(result.tree, result.local_const_types),
+        LambdaRegression.TypeSystem.infer_term(result.tree, result.local_const_types),
         target,
     )
     entry = result.metadata[:derivation_metadata][:function_defs][1]
     @test :recursive_type_query in entry[:used_capabilities]
 end
 
-@testitem "Procedural FunctionDef attempts share one root budget" begin
+@testitem "FunctionDef FunctionDef attempts share one root budget" begin
     using Test
     using Random
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration
     using LambdaRegression.TypeSystem: BoolTy, FloatTy, TyFun
 
     CG = CanonicalGeneration
@@ -1639,7 +1700,7 @@ end
     end
 
     policy = RejectEveryCandidate(0)
-    provider = Procedural.FunctionDefProvider(
+    provider = CanonicalGeneration.FunctionDefProvider(
         admissibility=policy,
         max_nesting=1,
         body_attempts=2,
@@ -1660,7 +1721,7 @@ end
     @test length(root_requirements) == 1
     budget = only(root_requirements)
     @test CG.generation_requirement_cache_key(budget) !== nothing
-    other_provider = Procedural.FunctionDefProvider(max_nesting=1, body_attempts=3)
+    other_provider = CanonicalGeneration.FunctionDefProvider(max_nesting=1, body_attempts=3)
     other_budget = only(CG.generation_root_requirements(
         other_provider,
         relation,
@@ -1670,11 +1731,11 @@ end
         bare_query;
         requirements=(budget, other_budget),
     )
-    @test Procedural._functiondef_attempt_budget(combined_query, provider) === budget
-    @test Procedural._functiondef_attempt_budget(combined_query, other_provider) === other_budget
+    @test CanonicalGeneration._functiondef_attempt_budget(combined_query, provider) === budget
+    @test CanonicalGeneration._functiondef_attempt_budget(combined_query, other_provider) === other_budget
 
-    twin_provider = Procedural.FunctionDefProvider(max_nesting=1, body_attempts=3)
-    other_twin_provider = Procedural.FunctionDefProvider(max_nesting=1, body_attempts=3)
+    twin_provider = CanonicalGeneration.FunctionDefProvider(max_nesting=1, body_attempts=3)
+    other_twin_provider = CanonicalGeneration.FunctionDefProvider(max_nesting=1, body_attempts=3)
     twin_budget = only(CG.generation_root_requirements(
         twin_provider,
         relation,
@@ -1691,10 +1752,10 @@ end
     )
     @test CG.generation_requirement_cache_key(twin_budget) !=
         CG.generation_requirement_cache_key(other_twin_budget)
-    @test Procedural._functiondef_attempt_budget(twin_query, twin_provider) === twin_budget
-    @test Procedural._functiondef_attempt_budget(twin_query, other_twin_provider) === other_twin_budget
+    @test CanonicalGeneration._functiondef_attempt_budget(twin_query, twin_provider) === twin_budget
+    @test CanonicalGeneration._functiondef_attempt_budget(twin_query, other_twin_provider) === other_twin_budget
 
-    layered_provider = Procedural.FunctionDefProvider(max_nesting=2, body_attempts=2)
+    layered_provider = CanonicalGeneration.FunctionDefProvider(max_nesting=2, body_attempts=2)
     layered_budget = only(CG.generation_root_requirements(
         layered_provider,
         relation,
@@ -1706,12 +1767,12 @@ end
     )
     layered_nested = CG._derive_generation_query(
         layered_root;
-        requirements=(Procedural.FunctionDefFuel(1),),
+        requirements=(CanonicalGeneration.FunctionDefFuel(1),),
     )
-    @test Procedural._functiondef_attempts_remaining(layered_root, layered_provider) == 2
-    @test Procedural._consume_functiondef_attempt!(layered_nested, layered_provider)
-    @test Procedural._functiondef_attempts_remaining(layered_nested, layered_provider) == 1
-    @test Procedural._functiondef_attempts_remaining(layered_root, layered_provider) == 2
+    @test CanonicalGeneration._functiondef_attempts_remaining(layered_root, layered_provider) == 2
+    @test CanonicalGeneration._consume_functiondef_attempt!(layered_nested, layered_provider)
+    @test CanonicalGeneration._functiondef_attempts_remaining(layered_nested, layered_provider) == 1
+    @test CanonicalGeneration._functiondef_attempts_remaining(layered_root, layered_provider) == 2
 
     query = CG._derive_generation_query(bare_query; requirements=root_requirements)
     options = NamedTuple[]
@@ -1743,9 +1804,9 @@ end
         depth_left=4,
         provider_fuel=4,
         node_budget=16,
-        requirements=(Procedural.FunctionDefSelfBinder(0),),
+        requirements=(CanonicalGeneration.FunctionDefSelfBinder(0),),
     )
-    nested_base = Procedural._functiondef_base_witness(
+    nested_base = CanonicalGeneration._functiondef_base_witness(
         provider,
         relation,
         (
@@ -1765,11 +1826,11 @@ end
         provider_fuel=4,
         node_budget=16,
         requirements=(
-            Procedural.FunctionDefSelfBinder(0),
+            CanonicalGeneration.FunctionDefSelfBinder(0),
             CG.ForbidsScopeBinder(1),
         ),
     )
-    fully_forbidden_base = Procedural._functiondef_base_witness(
+    fully_forbidden_base = CanonicalGeneration._functiondef_base_witness(
         provider,
         relation,
         (
@@ -1797,7 +1858,7 @@ end
         provider_fuel=4,
         node_budget=16,
     )
-    owned_base = Procedural._functiondef_base_witness(
+    owned_base = CanonicalGeneration._functiondef_base_witness(
         provider,
         owned_base_relation,
         (

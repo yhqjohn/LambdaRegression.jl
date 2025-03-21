@@ -1,14 +1,14 @@
 """
     search_typed_roots, search_typed_hole
 
-Small production bridge from complete `Individual` trees to the bounded
+Small production bridge from complete `Program` trees to the bounded
 `TypedSearch` island.  Source preparation and projection remain the only
 translation boundary: every objective call exports a whole tree, checks it,
 and then calls the supplied task score.  The returned candidates are owned
-`Individual` records; the compact terms and backend result are retained for
+`Program` values; the compact terms and backend result are retained for
 inspection.
 
-This first slice deliberately declines Let-App/CSE, `FunctionDefNode`, and
+This first slice deliberately declines let-like AppAbs/CSE, `FunctionDefNode`, and
 other unsupported source regions at the shared-root boundary rather than
 β-reducing them into a different program.  A local hole may retain such an
 outer complete-AST construct when the selected region itself is supported.
@@ -24,10 +24,9 @@ using ..Utils: Err
 using ..TypeSystem
 using ..TypeSystem: Ty, TyLike
 using ..ASTs.NodeASTs:
-    AstNode, AstTree, AbsNode, AppNode, ConstNode, IndexNode, LetNode, VarNode,
+    AstNode, AstTree, AbsNode, AppNode, ConstNode, FunctionDefNode, IndexNode, VarNode,
     children
-using ..Procedural: FunctionDefNode, ScopeNode
-using ..Mutations.Populations: Individual
+using ..Programs: Program, _publish_program
 using ..TypedSearch:
     Language, TypeTable, TypedTerm, TypedProposalPolicy, ScoredTerm,
     prepare_source, source_hole, prepare_root_hole, import_root_body,
@@ -123,12 +122,10 @@ function _typed_refinement_const_names!(names::Set{Symbol}, node::AstNode)
 end
 
 function _typed_refinement_unsupported(node::AstNode)
-    # CSE and Let-App both introduce an application whose function is an
+    # CSE and let-like AppAbs both introduce an application whose function is an
     # abstraction.  It is important to reject that shape before projection,
     # rather than silently β-reducing a complete ancestor.
     node isa FunctionDefNode && return :function_def
-    node isa ScopeNode && return :scope
-    node isa LetNode && return :let
     node isa AppNode && node.func isa AbsNode && return :let_app_cse
     return nothing
 end
@@ -143,25 +140,27 @@ function _typed_refinement_check_shape(node::AstNode)
     return nothing
 end
 
-function _typed_refinement_owned_ancestor(ind::Individual, index::Int,
+function _typed_refinement_owned_ancestor(program::Program, target_ty::Ty, index::Int,
                                          base_ctx::Dict{Symbol,TyLike},
                                          occupied::Set{Symbol};
                                          check_shape::Bool=true)
-    ind isa Individual || return _typed_refinement_fail(:not_individual, index)
-    ind.target_ty isa Ty || return _typed_refinement_fail(:invalid_target, index)
-    Set(keys(ind.local_consts)) == Set(keys(ind.local_consts_ty)) ||
+    Set(keys(program.local_consts)) == Set(keys(program.local_consts_ty)) ||
         return _typed_refinement_fail(:local_const_keys, index)
-    isempty(intersect(Set(keys(ind.local_consts)), Set(keys(base_ctx)))) ||
+    isempty(intersect(Set(keys(program.local_consts)), Set(keys(base_ctx)))) ||
         return _typed_refinement_fail(:local_context_collision, index)
     if check_shape
-        shape_reason = _typed_refinement_check_shape(ind.tree.root)
+        shape_reason = _typed_refinement_check_shape(program.tree.root)
         shape_reason === nothing || return _typed_refinement_fail(shape_reason, index)
     end
 
     renames = Dict{Symbol,Symbol}()
     local_consts = Dict{Symbol,Any}()
     local_consts_ty = Dict{Symbol,TyLike}()
-    names = sort!(collect(keys(ind.local_consts)); by=String)
+    # Published programs are read-only.  Rename only the declaration map;
+    # local values (including borrowed opaque resources and their aliases) are
+    # shared until a newly materialized candidate introduces edits.
+    copied_values = copy(program.local_consts)
+    names = sort!(collect(keys(program.local_consts)); by=String)
     for (serial, name) in enumerate(names)
         candidate = Symbol("__typed_bridge_local_", index, "_", serial)
         suffix = 1
@@ -171,17 +170,17 @@ function _typed_refinement_owned_ancestor(ind::Individual, index::Int,
         end
         push!(occupied, candidate)
         renames[name] = candidate
-        local_consts[candidate] = deepcopy(ind.local_consts[name])
-        local_consts_ty[candidate] = deepcopy(ind.local_consts_ty[name])
+        local_consts[candidate] = copied_values[name]
+        local_consts_ty[candidate] = program.local_consts_ty[name]
     end
-    tree = deepcopy(ind.tree)
+    tree = deepcopy(program.tree)
     isempty(renames) || (tree.root = Mutations._rename_const_nodes(tree.root, renames))
     # Reject unresolved named leaves here so custom contexts cannot defer a
     # source mistake until after a typed objective has been charged.
     names_in_tree = _typed_refinement_const_names!(Set{Symbol}(), tree.root)
     all(name -> haskey(base_ctx, name) || haskey(local_consts, name), names_in_tree) ||
         return _typed_refinement_fail(:unresolved_constant, index)
-    return (; individual=ind, tree, target_ty=ind.target_ty, local_consts,
+    return (; program, tree, target_ty, local_consts,
         local_consts_ty, context=merge(copy(base_ctx), local_consts_ty), index)
 end
 
@@ -282,9 +281,11 @@ function _typed_refinement_candidate(term::TypedTerm, language::Language,
         count_export && (counters.final_source_failures += 1)
         return checked
     end
-    return Individual(checked.tree, target_ty;
-        local_consts=deepcopy(local_consts),
-        local_consts_ty=deepcopy(local_consts_ty))
+    return _publish_program(
+        checked.index.tree,
+        Dict{Symbol,Any}(local_consts),
+        Dict{Symbol,TyLike}(local_consts_ty),
+    )
 end
 
 function _typed_refinement_materializer(term, language, hole, target_ty, context,
@@ -299,14 +300,11 @@ end
     return Tuple((node.kind, node.typeid, node.x, node.y) for node in term.nodes)
 end
 
-function _typed_refinement_original_copy(ind::Individual)
-    return Individual(
-        deepcopy(ind.tree),
-        ind.target_ty;
-        local_consts=deepcopy(ind.local_consts),
-        local_consts_ty=deepcopy(ind.local_consts_ty),
-        fitness=ind.fitness,
-        meta=deepcopy(ind.meta),
+function _typed_refinement_original_copy(program::Program)
+    return _publish_program(
+        program.tree,
+        copy(program.local_consts),
+        copy(program.local_consts_ty),
     )
 end
 
@@ -314,7 +312,7 @@ function _typed_refinement_result(raw, language, hole, target_ty, context,
                                   local_consts, local_consts_ty, options,
                                   counters, max_return::Int,
                                   seed_terms::Vector{TypedTerm},
-                                  seed_originals::Vector{Individual})
+                                  seed_originals::Vector{Program})
     raw isa Err && return raw
     entries = ScoredTerm[]
     hasproperty(raw, :frontier) && append!(entries, raw.frontier)
@@ -353,7 +351,7 @@ function _typed_refinement_result(raw, language, hole, target_ty, context,
         # complexity omits fixed binders/siblings and must not be presented as
         # whole-program complexity at this bridge.
         complexity = length(candidate.tree)
-        push!(candidates, (; individual=candidate, term=deepcopy(entry.term),
+        push!(candidates, (; program=candidate, term=deepcopy(entry.term),
             loss=Float64(entry.loss), complexity=Int(complexity),
             birth=hasproperty(entry, :birth) ? entry.birth : 0))
     end
@@ -370,7 +368,7 @@ function _typed_refinement_run(seeds::Vector{TypedTerm}, language::Language,
                                group_count::Int, max_return::Int, options,
                                counters::_TypedRefinementCounters,
                                proposal_policy, diverse_initialization::Bool,
-                               seed_originals::Vector{Individual})
+                               seed_originals::Vector{Program})
     objective = function(term::TypedTerm)
         candidate = _typed_refinement_materializer(term, language, hole,
             target_ty, context, local_consts, local_consts_ty, options, counters)
@@ -379,7 +377,7 @@ function _typed_refinement_run(seeds::Vector{TypedTerm}, language::Language,
         # Deliberately do not catch callback exceptions: they are programming or
         # task errors, while returned Err is the expected invalid-candidate path.
         applicable(score, candidate) || throw(ArgumentError(
-            "typed refinement score must accept an Individual"))
+            "typed refinement score must accept a Program"))
         return _typed_refinement_score_value(score(candidate), counters)
     end
     raw = search_nsga2(seeds, language, objective;
@@ -393,18 +391,20 @@ function _typed_refinement_run(seeds::Vector{TypedTerm}, language::Language,
 end
 
 """
-    search_typed_roots(individuals, type_context, score; arity,
+    search_typed_roots(programs, type_context, score; arity, target_ty,
                        input_types=Dict(), rng=default_rng(), max_return=4,
                        max_nodes=128, max_depth=32, group_count=1,
                        search_options...)
 
-Build one shared root interface from compatible complete ancestors.  Local
+Build one shared root interface from compatible complete programs.  Local
 constant names are deterministically made unique per ancestor, and ordinary
-boundary refusals are retained in diagnostics.  `score` receives a complete,
-owned `Individual` and returns a finite `Real` or `Err`.
+boundary refusals are retained in diagnostics.  `target_ty` is the explicit
+task target for every source program.  `score` receives a complete, owned
+`Program` and returns a finite `Real` or `Err`.
 """
-function search_typed_roots(individuals, type_context, score;
+function search_typed_roots(programs, type_context, score;
                             arity::Int,
+                            target_ty::Ty,
                             input_types=Dict(),
                             rng::AbstractRNG=default_rng(),
                             max_return::Int=4,
@@ -417,27 +417,22 @@ function search_typed_roots(individuals, type_context, score;
     arity >= 0 || throw(ArgumentError("arity must be non-negative"))
     max_return > 0 || throw(ArgumentError("max_return must be positive"))
     group_count > 0 || throw(ArgumentError("group_count must be positive"))
-    isempty(individuals) && return _typed_refinement_fail(:empty_ancestors)
+    isempty(programs) && return _typed_refinement_fail(:empty_ancestors)
     base, inputs = _typed_refinement_input_context(type_context, input_types)
     counters = _TypedRefinementCounters()
-    counters.ancestors_seen = length(individuals)
+    counters.ancestors_seen = length(programs)
     occupied = union(Set(keys(base)), Set(keys(inputs)))
     owned = Any[]
-    target = nothing
-    for (index, ancestor) in enumerate(individuals)
-        prepared = _typed_refinement_owned_ancestor(ancestor, index, base, occupied)
+    for (index, program) in enumerate(programs)
+        program isa Program || throw(ArgumentError("programs must contain Program values"))
+        prepared = _typed_refinement_owned_ancestor(program, target_ty, index, base, occupied)
         if prepared isa Err
-            counters.boundary_rejections += 1
-            continue
-        end
-        target === nothing && (target = prepared.target_ty)
-        TypeSystem.iscompatible(prepared.target_ty, target) || begin
             counters.boundary_rejections += 1
             continue
         end
         push!(owned, prepared)
     end
-    target === nothing && return _typed_refinement_fail(:no_common_root, counters)
+    isempty(owned) && return _typed_refinement_fail(:no_common_root, counters)
     options = _typed_refinement_options(length(owned), max_nodes, max_depth,
         search_options)
     language = Language(TypeTable())
@@ -445,14 +440,14 @@ function search_typed_roots(individuals, type_context, score;
     globals_registered isa Err && return globals_registered
     hole = nothing
     seeds = TypedTerm[]
-    seed_originals = Individual[]
+    seed_originals = Program[]
     all_locals = Dict{Symbol,Any}()
     all_local_types = Dict{Symbol,TyLike}()
     for prepared in owned
         merge!(all_locals, prepared.local_consts)
         merge!(all_local_types, prepared.local_consts_ty)
         if hole === nothing
-            source = prepare_source(prepared.tree, prepared.context, prepared.target_ty;
+            source = prepare_source(prepared.tree, prepared.context, target_ty;
                 max_nodes, max_depth)
             if source isa Err
                 counters.boundary_rejections += 1
@@ -465,9 +460,9 @@ function search_typed_roots(individuals, type_context, score;
             end
             hole = made.hole
             push!(seeds, made.term)
-            push!(seed_originals, _typed_refinement_original_copy(prepared.individual))
+            push!(seed_originals, _typed_refinement_original_copy(prepared.program))
         else
-            source = prepare_source(prepared.tree, prepared.context, prepared.target_ty;
+            source = prepare_source(prepared.tree, prepared.context, target_ty;
                 max_nodes, max_depth)
             if source isa Err
                 counters.boundary_rejections += 1
@@ -479,24 +474,26 @@ function search_typed_roots(individuals, type_context, score;
                 continue
             end
             push!(seeds, imported)
-            push!(seed_originals, _typed_refinement_original_copy(prepared.individual))
+            push!(seed_originals, _typed_refinement_original_copy(prepared.program))
         end
         counters.ancestors_admitted += 1
     end
     isempty(seeds) && return _typed_refinement_fail(:no_importable_root, counters)
     context = merge(base, all_local_types)
-    return _typed_refinement_run(seeds, language, hole, target, context,
+    return _typed_refinement_run(seeds, language, hole, target_ty, context,
         all_locals, all_local_types, score, rng, group_count, max_return, options,
         counters, proposal_policy, diverse_initialization, seed_originals)
 end
 
 """
-    search_typed_hole(individual, path, type_context, score; input_types=Dict(), ...)
+    search_typed_hole(program, path, type_context, score; target_ty,
+                      input_types=Dict(), ...)
 
 Search one ordinary occurrence of one fixed ancestor.  The source anchor and
 all enclosing bindings remain intact through every `export_hole` objective.
 """
-function search_typed_hole(individual::Individual, path, type_context, score;
+function search_typed_hole(program::Program, path, type_context, score;
+                           target_ty::Ty,
                            input_types=Dict(),
                            rng::AbstractRNG=default_rng(),
                            max_return::Int=4,
@@ -511,10 +508,10 @@ function search_typed_hole(individual::Individual, path, type_context, score;
     base, _ = _typed_refinement_input_context(type_context, input_types)
     counters = _TypedRefinementCounters(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     occupied = Set(keys(base))
-    prepared = _typed_refinement_owned_ancestor(individual, 1, base, occupied;
+    prepared = _typed_refinement_owned_ancestor(program, target_ty, 1, base, occupied;
         check_shape=false)
     prepared isa Err && return prepared
-    source = prepare_source(prepared.tree, prepared.context, prepared.target_ty;
+    source = prepare_source(prepared.tree, prepared.context, target_ty;
         max_nodes, max_depth)
     source isa Err && return _typed_refinement_fail(:source, source)
     hole = source_hole(source, Int[path...])
@@ -526,10 +523,10 @@ function search_typed_hole(individual::Individual, path, type_context, score;
     seed isa Err && return _typed_refinement_fail(:projection, seed)
     register_external_bindings!(hole, language)
     counters.ancestors_admitted = 1
-    seed_originals = Individual[_typed_refinement_original_copy(individual)]
+    seed_originals = Program[_typed_refinement_original_copy(program)]
     options = _typed_refinement_options(1, max_nodes, max_depth, search_options)
     return _typed_refinement_run(TypedTerm[seed], language, hole,
-        prepared.target_ty, prepared.context, prepared.local_consts,
+        target_ty, prepared.context, prepared.local_consts,
         prepared.local_consts_ty, score, rng, group_count, max_return, options,
         counters, proposal_policy, diverse_initialization, seed_originals)
 end
@@ -538,24 +535,24 @@ end
     using Test
     using Random: MersenneTwister
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: search_typed_roots, TypedRefinementResult
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
-    first = Individual(AstTree(AbsNode(:x, ConstNode(:c1))), TyFun(FloatTy, FloatTy);
+    first = Program(AstTree(AbsNode(:x, ConstNode(:c1)));
         local_consts=Dict{Symbol,Any}(:c1 => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:c1 => FloatTy))
-    second = Individual(AstTree(AbsNode(:x, ConstNode(:c1))), TyFun(FloatTy, FloatTy);
+    second = Program(AstTree(AbsNode(:x, ConstNode(:c1)));
         local_consts=Dict{Symbol,Any}(:c1 => 2.0),
         local_consts_ty=Dict{Symbol,TyLike}(:c1 => FloatTy))
     result = search_typed_roots([first, second], Dict{Symbol,TyLike}(), _ -> 0.0;
-        arity=1, rng=MersenneTwister(1111),
+        arity=1, target_ty=TyFun(FloatTy, FloatTy), rng=MersenneTwister(1111),
         attempts=0, evaluations=8, population_size=2)
     @test result isa TypedRefinementResult
     @test length(result.candidates) >= 1
     values = Float64[
-        c.individual.local_consts[:c1]
+        c.program.local_consts[:c1]
         for c in result.candidates
-        if haskey(c.individual.local_consts, :c1)
+        if haskey(c.program.local_consts, :c1)
     ]
     @test 1.0 in values
     @test 2.0 in values
@@ -565,16 +562,17 @@ end
 @testitem "typed refinement local hole preserves captured binder" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: search_typed_hole, TypedRefinementResult
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
     tree = AstTree(AbsNode(:x, AbsNode(:y, IndexNode(1))))
-    ind = Individual(tree, TyFun(FloatTy, TyFun(FloatTy, FloatTy)))
+    ind = Program(tree)
     result = search_typed_hole(ind, [1], Dict{Symbol,TyLike}(), _ -> 0.0;
+        target_ty=TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
         attempts=0, evaluations=4, population_size=1)
     @test result isa TypedRefinementResult
     @test !isempty(result.candidates)
-    candidate = first(result.candidates).individual
+    candidate = first(result.candidates).program
     @test candidate.tree.root isa AbsNode
     @test candidate.tree.root.body isa AbsNode
     @test candidate.tree.root.body.body isa IndexNode
@@ -584,76 +582,74 @@ end
 @testitem "typed refinement rejects CSE and separates callback accounting" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: search_typed_roots, TypedRefinementError
     using LambdaRegression.Utils: Err
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
-    cse = Individual(AstTree(AppNode(AbsNode(:x, IndexNode(0)), ConstNode(:one))),
-        FloatTy; local_consts=Dict{Symbol,Any}(),
+    cse = Program(AstTree(AppNode(AbsNode(:x, IndexNode(0)), ConstNode(:one)));
+        local_consts=Dict{Symbol,Any}(),
         local_consts_ty=Dict{Symbol,TyLike}())
     rejected = search_typed_roots([cse], Dict{Symbol,TyLike}(:one => FloatTy), _ -> 0.0;
-        arity=0)
+        arity=0, target_ty=FloatTy)
     @test rejected isa Err
     calls = Ref(0)
-    seed = Individual(AstTree(ConstNode(:one)), FloatTy)
+    seed = Program(AstTree(ConstNode(:one)))
     result = search_typed_roots([seed], Dict{Symbol,TyLike}(:one => FloatTy), ind ->
-        (calls[] += 1; 0.0); arity=0, attempts=0, evaluations=2, population_size=1)
+        (calls[] += 1; 0.0); arity=0, target_ty=FloatTy,
+        attempts=0, evaluations=2, population_size=1)
     @test result.diagnostics.score_calls == calls[]
     @test result.diagnostics.objective_calls >= result.diagnostics.score_calls
-    @test all(c -> c.individual !== seed, result.candidates)
+    @test all(c -> c.program !== seed, result.candidates)
 end
 
 @testitem "typed refinement propagates score callback exceptions" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: search_typed_hole
     using LambdaRegression.TypeSystem: FloatTy, TyFun
-    ind = Individual(AstTree(AbsNode(:x, IndexNode(0))), TyFun(FloatTy, FloatTy))
+    ind = Program(AstTree(AbsNode(:x, IndexNode(0))))
     @test_throws DomainError search_typed_hole(ind, Int[], Dict(), _ -> throw(DomainError(:test));
-        attempts=0, evaluations=1, population_size=1)
+        target_ty=TyFun(FloatTy, FloatTy), attempts=0, evaluations=1, population_size=1)
 end
 
 @testitem "typed local holes retain unsupported complete-AST siblings" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: search_typed_hole, TypedRefinementResult
-    using LambdaRegression.Procedural: FunctionDefNode
+    using LambdaRegression.ASTs.NodeASTs: FunctionDefNode
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
-    cse = Individual(
-        AstTree(AppNode(AbsNode(:z, IndexNode(0)), ConstNode(:one))), FloatTy,
-    )
+    cse = Program(AstTree(AppNode(AbsNode(:z, IndexNode(0)), ConstNode(:one))))
     cse_result = search_typed_hole(cse, [1, 1], Dict{Symbol,TyLike}(:one => FloatTy),
-        _ -> 0.0; attempts=0, evaluations=1, population_size=1)
+        _ -> 0.0; target_ty=FloatTy, attempts=0, evaluations=1, population_size=1)
     @test cse_result isa TypedRefinementResult
-    @test cse_result.candidates[1].individual.tree.root isa AppNode
-    @test cse_result.candidates[1].individual.tree.root.func isa AbsNode
+    @test cse_result.candidates[1].program.tree.root isa AppNode
+    @test cse_result.candidates[1].program.tree.root.func isa AbsNode
 
-    recursive = Individual(
-        AstTree(FunctionDefNode(AbsNode(:x, IndexNode(0)))), TyFun(FloatTy, FloatTy),
-    )
+    recursive = Program(AstTree(FunctionDefNode(AbsNode(:x, IndexNode(0)))))
     recursive_result = search_typed_hole(recursive, [1, 1], Dict{Symbol,TyLike}(),
-        _ -> 0.0; attempts=0, evaluations=1, population_size=1)
+        _ -> 0.0; target_ty=TyFun(FloatTy, FloatTy),
+        attempts=0, evaluations=1, population_size=1)
     @test recursive_result isa TypedRefinementResult
-    @test recursive_result.candidates[1].individual.tree.root isa FunctionDefNode
+    @test recursive_result.candidates[1].program.tree.root isa FunctionDefNode
 end
 
 @testitem "typed bridge registers real primitive leaves and runs N1" begin
     using Test
     using Random: MersenneTwister
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: search_typed_roots, TypedRefinementResult
-    using LambdaRegression.TypeSystem: FADD, FloatTy, TyFun, TyLike, get_type
-    seed = Individual(
-        AstTree(AbsNode(:x, AppNode(AppNode(ConstNode(:FADD), IndexNode(0)),
-            IndexNode(0)))), TyFun(FloatTy, FloatTy),
-    )
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, get_type
+    using LambdaRegression.Primitives: FADD
+    seed = Program(AstTree(AbsNode(:x, AppNode(AppNode(ConstNode(:FADD), IndexNode(0)),
+            IndexNode(0)))))
     seen = Ref(false)
     result = search_typed_roots([seed], Dict{Symbol,TyLike}(:FADD => get_type(FADD)),
         ind -> (seen[] = any(node -> node isa ConstNode && node.name == :FADD,
-            ind.tree); 0.0); arity=1, rng=MersenneTwister(2000),
+            ind.tree); 0.0);
+        arity=1, target_ty=TyFun(FloatTy, FloatTy), rng=MersenneTwister(2000),
         attempts=1, evaluations=4, population_size=1, max_nodes=32, max_depth=8)
     @test result isa TypedRefinementResult
     @test seen[]
@@ -663,20 +659,20 @@ end
 @testitem "typed root bridge preserves input positions" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: search_typed_roots, TypedRefinementResult
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
     target = TyFun(FloatTy, TyFun(FloatTy, FloatTy))
-    first = Individual(AstTree(AbsNode(:a, AbsNode(:b, IndexNode(1)))), target)
-    second = Individual(AstTree(AbsNode(:u, AbsNode(:v, IndexNode(0)))), target)
+    first = Program(AstTree(AbsNode(:a, AbsNode(:b, IndexNode(1)))))
+    second = Program(AstTree(AbsNode(:u, AbsNode(:v, IndexNode(0)))))
     result = search_typed_roots([first, second], Dict{Symbol,TyLike}(), _ -> 0.0;
-        arity=2, attempts=0, evaluations=4, population_size=2)
+        arity=2, target_ty=target, attempts=0, evaluations=4, population_size=2)
     @test result isa TypedRefinementResult
-    indices = [candidate.individual.tree.root.body.body.index
+    indices = [candidate.program.tree.root.body.body.index
                for candidate in result.candidates
-               if candidate.individual.tree.root isa AbsNode &&
-                  candidate.individual.tree.root.body isa AbsNode &&
-                  candidate.individual.tree.root.body.body isa IndexNode]
+               if candidate.program.tree.root isa AbsNode &&
+                  candidate.program.tree.root.body isa AbsNode &&
+                  candidate.program.tree.root.body.body isa IndexNode]
     @test 0 in indices
     @test 1 in indices
 end

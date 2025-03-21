@@ -1,4 +1,4 @@
-const CG = CanonicalGeneration
+const CG = @__MODULE__
 
 """Finite candidate passed to an injected FunctionDef admissibility policy."""
 struct FunctionDefCandidate
@@ -1058,8 +1058,8 @@ function CG.materialize_generation_derivation(
     return FunctionDefNode(body)
 end
 
-"""Post-generation failure when public procedural inference disagrees with the demand."""
-struct ProceduralGenerationVerificationError
+"""Post-generation failure when public type inference disagrees with the demand."""
+struct FunctionDefGenerationVerificationError
     expected::TyLike
     inferred
 end
@@ -1084,7 +1084,10 @@ end
 struct _DefaultFunctionDefProvider end
 const _DEFAULT_FUNCTIONDEF_PROVIDER = _DefaultFunctionDefProvider()
 
-function _with_functiondef_provider(config::CG.GenerationConfig, selection)
+function with_functiondef_provider(
+    config::CG.GenerationConfig,
+    selection=_DEFAULT_FUNCTIONDEF_PROVIDER,
+)
     existing = Tuple(provider for provider in config.providers if provider isa FunctionDefProvider)
     retained = Tuple(provider for provider in config.providers if !(provider isa FunctionDefProvider))
     providers = if selection isa _DefaultFunctionDefProvider
@@ -1124,7 +1127,25 @@ function _require_genuine_self_call(provider::FunctionDefProvider)
 end
 
 function _verification_context(result, kwargs)
-    context = Dict{Symbol,TyLike}(result.local_const_types)
+    empty_values = Dict{Symbol,Any}()
+    empty_types = Dict{Symbol,Any}()
+    global_types = CG._typed_context(
+        get(kwargs, :global_consts, empty_values),
+        get(kwargs, :global_consts_ty, empty_types),
+    )
+    local_types = CG._typed_context(
+        get(kwargs, :local_consts, empty_values),
+        get(kwargs, :local_consts_ty, empty_types),
+    )
+    preset_types = CG._typed_presets(
+        get(kwargs, :presets, empty_values),
+        get(kwargs, :preset_types, empty_types);
+        global_consts_ty=global_types,
+        local_consts_ty=local_types,
+    )
+    context = merge(global_types, local_types, preset_types)
+    # Explicit declarations retain their precedence over inferred contexts,
+    # while names materialized into this result remain authoritative.
     for key in (:global_consts_ty, :local_consts_ty, :preset_types)
         source = get(kwargs, key, nothing)
         source === nothing && continue
@@ -1132,6 +1153,7 @@ function _verification_context(result, kwargs)
             ty isa TyLike && (context[name] = ty)
         end
     end
+    merge!(context, result.local_const_types)
     return context
 end
 
@@ -1148,79 +1170,84 @@ function _close_scoped_verification(tree::AstTree, target_ty::TyLike, scope_tys)
     return AstTree(root), expected
 end
 
-function _verify_procedural_generation(
+function _verify_functiondef_result(
     result,
     target_ty;
-    fixed_point,
     kwargs,
     scope_tys=Ty[],
 )
     result isa CG.GenerationResult || return result
-    result.metadata[:procedural_generation] = true
-    result.metadata[:functiondef_observations] =
-        functiondef_recursion_observations(result.tree)
-    if !_contains_procedural_node(result.tree.root)
-        result.metadata[:procedural_verification] = :not_needed
+    if !_contains_functiondef(result.tree.root)
+        result.metadata[:functiondef_verification] = :not_needed
         return result
     end
+    result.metadata[:functiondef_observations] =
+        functiondef_recursion_observations(result.tree)
     verification_tree, expected = _close_scoped_verification(result.tree, target_ty, scope_tys)
-    inferred = infer_procedural(
+    inferred = TypeSystem.infer_term(
         verification_tree,
         _verification_context(result, kwargs);
-        fixed_point,
     )
     inferred isa Err && return inferred
     TypeSystem.iscompatible(inferred, expected) ||
-        return Err(ProceduralGenerationVerificationError(expected, inferred))
-    result.metadata[:procedural_verification] = :verified
+        return Err(FunctionDefGenerationVerificationError(expected, inferred))
+    result.metadata[:functiondef_verification] = :verified
     return result
 end
 
-function _contains_procedural_node(node::AstNode)
-    node isa Union{ScopeNode,FunctionDefNode} && return true
-    return any(_contains_procedural_node, children(node))
+function _functiondef_verification_required(config::CG.GenerationConfig, presets)
+    config.materializer isa CG.DefaultAstMaterializer || return true
+    config.sampler isa CG.WeightedDerivationSampler || return true
+    config.argument_planner isa CG.DefaultArgumentPlanner || return true
+    all(_known_core_provider_without_functiondef, config.providers) || return true
+    for preset in values(presets)
+        node = preset isa AstTree ? preset.root : preset
+        if node isa AstNode
+            _contains_functiondef(node) && return true
+        elseif !(node isa Union{Number,Symbol,AbstractString,Char,Bool,Nothing,Missing})
+            # An unfamiliar preset wrapper may carry an AST that can be
+            # materialized by a provider, so do not use the no-scan shortcut.
+            return true
+        end
+    end
+    return false
 end
 
-"""Generate with an opt-in guarded FunctionDef provider and public post-verification."""
-function generate_procedural(
-    target_ty::TyLike;
-    functiondef_provider=_DEFAULT_FUNCTIONDEF_PROVIDER,
-    fixed_point=fixed_point_witness,
-    config=nothing,
-    kwargs...,
+_known_core_provider_without_functiondef(provider::CG.SafeListAccessProvider) =
+    isempty(provider.source_collectors)
+
+_known_core_provider_without_functiondef(provider) = provider isa Union{
+    CG.ContextHeadProvider,
+    CG.NilFactoryProvider,
+    CG.TypedValueFactoryProvider,
+    CG.ToListProvider,
+    CG.AMapProvider,
+    CG.GuardedExpansionProvider,
+    CG.WeightTagProvider,
+}
+
+function _finalize_functiondef_result(
+    result,
+    target_ty;
+    kwargs,
+    scope_tys=Ty[],
+    verification_required::Bool=true,
 )
-    base_config = config === nothing ? _generation_config_from_kwargs(kwargs) : config
-    base_config isa CG.GenerationConfig || throw(ArgumentError("config must be GenerationConfig"))
-    effective = _with_functiondef_provider(base_config, functiondef_provider)
-    _validate_functiondef_sampling_config(effective)
-    result = CG.generate_canonical(target_ty; kwargs..., config=effective)
-    return _verify_procedural_generation(result, target_ty; fixed_point, kwargs)
+    result isa CG.GenerationResult || return result
+    if !verification_required
+        result.metadata[:functiondef_verification] = :not_needed
+        return result
+    end
+    return _verify_functiondef_result(result, target_ty; kwargs, scope_tys)
 end
 
-"""Scoped companion to [`generate_procedural`](@ref); scope is inner to outer."""
-function generate_procedural_scoped(
-    target_ty::TyLike;
-    scope_tys::AbstractVector{<:Ty}=Ty[],
-    functiondef_provider=_DEFAULT_FUNCTIONDEF_PROVIDER,
-    fixed_point=fixed_point_witness,
-    config=nothing,
-    kwargs...,
-)
-    base_config = config === nothing ? _generation_config_from_kwargs(kwargs) : config
-    base_config isa CG.GenerationConfig || throw(ArgumentError("config must be GenerationConfig"))
-    effective = _with_functiondef_provider(base_config, functiondef_provider)
-    _validate_functiondef_sampling_config(effective)
-    result = CG.generate_canonical_scoped(
-        target_ty;
-        scope_tys,
-        kwargs...,
-        config=effective,
-    )
-    return _verify_procedural_generation(result, target_ty; fixed_point, kwargs, scope_tys)
+function _contains_functiondef(node::AstNode)
+    node isa FunctionDefNode && return true
+    return any(_contains_functiondef, children(node))
 end
 
 """
-    generate_finite_procedural_scoped(target_ty::Ty; scope_tys=Ty[], kwargs...)
+    generate_finite_canonical_scoped(target_ty::Ty; scope_tys=Ty[], kwargs...)
 
 Return one finite core witness while retaining equirecursive target and scope
 support. The witness query masks `:function_def`, `:fixed_point`, and `:opaque`
@@ -1228,16 +1255,15 @@ capabilities transitively, so this entry can observe a finite `μ` graph without
 constructing a recursive definition. It is primarily useful as the finite side
 of FunctionDef removal and body replacement.
 """
-function generate_finite_procedural_scoped(
+function generate_finite_canonical_scoped(
     target_ty::Ty;
     scope_tys::AbstractVector{<:Ty}=Ty[],
-    fixed_point=fixed_point_witness,
     config=nothing,
     kwargs...,
 )
     base_config = config === nothing ? _generation_config_from_kwargs(kwargs) : config
     base_config isa CG.GenerationConfig || throw(ArgumentError("config must be GenerationConfig"))
-    effective = _with_functiondef_provider(base_config, nothing)
+    effective = with_functiondef_provider(base_config, nothing)
     scope = Ty[scope_tys...]
 
     local_consts = get(kwargs, :local_consts, Dict{Symbol,Any}())
@@ -1297,20 +1323,23 @@ function generate_finite_procedural_scoped(
             :forced_finite_witness => true,
         ),
     )
-    return _verify_procedural_generation(
+    return _finalize_functiondef_result(
         result,
         target_ty;
-        fixed_point,
         kwargs,
         scope_tys=scope,
+        verification_required=_functiondef_verification_required(
+            effective,
+            get(kwargs, :presets, Dict{Symbol,Any}()),
+        ),
     )
 end
 
 """
-    generate_recursive_functiondef_scoped(target_ty::Ty; scope_tys=Ty[], kwargs...)
+    generate_functiondef_root_scoped(target_ty::Ty; scope_tys=Ty[], kwargs...)
 
 Generate one guarded, genuinely self-using [`FunctionDefNode`](@ref) at the
-root. Unlike [`generate_procedural_scoped`](@ref), this entry does not route
+root. Unlike [`generate_canonical_scoped`](@ref), this entry does not route
 between ordinary core terms and FunctionDef: selecting it explicitly forces the
 existing [`FunctionDefProvider`](@ref) protocol, including its finite base
 witness, nesting fuel, shared attempt budget, and admissibility check.
@@ -1319,18 +1348,17 @@ witness, nesting fuel, shared attempt budget, and admissibility check.
 configuration are injectable; caller-owned RNG and constant containers are
 forwarded unchanged.
 """
-function generate_recursive_functiondef_scoped(
+function generate_functiondef_root_scoped(
     target_ty::Ty;
     scope_tys::AbstractVector{<:Ty}=Ty[],
     functiondef_provider::FunctionDefProvider=FunctionDefProvider(),
-    fixed_point=fixed_point_witness,
     config=nothing,
     kwargs...,
 )
     functiondef_provider = _require_genuine_self_call(functiondef_provider)
     base_config = config === nothing ? _generation_config_from_kwargs(kwargs) : config
     base_config isa CG.GenerationConfig || throw(ArgumentError("config must be GenerationConfig"))
-    effective = _with_functiondef_provider(base_config, functiondef_provider)
+    effective = with_functiondef_provider(base_config, functiondef_provider)
     _validate_functiondef_sampling_config(effective)
     CG._generation_target_supported(target_ty, effective) ||
         return Err(CG.UnsupportedCanonicalGenerationTarget(target_ty))
@@ -1387,7 +1415,6 @@ function generate_recursive_functiondef_scoped(
                 scope,
                 result_local_consts,
                 result_local_const_types,
-                fixed_point,
                 kwargs,
             )
         finally
@@ -1415,7 +1442,6 @@ function generate_recursive_functiondef_scoped(
         scope,
         result_local_consts,
         result_local_const_types,
-        fixed_point,
         kwargs,
     )
 end
@@ -1428,7 +1454,6 @@ function _generate_forced_functiondef_result(
     scope,
     result_local_consts,
     result_local_const_types,
-    fixed_point,
     kwargs,
 )
     state = CG.DerivationSamplingState(effective.rng, effective.sampling_node_budget)
@@ -1498,10 +1523,9 @@ function _generate_forced_functiondef_result(
         result_local_const_types,
         metadata,
     )
-    return _verify_procedural_generation(
+    return _verify_functiondef_result(
         result,
         target_ty;
-        fixed_point,
         kwargs,
         scope_tys=scope,
     )

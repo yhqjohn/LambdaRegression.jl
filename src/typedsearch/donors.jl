@@ -9,9 +9,8 @@ therefore retain their declared runtime meanings.
 """
 
 using ..ASTs.NodeASTs:
-    AstNode, AstTree, AbsNode, AppNode, ConstNode, IndexNode, VarNode, LetNode,
+    AstNode, AstTree, AbsNode, AppNode, ConstNode, FunctionDefNode, IndexNode, VarNode,
     children
-using ..Procedural: FunctionDefNode, ScopeNode
 import ..TypeSystem
 
 export SourceProgram, register_program!, admit_program_donor!, written_complexity,
@@ -126,12 +125,8 @@ function _expand_source_node(n::AstNode, language::Language, max_nodes::Int,
         return AbsNode(n.name, copied[1])
     elseif n isa AppNode
         return AppNode(copied[1], copied[2])
-    elseif n isa LetNode
-        return LetNode(n.name, copied[1], copied[2])
     elseif n isa FunctionDefNode
         return FunctionDefNode(copied[1])
-    elseif n isa ScopeNode
-        return ScopeNode(copied[1:end-1], copied[end])
     end
     return Err(SourceBoundaryError(:unsupported_region, 0))
 end
@@ -273,13 +268,13 @@ function register_program!(language::Language, name::Symbol, tree::AstTree,
             end
     end
     # Source size is bounded before changing any existing source-constant leaf.
-    expanded_size = _expanded_source_size(source.tree.root, language,
+    expanded_size = _expanded_source_size(source.index.tree.root, language,
         Set{Symbol}([name]), max_expanded_size, max_depth)
     expanded_size isa Err && begin
         resize!(language.leaves, initial_leaves)
         return expanded_size
     end
-    program = SourceProgram(name, source.tree, imported, root_typeid,
+    program = SourceProgram(name, source.index.tree, imported, root_typeid,
         source.root_type, constants, provenance, Int(expanded_size))
     # Prefer replacing the existing same-name constant at the exact committed
     # type.  A same-name donor at another type is rejected above, so the leaf
@@ -309,7 +304,8 @@ admit_program_donor!(args...; kwargs...) = register_program!(args...; kwargs...)
 @testitem "TypedSearch closed program donors preserve export and direct evaluation" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Procedural: evaluate_procedural, FunctionDefNode
+    using LambdaRegression.ASTs.NodeASTs: FunctionDefNode
+    using LambdaRegression.Execution: evaluate_native
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, TyMu, newtyvar
     using LambdaRegression.TypedSearch
     using LambdaRegression.TypedSearch: SourceConstant
@@ -337,7 +333,7 @@ admit_program_donor!(args...; kwargs...) = register_program!(args...; kwargs...)
     # Nested donor materialisation is guarded by the shared source-expansion
     # depth check; export may report that helper's reason directly.
     @test bounded_export.value.reason in (:export_depth, :program_depth)
-    @test evaluate_procedural(exported, Dict{Symbol,Any}(
+    @test evaluate_native(exported, Dict{Symbol,Any}(
         :inc => x -> x + 1, :one => 2, :law => 0,
     )) == 3
 
@@ -352,7 +348,8 @@ end
 @testitem "TypedSearch donor expansion is bounded and capture-safe" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Procedural: evaluate_procedural, FunctionDefNode
+    using LambdaRegression.ASTs.NodeASTs: FunctionDefNode
+    using LambdaRegression.Execution: evaluate_native
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, TyMu, newtyvar
     using LambdaRegression.TypedSearch
     using LambdaRegression.TypedSearch: SourceConstant
@@ -380,7 +377,7 @@ end
     term = import_hole(hole, language)
     rebuilt = export_hole(term, language, hole)
     @test rebuilt isa AstTree
-    @test evaluate_procedural(rebuilt, Dict{Symbol,Any}(); args=(1, 7)) == 7
+    @test evaluate_native(rebuilt, Dict{Symbol,Any}(); args=(1, 7)) == 7
 
     outer_target = prepare_source(AstTree(ConstNode(:outer)),
         Dict{Symbol,TyLike}(:outer => int_to_int), int_to_int)

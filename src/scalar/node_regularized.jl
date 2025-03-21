@@ -12,6 +12,31 @@ struct _NodeScalarCandidate
     complexity::Int
 end
 
+# These are the default scalar-tree weights in SymbolicRegression.jl v1.13.4.
+# `form_connection` and `break_connection` are GraphNode-only and therefore
+# intentionally have no DynamicExpressions analogue. `optimize` stays at zero:
+# constant refinement has an independent budget and accounting here.
+const _REGULARIZED_MUTATION_WEIGHTS = (
+    # SymbolicRegression.jl v1.13.4 Options() defaults (normalized only when
+    # sampled; keep the source-scale values unchanged).
+    mutate_constant=0.0346,
+    mutate_operator=0.293,
+    swap_operands=0.198,
+    rotate_tree=4.26,
+    add_node=2.47,
+    insert_node=0.0112,
+    delete_node=0.870,
+    simplify=0.00209,
+    randomize=0.000502,
+    do_nothing=0.273,
+    optimize=0.0,
+)
+
+const _REGULARIZED_MUTATION_NAMES = (
+    :constant, :operator, :swap, :rotate, :add, :insert, :delete,
+    :simplify, :restart, :do_nothing, :optimize,
+)
+
 struct _NodeScalarAnchor
     node::DynamicExpressions.Node{Float64}
     parent::Union{Nothing,DynamicExpressions.Node{Float64}}

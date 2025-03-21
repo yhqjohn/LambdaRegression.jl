@@ -3,18 +3,17 @@
 
 Population-level variation interfaces, typed recombination, and donor sampling.
 
-This submodule provides minimal `Individual`/`Population` containers and typed
-binary recombination. `TypedSubtreeSwapCrossover` analyzes each parent once,
+This submodule provides typed binary recombination over immutable `Program`
+payloads. `TypedSubtreeSwapCrossover` analyzes each parent once,
 routes a finite set of type- and scope-compatible site pairs without
 replacement, and returns two children only when both validate and both are
 genuine changes. Parent trees and constant dictionaries are never modified.
 
 The directional `recombine` seam uses exact demand-from-offer retrieval,
 binder-aware transport, and complete-child validation for ordinary lambda and
-first-class `FunctionDef` terms. The older binary `crossover` seam remains
-available; `AutoTypedCrossover` composes two directional calls for the default
-Regression path. Unsupported IR nodes such as `ScopeNode` have no implicit
-compatibility route.
+first-class `FunctionDef` terms. The binary `crossover` seam validates both
+children atomically. Unsupported extension nodes have no implicit compatibility
+route.
 
 `DonorPool` is a separate bounded sampling layer. It stores explicit fragment
 paths from caller-selected individuals and supports uniform or adaptive
@@ -91,49 +90,21 @@ using ...TypeSystem: Ty, TyLike
 using ...Utils: Err
 import ..prune_local_consts!
 
-export Individual, Population
+using ...Programs: Program
+
+export Program
 export AbstractCrossover, crossover, recombine
 export AbstractCrossoverSelectionPolicy, UniformCrossoverSelectionPolicy
 export CrossoverSite, PathCrossoverSelectionPolicy
 export crossover_site_weight, crossover_pair_weight
 export TypedSubtreeSwapCrossover, CrossoverPairPoolExhaustedErr
+export IndependentCrossover
 export NoEligibleCrossoverPairErr
 export CrossoverAnswerBudgetExhaustedErr
 export DonorPool, DonorPoolConfig, DonorPoolOutcome, DonorPoolSelection
 export DonorPoolAttempt, EmptyDonorPoolErr
 export admit_donor!, admit_random_donors!, sample_donor, record_outcome!
 export donor_pool_stats, donor_weights, recombine_from_pool
-export prune!
-
-"""
-    Individual
-
-Minimal individual container for population-based runs.
-"""
-struct Individual
-    tree::AstTree
-    target_ty::Ty
-    local_consts::Dict{Symbol,Any}
-    local_consts_ty::Dict{Symbol,TyLike}
-    fitness::Union{Nothing,Float64}
-    meta::NamedTuple
-end
-
-function Individual(tree::AstTree, target_ty::Ty;
-    local_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
-    local_consts_ty::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
-    fitness::Union{Nothing,Float64}=nothing,
-    meta::NamedTuple=(;),
-)
-    return Individual(tree, target_ty, local_consts, local_consts_ty, fitness, meta)
-end
-
-"""
-    Population(individuals)
-"""
-struct Population
-    individuals::Vector{Individual}
-end
 
 """
     AbstractCrossover
@@ -143,49 +114,51 @@ Interface for binary recombination between two individuals.
 abstract type AbstractCrossover end
 
 """
-    crossover(op::AbstractCrossover, a::Individual, b::Individual; rng, kwargs...) -> Union{Tuple{Individual,Individual},Err}
+    crossover(op::AbstractCrossover, a::Program, b::Program;
+        target_a, target_b, rng, kwargs...) -> Union{Tuple{Program,Program},Err}
 
-Apply crossover to produce (typically) two offspring from parents `a` and `b`.
-Implementations must preserve the individuals' `target_ty` constraints.
+Apply crossover to produce (typically) two offspring from programs `a` and `b`.
+Root requirements are explicit because they belong to the surrounding task.
 """
-function crossover(::AbstractCrossover, ::Individual, ::Individual; rng::AbstractRNG=MersenneTwister(2000), kwargs...)
+function crossover(
+    ::AbstractCrossover,
+    ::Program,
+    ::Program;
+    target_a::Ty,
+    target_b::Ty,
+    rng::AbstractRNG=MersenneTwister(2000),
+    kwargs...,
+)
     error("crossover not implemented")
 end
 
 """
-    recombine(op::AbstractCrossover, recipient::Individual, donor::Individual;
-        rng=MersenneTwister(2000), kwargs...) -> Individual or Err
+    recombine(op::AbstractCrossover, recipient::Program, donor::Program;
+        recipient_target, donor_target, rng=MersenneTwister(2000), kwargs...) -> Program or Err
 
 Apply the one-way population recombination seam.  `recipient` supplies the
-target site and target type; `donor` supplies the fragment.  Concrete
+target program and `recipient_target` supplies its root requirement; `donor`
+supplies the fragment and `donor_target` its own root requirement. Concrete
 operators implement the semantics for the variation family they support.
 The existing [`crossover`](@ref) tuple interface remains independent of this
 directional seam.
 """
 function recombine(
     ::AbstractCrossover,
-    ::Individual,
-    ::Individual;
+    ::Program,
+    ::Program;
+    recipient_target::Ty,
+    donor_target::Ty,
     rng::AbstractRNG=MersenneTwister(2000),
     kwargs...,
 )
     error("recombine not implemented")
 end
 
-"""
-    prune!(ind::Individual) -> Nothing
-
-Prune unreferenced local constants for this individual.
-"""
-function prune!(ind::Individual)
-    prune_local_consts!(ind.tree, ind.local_consts, ind.local_consts_ty)
-    return nothing
-end
-
 include("TypedCrossoverRetrieval.jl")
 include("ScopedRetrievalSolver.jl")
 include("OpenTypedRetrieval.jl")
-include("TypedCrossoverSnapshot.jl")
+include("ProgramAnalysisCrossover.jl")
 include("SnapshotOpenRetrieval.jl")
 include("TypedCrossoverTransport.jl")
 include("PopulationCrossover.jl")

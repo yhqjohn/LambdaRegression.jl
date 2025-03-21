@@ -400,7 +400,7 @@ end
     quantified = fresh(0)
     ctx = merge(
         TypeSystem.get_type_ctx(Dict{Symbol,Any}(
-            :PAIR => TypeSystem.PAIR,
+            :PAIR => LambdaRegression.Primitives.PAIR,
             :one => 1,
             :truth => true,
         )),
@@ -588,15 +588,12 @@ end
         end
         node
     end
-    dag_elapsed = @elapsed begin
-        @test TypeSystem.isequal_mu(non_sibling_dag, non_sibling_dag)
-        equality_graph = TypeSystem._mu_eq_graph(non_sibling_dag)
-        @test length(equality_graph.nodes) <= 160
-        unification_graph = TypeSystem._TypeGraph()
-        TypeSystem._elaborate_graph!(unification_graph, non_sibling_dag)
-        @test length(unification_graph.nodes) <= 160
-    end
-    @test dag_elapsed < 1.0
+    @test TypeSystem.isequal_mu(non_sibling_dag, non_sibling_dag)
+    equality_graph = TypeSystem._mu_eq_graph(non_sibling_dag)
+    @test length(equality_graph.nodes) <= 160
+    unification_graph = TypeSystem._TypeGraph()
+    TypeSystem._elaborate_graph!(unification_graph, non_sibling_dag)
+    @test length(unification_graph.nodes) <= 160
 
     quantified = fresh(0)
     counted_dag = let node = quantified
@@ -617,7 +614,20 @@ end
     counted_visits[] = 0
     counted_key = TypeSystem.typekey(counted_dag)
     @test counted_visits[] <= 14
-    @test (@elapsed hash(counted_key)) < 0.5
+    # The key stores a flat DAG table; hash work is bounded by these records,
+    # not by recursively expanding the shared input tree.
+    key_records = counted_key[4]
+    @test length(key_records) <= 15
+    @test all(
+        record -> all(child -> 1 <= child <= length(key_records), record[3]),
+        key_records,
+    )
+    counted_hash = hash(counted_key)
+    counted_visits[] = 0
+    repeated_key = TypeSystem.typekey(counted_dag)
+    @test counted_visits[] <= 14
+    @test repeated_key == counted_key
+    @test hash(repeated_key) == counted_hash
 
     recursive_quantified = fresh(0)
     recursive_binder = fresh(0)
@@ -647,7 +657,10 @@ end
         end
         node
     end
-    @test (@elapsed TypeSystem._mu_eq_graph(long_chain)) < 0.5
+    # A 1024-deep chain may add a repeated leaf record at each level, but must
+    # still elaborate to a linear number of nodes.
+    long_chain_graph = TypeSystem._mu_eq_graph(long_chain)
+    @test length(long_chain_graph.nodes) <= 2 * 1024 + 1
 
     immutable_chain = let node = int_ty
         for _ in 1:1024
@@ -655,7 +668,8 @@ end
         end
         node
     end
-    @test (@elapsed TypeSystem._mu_eq_graph(immutable_chain)) < 0.5
+    immutable_chain_graph = TypeSystem._mu_eq_graph(immutable_chain)
+    @test length(immutable_chain_graph.nodes) <= 2 * 1024 + 1
 
     long_cycle = cycle(fill(int_ty, 257))
     doubled_cycle = cycle(fill(int_ty, 514))

@@ -337,7 +337,6 @@ function _snapshot_donor_signature(site)
 end
 
 function _snapshot_site_list(input)
-    hasproperty(input, :sites) && return collect(getproperty(input, :sites))
     input isa AbstractVector && return collect(input)
     hasproperty(input, :demand) && return [input]
     throw(ArgumentError("expected a lexical snapshot, site, or site vector"))
@@ -350,7 +349,7 @@ function _snapshot_open_retrieval_bounded(
     max_answers::Int=typemax(Int),
 )
     max_answers >= 1 || throw(ArgumentError("max_answers must be positive"))
-    hasproperty(donor_site, :sites) && throw(ArgumentError(
+    hasproperty(donor_site, :demand) || throw(ArgumentError(
         "donor retrieval requires one selected lexical site",
     ))
     target_sites = _snapshot_site_list(target_input)
@@ -418,14 +417,17 @@ end
     using Test
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
     using LambdaRegression.Mutations.Populations:
-        _snapshot_open_retrieval, prepare_core_snapshot
+        _snapshot_open_retrieval, prepare_typed_analysis,
+        typed_analysis_site_ids, typed_analysis_site
     using LambdaRegression.TypeSystem: TyLike
 
-    snapshot = prepare_core_snapshot(
+    snapshot = prepare_typed_analysis(
         AstTree(AbsNode(:x, IndexNode(0))),
         Dict{Symbol,TyLike}(),
     )
-    site = only(filter(candidate -> candidate.path == (1,), snapshot.sites))
+    site = typed_analysis_site(
+        snapshot, only(typed_analysis_site_ids(snapshot; site_path=[1])),
+    )
     answers = _snapshot_open_retrieval(site, [site])
 
     @test length(answers) == 1
@@ -446,6 +448,7 @@ end
     donor_binder = (kind=:lambda, owner_path=(), ordinal=9)
     donor_occurrence = (path=(1,), use_type=IntTy)
     donor = (;
+        demand=IntTy,
         offer=IntTy,
         external_occurrences=Dict(donor_binder => [donor_occurrence]),
         binder_schemes=Dict{Any,TyLike}(
@@ -525,9 +528,10 @@ end
 @testitem "snapshot open retrieval freshens a polymorphic let per donor use" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs:
-        AbsNode, AppNode, AstTree, ConstNode, IndexNode, LetNode
+        AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.Mutations.Populations:
-        _snapshot_open_retrieval, prepare_core_snapshot
+        _snapshot_open_retrieval, prepare_typed_analysis,
+        typed_analysis_site_ids, typed_analysis_site
     using LambdaRegression.TypeSystem:
         BoolTy, IntTy, TyFun, TyLike
 
@@ -545,20 +549,23 @@ end
         :PAIR_IB => TyFun(IntTy, TyFun(BoolTy, IntTy)),
         :KEEP_II => TyFun(IntTy, TyFun(IntTy, IntTy)),
     )
-    donor_snapshot = prepare_core_snapshot(
-        AstTree(LetNode(:id, identity, donor_body)),
+    donor_snapshot = prepare_typed_analysis(
+        AstTree(AppNode(AbsNode(:id, donor_body), identity)),
         ctx,
     )
-    donor = only(filter(site -> site.path == (2,), donor_snapshot.sites))
+    donor = typed_analysis_site(
+        donor_snapshot,
+        only(typed_analysis_site_ids(donor_snapshot; site_path=[1, 1])),
+    )
 
-    polymorphic_snapshot = prepare_core_snapshot(
-        AstTree(LetNode(:id, identity, ConstNode(:ONE))),
+    polymorphic_snapshot = prepare_typed_analysis(
+        AstTree(AppNode(AbsNode(:id, ConstNode(:ONE)), identity)),
         ctx,
     )
-    polymorphic = only(filter(
-        site -> site.path == (2,),
-        polymorphic_snapshot.sites,
-    ))
+    polymorphic = typed_analysis_site(
+        polymorphic_snapshot,
+        only(typed_analysis_site_ids(polymorphic_snapshot; site_path=[1, 1])),
+    )
 
     monomorphic_tree = AbsNode(
         :f,
@@ -570,11 +577,11 @@ end
             ConstNode(:ONE),
         ),
     )
-    monomorphic_snapshot = prepare_core_snapshot(AstTree(monomorphic_tree), ctx)
-    monomorphic = only(filter(
-        site -> site.path == (1, 2),
-        monomorphic_snapshot.sites,
-    ))
+    monomorphic_snapshot = prepare_typed_analysis(AstTree(monomorphic_tree), ctx)
+    monomorphic = typed_analysis_site(
+        monomorphic_snapshot,
+        only(typed_analysis_site_ids(monomorphic_snapshot; site_path=[1, 2])),
+    )
 
     @test length(only(values(donor.external_occurrences))) == 2
     @test length(_snapshot_open_retrieval(donor, [polymorphic])) == 1
@@ -586,15 +593,18 @@ end
     using LambdaRegression.ASTs.NodeASTs:
         AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.Mutations.Populations:
-        _snapshot_open_retrieval, prepare_core_snapshot
+        _snapshot_open_retrieval, prepare_typed_analysis,
+        typed_analysis_site_ids, typed_analysis_site
     using LambdaRegression.TypeSystem:
         BoolTy, IntTy, TyFun, TyLike
 
-    donor_snapshot = prepare_core_snapshot(
+    donor_snapshot = prepare_typed_analysis(
         AstTree(AbsNode(:x, IndexNode(0))),
         Dict{Symbol,TyLike}(),
     )
-    donor = only(filter(site -> site.path == (1,), donor_snapshot.sites))
+    donor = typed_analysis_site(
+        donor_snapshot, only(typed_analysis_site_ids(donor_snapshot; site_path=[1])),
+    )
 
     ctx = Dict{Symbol,TyLike}(
         :ONE => IntTy,
@@ -607,39 +617,45 @@ end
             ConstNode(:ONE),
         ),
     )
-    target_snapshot = prepare_core_snapshot(AstTree(target_tree), ctx)
-    target = only(filter(
-        site -> site.path == (1, 2),
-        target_snapshot.sites,
-    ))
+    target_snapshot = prepare_typed_analysis(AstTree(target_tree), ctx)
+    target = typed_analysis_site(
+        target_snapshot,
+        only(typed_analysis_site_ids(target_snapshot; site_path=[1, 2])),
+    )
 
     # The donor's one TyVar is both its output and its captured-binder demand.
     # Solving those projections independently would accept Int and Bool; the
     # joint A identity correctly makes the mapping inconsistent.
     @test isempty(_snapshot_open_retrieval(donor, [target]))
 
-    forward = _snapshot_open_retrieval(donor, donor_snapshot)
-    reverse_order = _snapshot_open_retrieval(donor, reverse(donor_snapshot.sites))
+    donor_sites = [
+        typed_analysis_site(donor_snapshot, id)
+        for id in typed_analysis_site_ids(donor_snapshot)
+    ]
+    forward = _snapshot_open_retrieval(donor, donor_sites)
+    reverse_order = _snapshot_open_retrieval(donor, reverse(donor_sites))
     @test reverse_order == forward
 end
 
 @testitem "snapshot open retrieval accepts a FunctionDef lexical snapshot" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs:
-        AbsNode, AppNode, AstTree, IndexNode
-    using LambdaRegression.Mutations.Populations: _snapshot_open_retrieval
-    using LambdaRegression.Procedural:
-        FunctionDefNode, prepare_procedural_snapshot
+        AbsNode, AppNode, AstTree, FunctionDefNode, IndexNode
+    using LambdaRegression.Mutations.Populations:
+        _snapshot_open_retrieval, prepare_typed_analysis,
+        typed_analysis_site_ids, typed_analysis_site
     using LambdaRegression.TypeSystem: TyLike
 
     recursive_call = FunctionDefNode(
         AbsNode(:x, AppNode(IndexNode(1), IndexNode(0))),
     )
-    snapshot = prepare_procedural_snapshot(
+    snapshot = prepare_typed_analysis(
         AstTree(recursive_call),
         Dict{Symbol,TyLike}(),
     )
-    site = only(filter(candidate -> candidate.path == (1,), snapshot.sites))
+    site = typed_analysis_site(
+        snapshot, only(typed_analysis_site_ids(snapshot; site_path=[1])),
+    )
     answers = _snapshot_open_retrieval(site, [site])
 
     @test length(answers) == 1
@@ -673,6 +689,7 @@ end
 
     donor_binder = (kind=:lambda, owner_path=(), ordinal=9)
     donor = (;
+        demand=IntTy,
         offer=IntTy,
         external_occurrences=Dict(
             donor_binder => [(path=(1,), use_type=IntTy)],

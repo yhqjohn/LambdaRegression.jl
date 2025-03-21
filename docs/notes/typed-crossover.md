@@ -1,26 +1,25 @@
 # Typed crossover
 
-Typed crossover transports a lambda fragment between typed programs while
-preserving the target site's lexical and type contract.
-
-A target site contains an output demand, outer parameters whose identities must
-remain fixed, optional variables that the proposal may solve, and a visible
-lexical context. The donor signature includes every non-local variable used by
-the fragment. All occurrences of one donor binding map to one target binder;
-polymorphic target binders may be instantiated per occurrence, while
-monomorphic binders retain shared type state.
+Typed crossover transports a lambda fragment between programs while preserving
+lexical bindings, shared type variables, and the target site's output demand.
 
 Compatibility is directed: the target demand must be an instance of the donor
-offer. Donor-wide variables remain shared across every occurrence. Local
-occurrence variables are hidden, and rigid variables remain scoped to their
-occurrence. These rules prevent capture and preserve dependencies between
-separate uses of the same binding.
+offer. The donor signature lists every non-local free variable of the fragment.
+All occurrences of one donor binding map to one visible target binder.
+Polymorphic binders may be instantiated separately, while monomorphic binders
+retain one shared type state.
 
-Closed donors are accepted only when their payload and signature contain every
-resource they need. A pointer into an old environment is not a closure. Open
-donors are accepted only when the combined output and occurrence constraints
-have a valid scoped solution.
+Donor-wide variables remain shared across all occurrences. Occurrence-local
+variables stay hidden, and rigid variables stay within their occurrence scope.
+The combined output and occurrence constraints must preserve those scopes;
+otherwise the exchange is rejected. A closed donor is valid only when its
+payload and signature carry every resource it needs.
 
-After transport, the complete offspring is checked again for typing and
-capture safety. This final whole-program check is essential: a typable child
-can still have lost the original target demand or changed a shared binding.
+Sequential let-like bindings use ordinary application and abstraction
+occurrences. Explicit function definitions remain ordinary monomorphic
+dependencies, with their role restrictions applied after type retrieval.
+
+After transport, source syntax is reconstructed hygienically and the complete
+offspring is checked for typing and capture safety. Typability alone does not
+show that the original demand survived, so the relevant target contract is
+checked separately when the exchange is published.

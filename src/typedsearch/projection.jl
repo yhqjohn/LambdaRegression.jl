@@ -101,7 +101,7 @@ are registered as leaves as well; callers that need coverage details can call
 `register_external_bindings!` for its report without changing the term return
 type.
 
-The first slice refuses Let-App, recursive definitions, unresolved types, and
+The first slice refuses let-like AppAbs, recursive definitions, unresolved types, and
 μ-dependent syntax inside the projected region. Such source programs may still
 provide ordinary local holes. Refusal does not mutate source syntax. The type
 table may acquire concrete entries; unused leaf additions are rolled back.
@@ -109,20 +109,22 @@ table may acquire concrete entries; unused leaf additions are rolled back.
 function import_hole(hole::SourceHole, language::Language)
     nodes = TermNode[]
     initial_leaves = length(language.leaves)
+    index = hole.source.index
     function visit(o, binders)
-        haskey(hole.source.metadata, o) || return Err(SourceBoundaryError(:binding_artifact, o.id))
+        haskey(hole.source.metadata, o) || return Err(SourceBoundaryError(:binding_artifact, o))
         id = intern_type!(language.types, hole.source.metadata[o][1])
         id isa Err && return id
-        n = o.node
+        n = index.nodes[o]
+        child_ids = index.children[o]
         if n isa ConstNode
             leaf = _source_leaf!(language, id, SourceConstant(n.name))
             leaf isa Err && return leaf
             push!(nodes, TermNode(LEAF, id, leaf, 0))
         elseif n isa IndexNode
             0 <= n.index < length(binders) + length(hole.external_types) ||
-                return Err(SourceBoundaryError(:unbound_index, o.id))
+                return Err(SourceBoundaryError(:unbound_index, o))
             if n.index < length(binders)
-                binders[end - n.index] == id || return Err(SourceBoundaryError(:nonmonomorphic_use, o.id))
+                binders[end - n.index] == id || return Err(SourceBoundaryError(:nonmonomorphic_use, o))
                 push!(nodes, TermNode(VAR, id, n.index, 0))
             else
                 payload = SourceExternal(hole.anchor, n.index - length(binders))
@@ -132,22 +134,22 @@ function import_hole(hole::SourceHole, language::Language)
             end
         elseif n isa AbsNode
             ty = hole.source.metadata[o][1]
-            ty isa TypeSystem.TyFun || return Err(SourceBoundaryError(:nontransparent_binder, o.id))
+            ty isa TypeSystem.TyFun || return Err(SourceBoundaryError(:nontransparent_binder, o))
             argument = intern_type!(language.types, ty.arg)
             argument isa Err && return argument
             push!(binders, argument)
-            body = visit(o.children[1], binders)
+            body = visit(child_ids[1], binders)
             pop!(binders)
             body isa Err && return body
             push!(nodes, TermNode(ABS, id, body, 0))
-        elseif n isa AppNode && !(n.func isa AbsNode)
-            f = visit(o.children[1], binders)
+        elseif n isa AppNode && !(index.nodes[child_ids[1]] isa AbsNode)
+            f = visit(child_ids[1], binders)
             f isa Err && return f
-            x = visit(o.children[2], binders)
+            x = visit(child_ids[2], binders)
             x isa Err && return x
             push!(nodes, TermNode(APP, id, f, x))
         else
-            return Err(SourceBoundaryError(:unsupported_region, o.id))
+            return Err(SourceBoundaryError(:unsupported_region, o))
         end
         return Int32(length(nodes))
     end
@@ -164,7 +166,7 @@ function import_hole(hole::SourceHole, language::Language)
     end
     if valid === false
         resize!(language.leaves, initial_leaves)
-        return Err(SourceBoundaryError(:projection_type_mismatch, hole.occurrence.id))
+        return Err(SourceBoundaryError(:projection_type_mismatch, hole.occurrence))
     end
     register_external_bindings!(hole, language)
     return term
@@ -185,20 +187,20 @@ function export_hole(term::TypedTerm, language::Language, hole::SourceHole;
     max_nodes > 0 && max_depth >= 0 || throw(ArgumentError("invalid export bounds"))
     checked = validate(term, language)
     checked isa Err && return checked
-    checked === false && return Err(SourceBoundaryError(:invalid_term, hole.occurrence.id))
+    checked === false && return Err(SourceBoundaryError(:invalid_term, hole.occurrence))
     target = intern_type!(language.types, hole.source.metadata[hole.occurrence][1])
     target isa Err && return target
-    term.nodes[end].typeid == target || return Err(SourceBoundaryError(:wrong_hole_type, hole.occurrence.id))
+    term.nodes[end].typeid == target || return Err(SourceBoundaryError(:wrong_hole_type, hole.occurrence))
     materialized = Ref(0)
     function build(i, binder_depth, structural_depth)
         structural_depth <= max_depth || return Err(SourceBoundaryError(
-            :export_depth, hole.occurrence.id,
+            :export_depth, hole.occurrence,
         ))
         n = term.nodes[i]
         if n.kind == VAR
             materialized[] += 1
             materialized[] <= max_nodes || return Err(SourceBoundaryError(
-                :export_size, hole.occurrence.id,
+                :export_size, hole.occurrence,
             ))
             return IndexNode(Int(n.x))
         elseif n.kind == LEAF
@@ -206,7 +208,7 @@ function export_hole(term::TypedTerm, language::Language, hole::SourceHole;
             if payload isa SourceConstant
                 materialized[] += 1
                 materialized[] <= max_nodes || return Err(SourceBoundaryError(
-                    :export_size, hole.occurrence.id,
+                    :export_size, hole.occurrence,
                 ))
                 return ConstNode(payload.name)
             end
@@ -219,15 +221,15 @@ function export_hole(term::TypedTerm, language::Language, hole::SourceHole;
                     0 <= payload.index < length(hole.external_types)
                 materialized[] += 1
                 materialized[] <= max_nodes || return Err(SourceBoundaryError(
-                    :export_size, hole.occurrence.id,
+                    :export_size, hole.occurrence,
                 ))
                 return IndexNode(binder_depth + payload.index)
             end
-            return Err(SourceBoundaryError(:foreign_source_leaf, hole.occurrence.id))
+            return Err(SourceBoundaryError(:foreign_source_leaf, hole.occurrence))
         elseif n.kind == ABS
             materialized[] += 1
             materialized[] <= max_nodes || return Err(SourceBoundaryError(
-                :export_size, hole.occurrence.id,
+                :export_size, hole.occurrence,
             ))
             body = build(n.x, binder_depth + 1, structural_depth + 1)
             body isa Err && return body
@@ -235,7 +237,7 @@ function export_hole(term::TypedTerm, language::Language, hole::SourceHole;
         else
             materialized[] += 1
             materialized[] <= max_nodes || return Err(SourceBoundaryError(
-                :export_size, hole.occurrence.id,
+                :export_size, hole.occurrence,
             ))
             f = build(n.x, binder_depth, structural_depth + 1)
             f isa Err && return f
@@ -246,7 +248,7 @@ function export_hole(term::TypedTerm, language::Language, hole::SourceHole;
     end
     replacement = build(length(term.nodes), 0, 0)
     replacement isa Err && return replacement
-    owned = deepcopy(hole.source.tree)
+    owned = deepcopy(hole.source.index.tree)
     if isempty(hole.path)
         owned.root = replacement
     else
@@ -265,7 +267,7 @@ end
     using LambdaRegression.ASTs.NodeASTs
     using LambdaRegression.TypeSystem
     using LambdaRegression.TypeSystem: FloatTy
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
     ctx = Dict{Symbol,TyLike}(:one => FloatTy)
     target = TyFun(FloatTy, FloatTy)
     source = prepare_source(AstTree(AbsNode(:x, IndexNode(0))), ctx, target)
@@ -274,15 +276,15 @@ end
     term = import_hole(hole, language)
     @test validate(term, language) === true
     roundtrip = export_hole(term, language, hole)
-    @test prepare_source(roundtrip, ctx, target) isa SourceAnalysis
-    @test evaluate_procedural(roundtrip, Dict{Symbol,Any}(:one => 1.0); args=(2.0,)) == 2.0
+    @test prepare_source(roundtrip, ctx, target) isa TypedAnalysis
+    @test evaluate_native(roundtrip, Dict{Symbol,Any}(:one => 1.0); args=(2.0,)) == 2.0
     constant = prepare_source(AstTree(ConstNode(:one)), ctx, FloatTy)
     donor = import_hole(source_hole(constant), language)
     changed = replace_subterm(term, 1, donor, 1, language)
     @test validate(changed, language) === true
     offspring = export_hole(changed, language, hole)
-    @test prepare_source(offspring, ctx, target) isa SourceAnalysis
-    @test evaluate_procedural(offspring, Dict{Symbol,Any}(:one => 1.0); args=(2.0,)) == 1.0
+    @test prepare_source(offspring, ctx, target) isa TypedAnalysis
+    @test evaluate_native(offspring, Dict{Symbol,Any}(:one => 1.0); args=(2.0,)) == 1.0
 end
 
 @testitem "TypedSearch fixed external capture and recursive local holes" begin
@@ -290,7 +292,6 @@ end
     using LambdaRegression.ASTs.NodeASTs
     using LambdaRegression.TypeSystem
     using LambdaRegression.TypeSystem: FloatTy, BoolTy
-    using LambdaRegression.Procedural: FunctionDefNode
     using LambdaRegression.Utils: Err
     ctx = Dict{Symbol,TyLike}()
     target = TyFun(FloatTy, TyFun(BoolTy, FloatTy))
@@ -300,7 +301,7 @@ end
     term = import_hole(hole, language)
     roundtrip = export_hole(term, language, hole)
     @test roundtrip.root.body.body.index == 1
-    @test prepare_source(roundtrip, ctx, target) isa SourceAnalysis
+    @test prepare_source(roundtrip, ctx, target) isa TypedAnalysis
     foreign_hole = source_hole(source, [1])
     @test export_hole(term, language, foreign_hole) isa Err
     recursive = prepare_source(AstTree(FunctionDefNode(AbsNode(:x,
@@ -310,7 +311,7 @@ end
     body = import_hole(recursive_hole, recursive_language)
     @test validate(body, recursive_language) === true
     rebuilt = export_hole(body, recursive_language, recursive_hole)
-    @test prepare_source(rebuilt, ctx, TyFun(FloatTy, FloatTy)) isa SourceAnalysis
+    @test prepare_source(rebuilt, ctx, TyFun(FloatTy, FloatTy)) isa TypedAnalysis
     # The source admits recursion; the transparent dense language does not.
     @test import_hole(source_hole(recursive), recursive_language) isa Err
 end
@@ -334,7 +335,7 @@ end
     @test changed.root.func.arg.body == ConstNode(:one)
     @test changed.root.arg.body == IndexNode(0)
     @test shared.body == IndexNode(0)
-    @test prepare_source(changed, ctx, target) isa SourceAnalysis
+    @test prepare_source(changed, ctx, target) isa TypedAnalysis
 end
 
 @testitem "TypedSearch local registration exposes unused same-typed inputs" begin
@@ -344,7 +345,7 @@ end
     using LambdaRegression.ASTs.NodeASTs
     using LambdaRegression.TypeSystem
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
 
     target = TyFun(IntTy, TyFun(IntTy, TyFun(IntTy, IntTy)))
     source = prepare_source(AstTree(AbsNode(:x, AbsNode(:y,
@@ -365,8 +366,8 @@ end
     ])
     @test validate(candidate, language) === true
     exported = export_hole(candidate, language, hole)
-    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa SourceAnalysis
-    @test evaluate_procedural(exported, Dict{Symbol,Any}(); args=(1, 2, 3)) == 2
+    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa TypedAnalysis
+    @test evaluate_native(exported, Dict{Symbol,Any}(); args=(1, 2, 3)) == 2
 end
 
 @testitem "TypedSearch local registration exposes unused recursive self" begin
@@ -376,7 +377,7 @@ end
     using LambdaRegression.ASTs.NodeASTs
     using LambdaRegression.TypeSystem
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
-    using LambdaRegression.Procedural: FunctionDefNode, evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
     using LambdaRegression.Utils: Err
 
     target = TyFun(IntTy, IntTy)
@@ -387,7 +388,7 @@ end
     projected = import_hole(hole, language)
     @test projected isa TypedTerm
     original = export_hole(projected, language, hole)
-    @test evaluate_procedural(original, Dict{Symbol,Any}(); args=(5,)) == 5
+    @test evaluate_native(original, Dict{Symbol,Any}(); args=(5,)) == 5
     intid = intern!(language.types, IntTy)
     fintid = intern!(language.types, target)
     self_leaf = findfirst(i -> begin
@@ -406,8 +407,8 @@ end
     @test exported.root isa FunctionDefNode
     @test exported.root.body.body.func.index == 1
     @test exported.root.body.body.arg.index == 0
-    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa SourceAnalysis
-    @test evaluate_procedural(exported, Dict{Symbol,Any}(); args=(5,), max_steps=16) isa Err
+    @test prepare_source(exported, Dict{Symbol,TyLike}(), target) isa TypedAnalysis
+    @test evaluate_native(exported, Dict{Symbol,Any}(); args=(5,), max_steps=16) isa Err
 end
 
 @testitem "TypedSearch scheme inputs retain only observed instances" begin

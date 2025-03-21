@@ -10,7 +10,7 @@ using TestItems
 using ...Utils: Err
 using ...TypeSystem:
     Ty, TyLike, TyVar, TyMu, TyScheme, TyArray, TyNat, TyRigid,
-    make_tyvar_factory, _inst, unify!, type_children
+    unify!, type_children
 
 export ClosedDemandSite, closed_directed_match, closed_retrieval_scan
 export ClosedRetrievalMuErr, ClosedRetrievalArraySortErr
@@ -31,37 +31,6 @@ end
 struct ClosedRetrievalArraySortErr
     side::Symbol
     variable::TyVar
-end
-
-function _detached_type_inputs(
-    type_ctx::AbstractDict{Symbol,<:TyLike},
-    extras::TyLike...,
-)
-    factory = make_tyvar_factory()
-    variables = Dict{TyVar,TyVar}()
-    mapvar(variable::TyVar) = get!(variables, variable) do
-        factory(variable.level)
-    end
-    function detach(ty::TyLike)
-        if ty isa TyScheme
-            return TyScheme(
-                TyVar[mapvar(variable) for variable in ty.vars],
-                _inst(ty.ty, mapvar),
-            )
-        end
-        return _inst(ty, mapvar)
-    end
-    detached = Dict{Symbol,TyLike}()
-    for (name, ty) in type_ctx
-        detached[name] = detach(ty)
-    end
-    return detached, map(detach, extras)
-end
-
-"""Clone a type context without retaining caller-owned free-variable links."""
-function _detached_type_ctx(type_ctx::AbstractDict{Symbol,<:TyLike})
-    detached, _ = _detached_type_inputs(type_ctx)
-    return detached
 end
 
 function _closed_has_mu(ty::TyLike, seen=IdDict{Any,Nothing}())::Bool

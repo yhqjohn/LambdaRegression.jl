@@ -41,6 +41,12 @@ config = GenerationConfig(; rng, providers, weights)
 result = generate_canonical(target_ty; global_consts, config)
 ```
 
+FunctionDef construction is an optional generation capability, not part of the
+default canonical provider set. Install `FunctionDefProvider` explicitly in
+`GenerationConfig.providers`; successful results containing FunctionDef nodes
+receive a final public type-inference check against the same target and constant
+context.
+
 For the rich test catalog, pair `test_catalog_consts()` with
 `test_catalog_providers()`. The latter is an explicit provider tuple that adds
 typed value factories without promoting scalar or ndarray factories into the
@@ -166,11 +172,14 @@ module CanonicalGeneration
 import Random
 import ..TypeSystem
 import ..ValueFactories
+import ..Primitives
 
 using ..ASTs.NodeASTs: AstNode, AstTree, ConstNode, IndexNode, AbsNode, AppNode
+using ..ASTs.NodeASTs: VarNode, FunctionDefNode, children
 using ..TypeSystem: Ty, TyConst, TyVar, TyFun, TyProd, TySum, TyList, TyArray, TyNat, TyMu, TyScheme, TyLike
 using ..TypeSystem: BoolTy, FloatTy, get_ast_type_ctx, get_type_ctx, get_type, iscompatible, typekey, →
 using ..Utils
+using ..ProgramAnalysis: functiondef_recursion_observations
 using TestItems
 
 export generate_canonical, generate_canonical_scoped
@@ -197,6 +206,12 @@ export test_catalog_consts, test_catalog_providers, test_catalog_weight_tags, te
 export ContextHeadProvider, NilFactoryProvider, ToListProvider, AMapProvider, GuardedExpansionProvider, TypedValueFactoryProvider, WeightTagProvider
 export SafeListAccessProvider
 export DefaultArgumentPlanner, WeightedDerivationSampler, DefaultAstMaterializer
+export FunctionDefCandidate, FunctionDefProvider, AcceptFunctionDef
+export DirectKnotFilter, GenuineSelfCallFilter, FiniteBaseWitness
+export FunctionDefFuel, FunctionDefSelfBinder, FunctionDefAttemptBudget
+export FunctionDefGenerationVerificationError
+export with_functiondef_provider, generate_finite_canonical_scoped
+export generate_functiondef_root_scoped
 
 abstract type CoreRuleClass end
 struct CoreProductive <: CoreRuleClass end
@@ -513,13 +528,13 @@ independent user constants. Unknown providers and value factories default to
 """
 provider_replays_materialized_value(::AbstractHeadProvider, value, ty::TyLike) = false
 provider_replays_materialized_value(::ToListProvider, value, ty::TyLike) =
-    value === TypeSystem.TOLIST
+    value === Primitives.TOLIST
 provider_replays_materialized_value(::AMapProvider, value, ty::TyLike) =
-    value === TypeSystem.AMAP
+    value === Primitives.AMAP
 provider_replays_materialized_value(::GuardedExpansionProvider, value, ty::TyLike) =
-    value === TypeSystem.CONS || value === TypeSystem.COND || value === TypeSystem.AFOLDL
+    value === Primitives.CONS || value === Primitives.COND || value === Primitives.AFOLDL
 provider_replays_materialized_value(::SafeListAccessProvider, value, ty::TyLike) =
-    value === TypeSystem.UNCONS_CASE
+    value === Primitives.UNCONS_CASE
 
 """
     provides_generation_options(provider)
@@ -661,17 +676,17 @@ default_head_providers() = _DEFAULT_HEAD_PROVIDERS
 
 function test_catalog_consts()
     return Dict{Symbol,Any}(
-        :FSIN => TypeSystem.FSIN,
-        :FCOS => TypeSystem.FCOS,
-        :FSQRT => TypeSystem.FSQRT,
-        :SQR => TypeSystem.SQR,
-        :FADD => TypeSystem.FADD,
-        :FSUB => TypeSystem.FSUB,
-        :FMUL => TypeSystem.FMUL,
-        :FDIV => TypeSystem.FDIV,
-        :FEQ => TypeSystem.FEQ,
-        :FLE => TypeSystem.FLE,
-        :LENF => TypeSystem.LENF,
+        :FSIN => Primitives.FSIN,
+        :FCOS => Primitives.FCOS,
+        :FSQRT => Primitives.FSQRT,
+        :SQR => Primitives.SQR,
+        :FADD => Primitives.FADD,
+        :FSUB => Primitives.FSUB,
+        :FMUL => Primitives.FMUL,
+        :FDIV => Primitives.FDIV,
+        :FEQ => Primitives.FEQ,
+        :FLE => Primitives.FLE,
+        :LENF => Primitives.LENF,
     )
 end
 
@@ -1057,7 +1072,7 @@ end
 function _is_builtin_tolist_head(head::HeadEntry)
     head.name == :TOLIST || return false
     head.source == :primitive || return false
-    _metadata_get(head.metadata, :value, nothing) === TypeSystem.TOLIST || return false
+    _metadata_get(head.metadata, :value, nothing) === Primitives.TOLIST || return false
     head.type isa TyFun || return false
     source_ty = head.type.arg
     result_ty = head.type.res
@@ -1069,7 +1084,7 @@ end
 function _is_builtin_amap_head(head::HeadEntry)
     head.name == :AMAP || return false
     head.source == :primitive || return false
-    _metadata_get(head.metadata, :value, nothing) === TypeSystem.AMAP || return false
+    _metadata_get(head.metadata, :value, nothing) === Primitives.AMAP || return false
     _metadata_get(head.metadata, :source_array_constructor, false) === true || return false
     head.type isa Ty || return false
     args, result_ty = _split_fun(head.type)
@@ -1573,7 +1588,7 @@ function _add_tolist_heads!(heads::Vector{HeadEntry}, universe::CoreUniverse, so
                 TyFun(array_ty, list_ty),
                 CoreProductive(),
                 _TOLIST_WEIGHT;
-                metadata=(value=TypeSystem.TOLIST, source_array_depth_limit=1),
+                metadata=(value=Primitives.TOLIST, source_array_depth_limit=1),
             ),
         )
     end
@@ -1602,7 +1617,7 @@ function _add_amap_heads!(
                     CoreProductive(),
                     _AMAP_WEIGHT;
                     metadata=(
-                        value=TypeSystem.AMAP,
+                        value=Primitives.AMAP,
                         source_array_constructor=true,
                         source_array_argument_index=2,
                         source_array_depth_limit=0,
@@ -1633,7 +1648,7 @@ function _add_cons_heads!(heads::Vector{HeadEntry}, universe::CoreUniverse)
                 cons_ty,
                 Decoration(),
                 _GUARDED_EXPANSION_WEIGHT;
-                metadata=(value=TypeSystem.CONS, guarded=true),
+                metadata=(value=Primitives.CONS, guarded=true),
             ),
         )
     end
@@ -1652,7 +1667,7 @@ function _add_cond_heads!(heads::Vector{HeadEntry}, universe::CoreUniverse)
                 cond_ty,
                 Decoration(),
                 _GUARDED_EXPANSION_WEIGHT;
-                metadata=(value=TypeSystem.COND, guarded=true),
+                metadata=(value=Primitives.COND, guarded=true),
             ),
         )
     end
@@ -1674,7 +1689,7 @@ function _add_afoldl_heads!(heads::Vector{HeadEntry}, universe::CoreUniverse)
                     afoldl_ty,
                     Decoration(),
                     _GUARDED_EXPANSION_WEIGHT;
-                    metadata=(value=TypeSystem.AFOLDL, guarded=true),
+                    metadata=(value=Primitives.AFOLDL, guarded=true),
                 ),
             )
         end
@@ -2326,7 +2341,27 @@ function generate_canonical(
     sampling_node_budget::Integer=128,
     config::GenerationConfig=GenerationConfig(; rng, weights, providers, guarded_expansion_depth, sampling_depth_limit, sampling_node_budget),
     _cache_relation::Bool=true,
+    _verify_functiondefs::Bool=true,
 )
+    any(provider -> provider isa FunctionDefProvider, config.providers) &&
+        _validate_functiondef_sampling_config(config)
+    verification_kwargs = (;
+        global_consts,
+        global_consts_ty,
+        local_consts,
+        local_consts_ty,
+        presets,
+        preset_types,
+    )
+    verify_functiondefs = _verify_functiondefs &&
+        _functiondef_verification_required(config, presets)
+    finalize_result = result -> _verify_functiondefs ?
+        _finalize_functiondef_result(
+            result,
+            target_ty;
+            kwargs=verification_kwargs,
+            verification_required=verify_functiondefs,
+        ) : result
     if target_ty isa TyScheme
         demand = _rigidify_scheme_demand(target_ty)
         demand === nothing && return Err(UnsupportedCanonicalGenerationTarget(target_ty))
@@ -2346,9 +2381,10 @@ function generate_canonical(
             sampling_node_budget,
             config,
             _cache_relation,
+            _verify_functiondefs=false,
         )
         result isa GenerationResult || return result
-        return _discharge_rigid_result(result, target_ty, demand)
+        return finalize_result(_discharge_rigid_result(result, target_ty, demand))
     end
     target_ty isa Ty || return Err(UnsupportedCanonicalGenerationTarget(target_ty))
     _generation_target_supported(target_ty, config) ||
@@ -2383,7 +2419,9 @@ function generate_canonical(
                 argument_planner=config.argument_planner,
                 guarded_expansion_depth=config.guarded_expansion_depth,
             )
-            return _generate_lazy_result(relation, config, target_ty, result_local_consts, result_local_const_types)
+            return finalize_result(_generate_lazy_result(
+                relation, config, target_ty, result_local_consts, result_local_const_types,
+            ))
         end
 
         entry = _get_default_lazy_relation_cache_entry(
@@ -2396,11 +2434,14 @@ function generate_canonical(
             global_consts_ty,
         )
         lock(entry.lock)
-        try
-            return _generate_lazy_result(entry.relation, config, target_ty, result_local_consts, result_local_const_types)
+        result = try
+            _generate_lazy_result(
+                entry.relation, config, target_ty, result_local_consts, result_local_const_types,
+            )
         finally
             unlock(entry.lock)
         end
+        return finalize_result(result)
     end
 
     if cache_key === nothing
@@ -2454,7 +2495,9 @@ function generate_canonical(
         :derivation => _derivation_signature(derivation),
     )
     _attach_derivation_metadata!(metadata, derivation)
-    return GenerationResult(AstTree(node), target_ty, result_local_consts, result_local_const_types, metadata)
+    return finalize_result(GenerationResult(
+        AstTree(node), target_ty, result_local_consts, result_local_const_types, metadata,
+    ))
 end
 
 """
@@ -2489,7 +2532,28 @@ function generate_canonical_scoped(
     config::GenerationConfig=GenerationConfig(; rng, weights, providers, guarded_expansion_depth, sampling_depth_limit, sampling_node_budget),
     capability_mask=(),
     _cache_relation::Bool=true,
+    _verify_functiondefs::Bool=true,
 )
+    any(provider -> provider isa FunctionDefProvider, config.providers) &&
+        _validate_functiondef_sampling_config(config)
+    verification_kwargs = (;
+        global_consts,
+        global_consts_ty,
+        local_consts,
+        local_consts_ty,
+        presets,
+        preset_types,
+    )
+    verify_functiondefs = _verify_functiondefs &&
+        _functiondef_verification_required(config, presets)
+    finalize_result = result -> _verify_functiondefs ?
+        _finalize_functiondef_result(
+            result,
+            target_ty;
+            kwargs=verification_kwargs,
+            scope_tys,
+            verification_required=verify_functiondefs,
+        ) : result
     if target_ty isa TyScheme
         demand = _rigidify_scheme_demand(target_ty)
         demand === nothing && return Err(UnsupportedCanonicalGenerationTarget(target_ty))
@@ -2512,9 +2576,10 @@ function generate_canonical_scoped(
             config,
             capability_mask=capability_mask,
             _cache_relation=false,
+            _verify_functiondefs=false,
         )
         result isa GenerationResult || return result
-        return _discharge_rigid_result(result, target_ty, demand)
+        return finalize_result(_discharge_rigid_result(result, target_ty, demand))
     end
     target_ty isa Ty || return Err(UnsupportedCanonicalGenerationTarget(target_ty))
     _generation_target_supported(target_ty, config) ||
@@ -2555,13 +2620,17 @@ function generate_canonical_scoped(
             mask,
         )
         lock(entry.lock)
-        try
+        result = try
             entry.relation.local_consts = relation_local_consts
             entry.relation.local_consts_ty = relation_local_const_types
-            return _generate_scoped_result(entry.relation, config, target_ty, scope, result_local_consts, result_local_const_types)
+            _generate_scoped_result(
+                entry.relation, config, target_ty, scope,
+                result_local_consts, result_local_const_types,
+            )
         finally
             unlock(entry.lock)
         end
+        return finalize_result(result)
     end
 
     relation = CoreRelation(
@@ -2577,7 +2646,9 @@ function generate_canonical_scoped(
         guarded_expansion_depth=config.guarded_expansion_depth,
         capability_mask=mask,
     )
-    return _generate_scoped_result(relation, config, target_ty, scope, result_local_consts, result_local_const_types)
+    return finalize_result(_generate_scoped_result(
+        relation, config, target_ty, scope, result_local_consts, result_local_const_types,
+    ))
 end
 
 function _generate_lazy_result(
@@ -4572,7 +4643,7 @@ function _add_target_cons_head!(heads::Vector{HeadEntry}, target_ty::Ty)
             cons_ty,
             Decoration(),
             _GUARDED_EXPANSION_WEIGHT;
-            metadata=(value=TypeSystem.CONS, guarded=true),
+            metadata=(value=Primitives.CONS, guarded=true),
         ),
     )
     return heads
@@ -4589,7 +4660,7 @@ function _add_target_cond_head!(heads::Vector{HeadEntry}, universe::CoreUniverse
             cond_ty,
             Decoration(),
             _GUARDED_EXPANSION_WEIGHT;
-            metadata=(value=TypeSystem.COND, guarded=true),
+            metadata=(value=Primitives.COND, guarded=true),
         ),
     )
     return heads
@@ -4607,7 +4678,7 @@ function _add_target_afoldl_heads!(heads::Vector{HeadEntry}, universe::CoreUnive
                 afoldl_ty,
                 Decoration(),
                 _GUARDED_EXPANSION_WEIGHT;
-                metadata=(value=TypeSystem.AFOLDL, guarded=true),
+            metadata=(value=Primitives.AFOLDL, guarded=true),
             ),
         )
     end
@@ -5872,7 +5943,6 @@ end
 
     @test LambdaRegression.CanonicalGeneration isa Module
     @test LambdaRegression.mutate_tree isa Function
-    @test LambdaRegression.fit! isa Function
     @test LambdaRegression.TypeSystem isa Module
     @test LambdaRegression.CanonicalGeneration.generate_canonical isa Function
     @test LambdaRegression.CanonicalGeneration.GenerationWeights isa DataType
@@ -6153,7 +6223,8 @@ end
     using Test
     using Random
     using LambdaRegression.ASTs.NodeASTs: AppNode, ConstNode
-    using LambdaRegression.TypeSystem: TyVar, TyScheme, TyArray, TyNat, TyList, BoolTy, TRUE, FALSE
+    using LambdaRegression.TypeSystem: TyVar, TyScheme, TyArray, TyNat, TyList, BoolTy
+    using LambdaRegression.Primitives: TRUE, FALSE
     using LambdaRegression.TypeSystem: infer, iscompatible, →
 
     CG = LambdaRegression.CanonicalGeneration
@@ -6699,7 +6770,7 @@ end
 
     impossible = CG.generate_canonical(
         BoolVec3;
-        global_consts=Dict{Symbol,Any}(:FLE => LambdaRegression.TypeSystem.FLE),
+        global_consts=Dict{Symbol,Any}(:FLE => Primitives.FLE),
         config=CG.GenerationConfig(;
             rng=Random.MersenneTwister(42),
             weights=CG.GenerationWeights(; instance_factory=0),
@@ -6710,7 +6781,7 @@ end
     target = Vec3 → TyList(BoolTy)
     result = CG.generate_canonical(
         target;
-        global_consts=Dict{Symbol,Any}(:FLE => LambdaRegression.TypeSystem.FLE),
+        global_consts=Dict{Symbol,Any}(:FLE => Primitives.FLE),
         config=CG.GenerationConfig(;
             rng=Random.MersenneTwister(555),
             weights=CG.GenerationWeights(; instance_factory=0),
@@ -6743,7 +6814,7 @@ end
     cond_target = FloatTy → FloatTy
     cond_result = CG.generate_canonical(
         cond_target;
-        global_consts=Dict{Symbol,Any}(:FEQ => LambdaRegression.TypeSystem.FEQ),
+        global_consts=Dict{Symbol,Any}(:FEQ => Primitives.FEQ),
         config=CG.GenerationConfig(;
             rng=Random.MersenneTwister(2000),
             sampler=pick_named(:COND),
@@ -6755,8 +6826,8 @@ end
 
     fold_target = Vec3 → FloatTy
     fold_consts = Dict{Symbol,Any}(
-        :LENF => LambdaRegression.TypeSystem.LENF,
-        :FADD => LambdaRegression.TypeSystem.FADD,
+        :LENF => Primitives.LENF,
+        :FADD => Primitives.FADD,
     )
     fold_result = CG.generate_canonical(
         fold_target;
@@ -6843,7 +6914,7 @@ end
         target;
         global_consts=Dict{Symbol,Any}(
             :zero => 0.0,
-            :LENF => LambdaRegression.TypeSystem.LENF,
+            :LENF => Primitives.LENF,
         ),
         config=CG.GenerationConfig(;
             rng=Random.MersenneTwister(1234),
@@ -7056,8 +7127,8 @@ end
     Matrix32 = TyArray(TyNat(3), Vec2)
     target = Matrix32 → FloatTy
     fold_consts = Dict{Symbol,Any}(
-        :FADD => LambdaRegression.TypeSystem.FADD,
-        :LENF => LambdaRegression.TypeSystem.LENF,
+        :FADD => Primitives.FADD,
+        :LENF => Primitives.LENF,
     )
 
     function signature_count(sig, name::Symbol)
@@ -7178,7 +7249,7 @@ end
 
     CG = LambdaRegression.CanonicalGeneration
     relation = CG.CoreRelation(;
-        global_consts=Dict{Symbol,Any}(:FEQ => LambdaRegression.TypeSystem.FEQ),
+        global_consts=Dict{Symbol,Any}(:FEQ => Primitives.FEQ),
         guarded_expansion_depth=1,
     )
     scope = Ty[FloatTy]
@@ -7227,7 +7298,7 @@ end
         matrix_fold_ty,
         CG.Decoration(),
         CG.WeightBucket(:test);
-        metadata=(value=LambdaRegression.TypeSystem.AFOLDL,),
+        metadata=(value=Primitives.AFOLDL,),
     )
     row_head = CG.HeadEntry(
         :AFOLDL,
@@ -7235,7 +7306,7 @@ end
         row_fold_ty,
         CG.Decoration(),
         CG.WeightBucket(:test);
-        metadata=(value=LambdaRegression.TypeSystem.AFOLDL,),
+        metadata=(value=Primitives.AFOLDL,),
     )
 
     matrix_node = CG._head_node!(matrix_head, local_consts, local_const_types, relation)
@@ -7310,7 +7381,7 @@ end
     result = CG.generate_canonical(
         target;
         rng=Random.MersenneTwister(2000),
-        global_consts=Dict{Symbol,Any}(:LENF => LambdaRegression.TypeSystem.LENF),
+        global_consts=Dict{Symbol,Any}(:LENF => Primitives.LENF),
         guarded_expansion_depth=0,
     )
 
@@ -7503,7 +7574,8 @@ end
     using Test
     using Random
     using LambdaRegression.ASTs.NodeASTs: ConstNode
-    using LambdaRegression.TypeSystem: BoolTy, FALSE, NOT, TRUE, infer, iscompatible
+    using LambdaRegression.TypeSystem: BoolTy, infer, iscompatible
+    using LambdaRegression.Primitives: FALSE, NOT, TRUE
 
     CG = LambdaRegression.CanonicalGeneration
     context = Dict{Symbol,Any}(:TRUE => TRUE, :FALSE => FALSE, :NOT => NOT)
@@ -7865,13 +7937,14 @@ end
     end
 end
 
-@testitem "CanonicalGeneration integration smoke supports Individual evaluation and mutation" begin
+@testitem "CanonicalGeneration integration smoke supports Program evaluation and mutation" begin
     using Test
     using Random
     using LambdaRegression.ASTs.NodeASTs: AstTree
     using LambdaRegression.Mutations: IndexedProvider, ScalarConstMutation, WeightedPairChooser, mutate_tree
-    using LambdaRegression.Mutations.Populations: Individual
-    using LambdaRegression.Regression: default_components, default_config, evaluate_default
+    using LambdaRegression.Programs: Program
+    using LambdaRegression.Regression: default_components, default_config
+    using LambdaRegression.Execution: evaluate_default
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, infer, iscompatible
 
     CG = LambdaRegression.CanonicalGeneration
@@ -7891,9 +7964,8 @@ end
     id_result = CG.generate_canonical(target; config=id_config)
 
     @test id_result isa CG.GenerationResult
-    ind = Individual(
-        id_result.tree,
-        target;
+    program = Program(
+        id_result.tree;
         local_consts=id_result.local_consts,
         local_consts_ty=id_result.local_const_types,
     )
@@ -7903,7 +7975,15 @@ end
         input_slots=Symbol[:x],
         input_types=Dict{Symbol,TyLike}(:x => FloatTy),
     )
-    @test evaluate_default(ind, 2.5, components, default_config(max_reduce_steps=20)) == 2.5
+    @test evaluate_default(
+        program,
+        2.5;
+        input_slots=components.input_slots,
+        global_consts=components.global_consts,
+        make_eval_context=components.make_eval_context,
+        const_symfactory_ctor=components.const_symfactory_ctor,
+        max_reduce_steps=20,
+    ) == 2.5
 
     const_result = CG.generate_canonical(
         FloatTy;
@@ -10360,5 +10440,7 @@ end
     @test_throws ArgumentError CG.GenerationWeights(Inf, Dict{Symbol,Float64}())
     @test_throws ArgumentError CG.GenerationWeights(1.0, Dict{Symbol,Float64}(:constant => -1.0))
 end
+
+include("FunctionDefGeneration.jl")
 
 end # module CanonicalGeneration

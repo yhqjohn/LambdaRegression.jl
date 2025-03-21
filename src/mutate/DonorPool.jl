@@ -20,7 +20,7 @@ using TestItems
 
 """Tunable bounded-pool policy.
 
-Entries are anchored by an explicitly admitted source `Individual` and AST
+Entries are anchored by an explicitly admitted source `Program` and AST
 path. `policy` is `:uniform` or `:adaptive`; every adaptive entry retains the
 positive `exploration_floor`. The configuration itself needs no typing context,
 while `admit_random_donors!` and `recombine_from_pool` require the recipient
@@ -130,7 +130,8 @@ DonorPoolOutcome(;
 
 mutable struct _DonorPoolEntry
     id::Int
-    donor::Individual
+    donor::Program
+    donor_target::Ty
     path::Tuple{Vararg{Int}}
     source_fitness::Union{Nothing,Float64}
     admitted_at::Int
@@ -180,7 +181,8 @@ DonorPool(config::DonorPoolConfig=DonorPoolConfig()) = DonorPool(
 """Immutable selection containing a detached snapshot of the sampled donor."""
 struct DonorPoolSelection
     donor_id::Int
-    donor::Individual
+    donor::Program
+    donor_target::Ty
     path::Tuple{Vararg{Int}}
     weight::Float64
 end
@@ -218,9 +220,10 @@ end
 """Admit one explicit source fragment, evicting one low-priority entry if full."""
 function admit_donor!(
     pool::DonorPool,
-    donor::Individual,
+    donor::Program,
     path;
-    source_fitness::Union{Nothing,Real}=donor.fitness,
+    donor_target::Ty,
+    source_fitness::Union{Nothing,Real}=nothing,
 )
     normalized_path = Tuple(Int.(collect(path)))
     _node_at_path_maybe(donor.tree, collect(normalized_path)) === nothing &&
@@ -236,7 +239,8 @@ function admit_donor!(
         pool.next_id += 1
         push!(pool.entries, _DonorPoolEntry(
             id,
-            deepcopy(donor),
+            donor,
+            donor_target,
             normalized_path,
             fitness,
             pool.clock,
@@ -254,10 +258,6 @@ function admit_donor!(
     end
 end
 
-function _donor_subtree_size(node)::Int
-    return 1 + sum(_donor_subtree_size, children(node); init=0)
-end
-
 """Sample and admit eligible fragments from one already selected individual.
 
 The individual is analyzed once under `global_consts_ty`; eligible sites are
@@ -266,7 +266,8 @@ failure returns `Err`, while an empty eligible set returns an empty id vector.
 """
 function admit_random_donors!(
     pool::DonorPool,
-    donor::Individual;
+    donor::Program;
+    donor_target::Ty,
     rng::AbstractRNG,
     global_consts_ty::Dict{Symbol,TyLike},
     count::Int=1,
@@ -277,22 +278,22 @@ function admit_random_donors!(
     count >= 0 || throw(ArgumentError("count must be nonnegative"))
     min_nodes >= 1 || throw(ArgumentError("min_nodes must be positive"))
     context = merge(global_consts_ty, donor.local_consts_ty)
-    snapshot = _engine_snapshot(
-        donor.tree,
-        context,
-        donor.target_ty,
-        tyfactory_ctor,
+    snapshot = prepare_typed_analysis(
+        donor,
+        context;
+        factory=tyfactory_ctor(),
+        target_ty=donor_target,
     )
     snapshot isa Err && return snapshot
-    eligible = filter(snapshot.sites) do site
-        (include_root || !isempty(site.path)) &&
-            _donor_subtree_size(site.node) >= min_nodes
+    eligible = filter(typed_analysis_site_ids(snapshot; include_root=include_root)) do id
+        snapshot.index.subtree_end[id] - id >= min_nodes
     end
     isempty(eligible) && return Int[]
     order = randperm(rng, length(eligible))
     ids = Int[]
     for index in Iterators.take(order, min(count, length(order)))
-        push!(ids, admit_donor!(pool, donor, eligible[index].path))
+        path = typed_analysis_path(snapshot, eligible[index])
+        push!(ids, admit_donor!(pool, donor, path; donor_target))
     end
     return ids
 end
@@ -319,7 +320,8 @@ function sample_donor(pool::DonorPool; rng::AbstractRNG)
         entry.last_used = pool.clock
         return DonorPoolSelection(
             entry.id,
-            deepcopy(entry.donor),
+            entry.donor,
+            entry.donor_target,
             entry.path,
             weights[index],
         )
@@ -402,8 +404,9 @@ end
 """Sample one explicit fragment, run directional recombination, and feed back."""
 function recombine_from_pool(
     op::TypedSubtreeSwapCrossover,
-    recipient::Individual,
+    recipient::Program,
     pool::DonorPool;
+    recipient_target::Ty,
     rng::AbstractRNG=MersenneTwister(2000),
     trace_callback=nothing,
     kwargs...,
@@ -421,6 +424,8 @@ function recombine_from_pool(
         op,
         recipient,
         selection.donor;
+        recipient_target,
+        donor_target=selection.donor_target,
         rng,
         donor_path=selection.path,
         trace_callback=pool_trace,
@@ -435,14 +440,14 @@ end
     using Random
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.Mutations.Populations:
-        DonorPool, DonorPoolConfig, DonorPoolOutcome, Individual,
+        DonorPool, DonorPoolConfig, DonorPoolOutcome, Program,
         admit_donor!, donor_pool_stats, donor_weights, record_outcome!,
         sample_donor
     using LambdaRegression.TypeSystem: IntTy, TyFun
 
     target = TyFun(IntTy, IntTy)
     donors = [
-        Individual(AstTree(AbsNode(Symbol(:x, i), IndexNode(0))), target)
+        Program(AstTree(AbsNode(Symbol(:x, i), IndexNode(0))))
         for i in 1:3
     ]
     pool = DonorPool(DonorPoolConfig(
@@ -451,8 +456,8 @@ end
         exploration_floor=0.1,
         age_penalty=0.01,
     ))
-    first_id = admit_donor!(pool, donors[1], [1])
-    second_id = admit_donor!(pool, donors[2], [1])
+    first_id = admit_donor!(pool, donors[1], [1]; donor_target=target)
+    second_id = admit_donor!(pool, donors[2], [1]; donor_target=target)
     for _ in 1:3
         record_outcome!(
             pool,
@@ -464,7 +469,7 @@ end
 
     weights = donor_weights(pool)
     @test weights[first_id] > weights[second_id] > 0
-    third_id = admit_donor!(pool, donors[3], [1])
+    third_id = admit_donor!(pool, donors[3], [1]; donor_target=target)
     stats = donor_pool_stats(pool)
     @test stats.admitted == 3
     @test stats.promotions == 3
@@ -475,10 +480,10 @@ end
     @test !(second_id in stats.entry_ids)
 
     isolated = DonorPool(DonorPoolConfig(capacity=1, policy=:uniform))
-    admit_donor!(isolated, donors[1], [1])
+    admit_donor!(isolated, donors[1], [1]; donor_target=target)
     first_selection = sample_donor(isolated; rng=MersenneTwister(1234))
-    first_selection.donor.local_consts[:caller_owned] = 1
     second_selection = sample_donor(isolated; rng=MersenneTwister(1234))
+    @test !haskey(first_selection.donor.local_consts, :caller_owned)
     @test !haskey(second_selection.donor.local_consts, :caller_owned)
 end
 
@@ -488,7 +493,7 @@ end
     using LambdaRegression.ASTs.NodeASTs:
         AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.Mutations.Populations:
-        DonorPool, DonorPoolAttempt, DonorPoolConfig, Individual,
+        DonorPool, DonorPoolAttempt, DonorPoolConfig, Program,
         PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
         admit_donor!, donor_pool_stats, recombine_from_pool
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer
@@ -500,7 +505,7 @@ end
         :ZERO => IntTy,
         :USE_FUN => TyFun(int_function, IntTy),
     )
-    recipient = Individual(
+    recipient = Program(
         AstTree(AbsNode(
             :x,
             AppNode(
@@ -508,9 +513,8 @@ end
                 ConstNode(:ZERO),
             ),
         )),
-        int_function,
     )
-    donor = Individual(
+    donor = Program(
         AstTree(AbsNode(
             :x,
             AppNode(
@@ -524,11 +528,10 @@ end
                 ),
             ),
         )),
-        int_function,
     )
     before_recipient, before_donor = deepcopy(recipient), deepcopy(donor)
     pool = DonorPool(DonorPoolConfig(capacity=4, policy=:uniform))
-    donor_id = admit_donor!(pool, donor, [1, 2, 1])
+    donor_id = admit_donor!(pool, donor, [1, 2, 1]; donor_target=int_function)
     op = TypedSubtreeSwapCrossover(
         max_try=1,
         require_same_depth=false,
@@ -542,6 +545,7 @@ end
         pool;
         rng=MersenneTwister(2000),
         global_consts_ty=ctx,
+        recipient_target=int_function,
     )
 
     @test attempt isa DonorPoolAttempt
@@ -562,17 +566,17 @@ end
     using Random
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
     using LambdaRegression.Mutations.Populations:
-        DonorPool, DonorPoolConfig, Individual, PathCrossoverSelectionPolicy,
+        DonorPool, DonorPoolConfig, Program, PathCrossoverSelectionPolicy,
         TypedSubtreeSwapCrossover, admit_donor!, donor_pool_stats,
         recombine_from_pool
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
 
     target = TyFun(IntTy, IntTy)
-    donor = Individual(AstTree(AbsNode(:x, IndexNode(0))), target)
+    donor = Program(AstTree(AbsNode(:x, IndexNode(0))))
     recipient = deepcopy(donor)
     pool = DonorPool(DonorPoolConfig(capacity=1, policy=:adaptive))
-    admit_donor!(pool, donor, [1])
+    admit_donor!(pool, donor, [1]; donor_target=target)
     attempt = recombine_from_pool(
         TypedSubtreeSwapCrossover(
             max_try=1,
@@ -583,6 +587,7 @@ end
         pool;
         rng=MersenneTwister(1),
         global_consts_ty=Dict{Symbol,TyLike}(),
+        recipient_target=target,
     )
     @test attempt.result isa Err
     stats = donor_pool_stats(pool)
@@ -596,16 +601,15 @@ end
     using Base.Threads
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
     using LambdaRegression.Mutations.Populations:
-        DonorPool, DonorPoolConfig, DonorPoolOutcome, Individual,
+        DonorPool, DonorPoolConfig, DonorPoolOutcome, Program,
         admit_donor!, donor_pool_stats, record_outcome!
     using LambdaRegression.TypeSystem: IntTy, TyFun
 
-    donor = Individual(
+    donor = Program(
         AstTree(AbsNode(:x, IndexNode(0))),
-        TyFun(IntTy, IntTy),
     )
     pool = DonorPool(DonorPoolConfig(capacity=2, policy=:adaptive))
-    donor_id = admit_donor!(pool, donor, [1])
+    donor_id = admit_donor!(pool, donor, [1]; donor_target=TyFun(IntTy, IntTy))
     tasks = [Threads.@spawn record_outcome!(
         pool,
         donor_id,

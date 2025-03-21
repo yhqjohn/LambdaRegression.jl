@@ -17,9 +17,11 @@ Design goals
 This module models mutation as choosing a pair `(mutation, site)` and applying it:
 
 1. **Site provider** (`AbstractSiteProvider`):
-   - Computes and stores a list of mutation sites for a given tree, including
-     parent pointers, scope depth, and the inferred type of each node.
-   - `IndexedProvider` builds a practical baseline index (`sites_all` + `sites_by_kind`).
+   - `IndexedProvider` derives occurrence-backed sites from one root-constrained
+     `TypedAnalysis` for the common syntax, with paths and binder slots on demand.
+   - Binding insertion and Graft consume that same analysis for the selected
+     occurrence and recorded let-like schemes; scoped trees remain rewrite-only.
+   - FunctionDef mutations consume that same analysis for exact binder schemes.
 
 2. **Pair chooser** (`AbstractPairChooser`):
    - Selects a mutation operator and a compatible site.
@@ -121,12 +123,6 @@ mutation = SubtreeReplacementMutation(;
 )
 ```
 
-`mutate_tree(...; type_inference=checker)` replaces the four-argument type
-checker used for both site decoration and post-mutation validation. The callable
-receives `(tree, type_ctx, tyfactory, meta_or_nothing)`. Omitting it preserves the
-ordinary core `infer` path; procedural layers can inject their lowering-aware
-checker without coupling this module to that AST extension.
-
 ## Direct composition
 
 `UnaryCompositionMutation()` wraps a selected `S : T` with a monomorphic global
@@ -163,7 +159,7 @@ changing site selection, pair choice, or mutation validation.
 ## Let-region mutations
 
 Let-like regions are recognized from the core encoding
-`AppNode(AbsNode(...), rhs)`; callers do not need a persistent `ScopeNode`.
+`AppNode(AbsNode(...), rhs)`; let-like bindings use only the common AST.
 Three accepted operators share one attempt-local binder-resolved view:
 
 - `LetHoistMutation()` moves one binding across one legal parent. Set
@@ -176,7 +172,7 @@ Three accepted operators share one attempt-local binder-resolved view:
 They require no mutation-specific context fields. Capture safety, De Bruijn
 rebasing, and the distinction between ordinary applications and maximally
 generalized let-like applications are checked by the shared rewrite kernel;
-the usual final `infer`/`iscompatible` check remains authoritative. An operator
+final whole-tree Algorithm W remains authoritative. An operator
 can fail normally when no legal region exists, when a move would alter a
 retained application role, or when final validation rejects the result.
 
@@ -244,7 +240,8 @@ and staged local constants. Captured host binders remain rigid during this check
 quantified variables in the selected scheme remain genuinely polymorphic. RHS
 generalization follows `FTV(rhs) ∖ FTV(environment)`, and enclosing binder types
 are reconstructed from the current tree and authoritative path rather than
-trusted from caller-supplied `Site` metadata.
+trusted from caller-supplied `Site` metadata. Its new binder name is made fresh
+against named variables and abstractions in the attempt tree.
 
 ```julia
 fresh = LambdaRegression.TypeSystem.make_tyvar_factory()
@@ -371,7 +368,8 @@ context:
 
 ```julia
 using LambdaRegression.Mutations
-using LambdaRegression.TypeSystem: FST, PAIR, SND, TyLike, get_type_ctx
+using LambdaRegression.TypeSystem: TyLike, get_type_ctx
+using LambdaRegression.Primitives: FST, PAIR, SND
 
 capability = PrimitiveProductCapability(
     pair_head=:MAKE_PAIR,
@@ -394,7 +392,9 @@ Custom primitive-head mappings subtype `AbstractProductCapability` and define
 `product_primitive_heads(::MyCapability)`. The current protocol does not replace
 the product AST shape or its evaluation strategy. The shared kernel continues
 to own binder resolution, strict matching, materialization, and final type
-validation.
+validation. Generated binder names avoid all named variables and abstractions
+in the attempt tree. Packing/unpacking conservatively reject named references
+to the let binders they remove; De Bruijn references remain supported.
 """
 module Mutations
 
@@ -403,13 +403,20 @@ using TestItems
 
 using ..Utils: Err
 using ..TypeSystem
-using ..TypeSystem: Ty, TyLike, TyConst, TyFun, TyList, TyVar, TyArray, TyNat, instantiate, infer, iscompatible, newtyvar, BoolTy, IntTy, FloatTy
+using ..Primitives
+using ..TypeSystem: Ty, TyLike, TyConst, TyFun, TyList, TyVar, TyArray, TyNat,
+    instantiate, infer, iscompatible, newtyvar, BoolTy, IntTy, FloatTy,
+    _detached_type_ctx
 using ..ASTs.NodeASTs
-using ..ASTs.CSE: canonicalize, eliminate_expression!, eliminate_node!, repeated_nodes
+using ..ProgramAnalysis:
+    TypedAnalysis, SyntaxIndex, analyze_program, path,
+    visible_binder_ids
+using ..Transforms: eliminate_node!, occurrence_id, repeated_nodes
 using ..CanonicalGeneration: generate_canonical_scoped, GenerationResult
+using ..Programs: Program, _publish_program
 import ..ASTs.NodeASTs: apply_node!, shift_free_variables!
-using ..ASTs.Contexts: new_constant!, ConstSymbolFactory
-using ..Trees: traverse, PointerState, StackState, getstate, Break, setroot!, setchild!, children
+using ..Programs: new_constant!, ConstSymbolFactory
+using ..Trees: traverse, Break, getstate, setroot!, setchild!, children
 
 export mutate_tree, default_mutations
 export AbstractMutation, required_site_kinds, is_site_eligible, apply
@@ -437,6 +444,8 @@ export ProductPackMutation, ProductUnpackMutation
 export product_primitive_heads
 export generate_binding_rhs
 export CondAppPullMutation, CondAppPushMutation
+export FunctionDefMutation, FunctionDefScope, generate_functiondef_replacement
+export DefaultFunctionDefMutationGenerator
 export Populations
 
 struct MaxTryReachedErr end
@@ -462,25 +471,125 @@ Mutation site metadata derived from a typed traversal of an `AstTree`.
 `Site` is the *adapter* between typing/scope information and mutation operators.
 
 # Fields
-- `path`: stable 1-based child-index path from root (`Int[]` means root)
-- `node`: current AST node
+- `occurrence`: stable occurrence ID in the shared syntax index (zero for legacy/manual sites)
+- `path`: stable 1-based child-index path from root (`Int[]` means root), recovered on demand
+- `node`: AST node at this occurrence
 - `parent`: parent AST node (or `nothing` for root)
-- `child_index`: 1-based child index in `parent` (from `PointerState`)
-- `depth`: number of enclosing lambdas (scope depth)
+- `child_index`: 1-based child index in `parent`
+- `depth`: number of enclosing λ/FunctionDef binders
 - `kind`: coarse kind for eligibility routing:
   - `:const_local`, `:const_global`, `:index`, `:app`, `:abs`, `:any`
-- `ty`: inferred monotype lower-bound for the node (from `infer(..., meta=...)`)
-- `binder_types`: enclosing binder argument types, ordered outer → inner
+- `ty`: inferred monotype for the node
+- `binder_types`: complete visible binder schemes, ordered outer → inner
 """
-struct Site
-    path::Vector{Int}
-    node::AstNode
-    parent::Union{Nothing,AstNode}
-    child_index::Int                 # 1-based child index in `parent` (PointerState)
-    depth::Int                       # number of enclosing lambdas
-    kind::Symbol                     # :const_local, :const_global, :index, :app, :abs, :any
-    ty::Ty                           # node lower-bound type (monotype)
-    binder_types::Vector{Ty}         # enclosing binders (outer -> inner)
+mutable struct Site
+    analysis::Union{Nothing,TypedAnalysis}
+    occurrence::Int
+    path_cache::Union{Nothing,Vector{Int}}
+    node_cache::Union{Nothing,AstNode}
+    parent_cache::Union{Nothing,AstNode}
+    child_index_cache::Int
+    depth_cache::Int
+    kind::Symbol
+    ty_cache::Union{Nothing,Ty}
+    binder_types_cache::Union{Nothing,Vector{TyLike}}
+end
+
+function Site(
+    path::Vector{Int},
+    node::AstNode,
+    parent::Union{Nothing,AstNode},
+    child_index::Int,
+    depth::Int,
+    kind::Symbol,
+    ty::Ty,
+    binder_types::AbstractVector{<:TyLike},
+    occurrence::Int=0,
+)
+    return Site(
+        nothing,
+        occurrence,
+        path,
+        node,
+        parent,
+        child_index,
+        depth,
+        kind,
+        ty,
+        TyLike[binder for binder in binder_types],
+    )
+end
+
+function Site(analysis::TypedAnalysis, occurrence::Int, kind::Symbol)
+    1 <= occurrence <= length(analysis) || throw(BoundsError(analysis.index.nodes, occurrence))
+    return Site(analysis, occurrence, nothing, nothing, nothing, 0, -1, kind, nothing, nothing)
+end
+
+function Base.getproperty(site::Site, name::Symbol)
+    analysis = getfield(site, :analysis)
+    occurrence = getfield(site, :occurrence)
+    if analysis === nothing
+        name === :path && return getfield(site, :path_cache)
+        name === :node && return getfield(site, :node_cache)
+        name === :parent && return getfield(site, :parent_cache)
+        name === :child_index && return getfield(site, :child_index_cache)
+        name === :depth && return getfield(site, :depth_cache)
+        name === :kind && return getfield(site, :kind)
+        name === :ty && return getfield(site, :ty_cache)::Ty
+        name === :binder_types && return getfield(site, :binder_types_cache)::Vector{TyLike}
+    else
+        index = analysis.index
+        name === :path && begin
+            cached = getfield(site, :path_cache)
+            cached === nothing || return cached
+            value = path(index, occurrence)
+            setfield!(site, :path_cache, value)
+            return value
+        end
+        name === :node && return index.nodes[occurrence]
+        name === :parent && begin
+            parent_id = index.parent[occurrence]
+            return parent_id == 0 ? nothing : index.nodes[parent_id]
+        end
+        name === :child_index && return index.parent[occurrence] == 0 ? 1 : index.parent_edge[occurrence]
+        name === :depth && begin
+            cached = getfield(site, :depth_cache)
+            cached >= 0 && return cached
+            depth = 0
+            binder = index.env_head[occurrence]
+            while binder != 0
+                depth += 1
+                binder = index.bindings[binder].outer
+            end
+            setfield!(site, :depth_cache, depth)
+            return depth
+        end
+        name === :kind && return getfield(site, :kind)
+        name === :ty && begin
+            cached = getfield(site, :ty_cache)
+            cached === nothing || return cached
+            raw = analysis.metadata[occurrence][1]
+            raw isa Ty || throw(ArgumentError("mutation site $occurrence has non-monotype type metadata"))
+            value = TypeSystem.prune(raw)
+            setfield!(site, :ty_cache, value)
+            return value
+        end
+        name === :binder_types && begin
+            cached = getfield(site, :binder_types_cache)
+            cached === nothing || return cached
+            ids = reverse(visible_binder_ids(index, occurrence))
+            value = TyLike[]
+            for binder in ids
+                haskey(analysis.binder_schemes, binder) || throw(ArgumentError(
+                    "mutation analysis lacks a scheme for visible binder $binder",
+                ))
+                push!(value, analysis.binder_schemes[binder])
+            end
+            setfield!(site, :binder_types_cache, value)
+            return value
+        end
+    end
+    return getfield(site, name)
 end
 
 struct PairChoice
@@ -555,10 +664,8 @@ site_weight(::AbstractMutation, ::Site, ::Any, ::NamedTuple) = 1.0
 
 Abstract base type for site providers.
 
-Site providers are responsible for:
-- running `infer(tree, type_ctx; meta=...)` once (if desired),
-- traversing the AST and collecting `Site` records,
-- (optionally) indexing sites by `kind` for fast access.
+Site providers are responsible for supplying occurrence-backed `Site` records
+and optionally indexing them by `kind` for fast access.
 
 ## Required interface
 - `reset!(provider)`
@@ -655,7 +762,7 @@ mutable struct MutationEnv
     target_ty::Ty
     type_ctx::Dict{Symbol,TyLike}
     tree::Union{Nothing,AstTree}
-    meta::Union{Nothing,Dict{AstNode,Tuple{TyLike,TyLike}}}
+    analysis::Union{Nothing,TypedAnalysis}
     cache_eligibility::Bool
     eligibility_cache::IdDict{Any,Any}
     adaptive_policy::AdaptivePolicy
@@ -799,7 +906,9 @@ function _weighted_choice(rng::AbstractRNG, items::Vector, weights::Vector{Float
     return items[end]
 end
 
-_is_local_const(name::Symbol, ctx::NamedTuple) = haskey(ctx.local_consts, name) && haskey(ctx.local_consts_ty, name)
+_is_local_const(name::Symbol, ctx::NamedTuple) =
+    haskey(ctx, :local_consts) && haskey(ctx, :local_consts_ty) &&
+    haskey(ctx.local_consts, name) && haskey(ctx.local_consts_ty, name)
 function _site_kind(node::AstNode, ctx::NamedTuple)
     if node isa ConstNode
         return _is_local_const(node.name, ctx) ? :const_local : :const_global
@@ -814,19 +923,6 @@ function _site_kind(node::AstNode, ctx::NamedTuple)
     end
 end
 
-function _binder_types(scope, meta)::Vector{Ty}
-    tys = Ty[]
-    for abs in scope.abstractions
-        haskey(meta, abs) || continue
-        raw_abs_ty = meta[abs][1]
-        raw_abs_ty isa Ty || continue
-        abs_ty = TypeSystem.prune(raw_abs_ty)
-        abs_ty isa TyFun || continue
-        push!(tys, TypeSystem.prune(abs_ty.arg))
-    end
-    return tys
-end
-
 function _node_at_path(tree::AstTree, path::Vector{Int})::AstNode
     node = tree.root
     for idx in path
@@ -835,88 +931,116 @@ function _node_at_path(tree::AstTree, path::Vector{Int})::AstNode
     return node
 end
 
-function _remap_site(tree::AstTree, site::Site)::Site
-    node = _node_at_path(tree, site.path)
-    if isempty(site.path)
-        return Site(site.path, node, nothing, 1, site.depth, site.kind, site.ty, site.binder_types)
+function _analysis_occurrence_at_path(analysis::TypedAnalysis, requested_path)
+    occurrence = 1
+    for child_index in requested_path
+        children_ids = analysis.index.children[occurrence]
+        1 <= child_index <= length(children_ids) || return Err(NoEligibleSiteErr())
+        occurrence = children_ids[child_index]
     end
-    parent_path = site.path[1:end-1]
+    return occurrence
+end
+
+function _authoritative_site(
+    analysis::TypedAnalysis,
+    offered::Site,
+    ctx::NamedTuple,
+)
+    offered_analysis = getfield(offered, :analysis)
+    offered_analysis === nothing || offered_analysis === analysis ||
+        return Err(NoEligibleSiteErr())
+
+    offered_occurrence = getfield(offered, :occurrence)
+    offered_occurrence >= 0 || return Err(NoEligibleSiteErr())
+    if offered_analysis === analysis
+        offered_occurrence > 0 || return Err(NoEligibleSiteErr())
+        offered_occurrence <= length(analysis) || return Err(NoEligibleSiteErr())
+        authoritative_path = path(analysis.index, offered_occurrence)
+        cached_path = getfield(offered, :path_cache)
+        cached_path === nothing || cached_path == authoritative_path ||
+            return Err(NoEligibleSiteErr())
+    else
+        authoritative_path = getfield(offered, :path_cache)
+        authoritative_path isa Vector{Int} || return Err(NoEligibleSiteErr())
+        authoritative_path = copy(authoritative_path)
+    end
+
+    occurrence = _analysis_occurrence_at_path(analysis, authoritative_path)
+    occurrence isa Err && return occurrence
+    offered_occurrence == 0 || offered_occurrence == occurrence ||
+        return Err(NoEligibleSiteErr())
+    haskey(analysis.metadata, occurrence) || return Err(NoEligibleSiteErr())
+    return Site(analysis, occurrence, _site_kind(analysis.index.nodes[occurrence], ctx))
+end
+
+function _remap_authoritative_site(tree::AstTree, site::Site)
+    site_path = site.path
+    node = _node_at_path(tree, site_path)
+    if isempty(site_path)
+        return Site(
+            site_path, node, nothing, 1, site.depth, site.kind, site.ty,
+            site.binder_types, site.occurrence,
+        )
+    end
+    parent_path = site_path[1:end-1]
     parent = _node_at_path(tree, parent_path)
-    return Site(site.path, node, parent, site.path[end], site.depth, site.kind, site.ty, site.binder_types)
+    return Site(
+        site_path, node, parent, site_path[end], site.depth, site.kind, site.ty,
+        site.binder_types, site.occurrence,
+    )
 end
 
-function _target_refined_binder_types(tree::AstTree, path::Vector{Int}, target_ty::Ty, fallback::Vector{Ty})
-    node = tree.root
-    expected = target_ty
-    tys = Ty[]
-    for idx in path
-        if node isa AbsNode
-            pruned = TypeSystem.prune(expected)
-            pruned isa TyFun || return fallback
-            push!(tys, pruned.arg)
-            expected = pruned.res
-        end
-        kids = children(node)
-        1 <= idx <= length(kids) || return fallback
-        node = kids[idx]
-    end
-    return tys
+function _remap_site(
+    tree::AstTree,
+    offered::Site,
+    analysis::TypedAnalysis,
+    ctx::NamedTuple,
+)
+    site = _authoritative_site(analysis, offered, ctx)
+    site isa Err && return site
+    return _remap_authoritative_site(tree, site)
 end
 
-function _target_refined_site_ty(tree::AstTree, path::Vector{Int}, target_ty::Ty, fallback::Ty)
-    node = tree.root
-    expected = target_ty
-    isempty(path) && return TypeSystem.prune(expected)
-    for idx in path
-        if node isa AbsNode && idx == 1
-            pruned = TypeSystem.prune(expected)
-            pruned isa TyFun || return fallback
-            expected = pruned.res
-        else
-            return fallback
-        end
-        kids = children(node)
-        1 <= idx <= length(kids) || return fallback
-        node = kids[idx]
-    end
-    return TypeSystem.prune(expected)
-end
-
-function _collect_sites(tree::AstTree, meta::Dict{AstNode,Tuple{TyLike,TyLike}}, ctx::NamedTuple, target_ty::Ty)
+function _collect_analysis_sites(analysis::TypedAnalysis, ctx::NamedTuple)
     sites = Site[]
-    traverse(tree, PointerState{AstNode}, ScopeState) do t, node, bag
-        pointer = getstate(bag, PointerState{AstNode})
-        stack = getstate(bag, StackState{AstNode})
-        scope = getstate(bag, ScopeState)
-        haskey(meta, node) || return nothing
-        meta_node_ty = meta[node][1]
-        raw_node_ty = meta_node_ty isa Ty ? TypeSystem.prune(meta_node_ty) : meta_node_ty
-        raw_binder_types = _binder_types(scope, meta)
-        kind = _site_kind(node, ctx)
-        path =
-            if length(stack.stack) <= 1
-                Int[]
-            else
-                [stack.stack[i][2] for i in 1:(length(stack.stack)-1)]
-            end
-        node_ty = raw_node_ty isa Ty ? _target_refined_site_ty(tree, path, target_ty, raw_node_ty) : raw_node_ty
-        binder_types = _target_refined_binder_types(tree, path, target_ty, raw_binder_types)
-        push!(sites, Site(path, node, pointer.parent, pointer.child_index, length(binder_types), kind, node_ty, binder_types))
-        return nothing
+    for occurrence in eachindex(analysis.index.nodes)
+        haskey(analysis.metadata, occurrence) || continue
+        node = analysis.index.nodes[occurrence]
+        push!(sites, Site(analysis, occurrence, _site_kind(node, ctx)))
     end
     return sites
+end
+
+function _common_mutation_analysis(tree, type_ctx, factory, target_ty)
+    return analyze_program(tree, type_ctx; factory, target_ty)
+end
+
+function _typed_mutation_analysis(env::MutationEnv, ctx::NamedTuple)
+    analysis = get(ctx, :typed_analysis, nothing)
+    if analysis isa TypedAnalysis
+        env.analysis = analysis
+        return analysis
+    end
+    env.analysis isa TypedAnalysis && return env.analysis
+    env.tree === nothing && return Err(NoEligibleSiteErr())
+    analysis = _common_mutation_analysis(
+        env.tree,
+        env.type_ctx,
+        get(ctx, :tyfactory, newtyvar),
+        env.target_ty,
+    )
+    analysis isa Err && return analysis
+    env.analysis = analysis
+    return analysis
 end
 
 """
     IndexedProvider() <: AbstractSiteProvider
 
-Indexed site provider (Milestone B).
+Indexed site provider for the common syntax.
 
-Runs `infer(..., meta=...)` once and traverses once to build:
-- `sites_all`
-- `sites_by_kind` index
-
-This is the recommended provider once correctness is established.
+Consumes one root-constrained `TypedAnalysis` and builds occurrence-backed
+`sites_all` and `sites_by_kind` indexes.
 """
 mutable struct IndexedProvider <: AbstractSiteProvider
     prepared::Bool
@@ -934,24 +1058,23 @@ end
 
 function prepare!(p::IndexedProvider, tree::AstTree, type_ctx::Dict{Symbol,<:TyLike}, env::MutationEnv, ctx::NamedTuple)
     reset!(p)
-    meta = Dict{AstNode,Tuple{TyLike,TyLike}}()
-    factory = haskey(ctx, :tyfactory) ? ctx.tyfactory : newtyvar
-    ty = _run_mutation_inference(ctx, tree, type_ctx, factory, meta)
-    ty isa Err && return ty
-    if ty isa Ty
-        target_copy = TypeSystem._query_copy(
-            env.target_ty,
-            factory,
-            Dict{TypeSystem.TyVar,TypeSystem.TyVar}(),
-        )
-        matched = TypeSystem.unify!(ty, target_copy)
-        matched isa Err && return matched
+    prepared = get(ctx, :typed_analysis, nothing)
+    typed_ctx = type_ctx isa Dict{Symbol,TyLike} ? type_ctx : Dict{Symbol,TyLike}(type_ctx)
+    if !(prepared isa TypedAnalysis) && (env.tree !== tree || env.type_ctx !== typed_ctx)
+        # Cached facts belong to the prior source tree/context. Direct provider
+        # callers need not pre-seed MutationEnv with this input.
+        env.analysis = nothing
     end
-    env.meta = meta
-    p.sites_all = _collect_sites(tree, meta, ctx, env.target_ty)
-    for s in p.sites_all
-        push!(get!(p.sites_kind, :any, Site[]), s)
-        s.kind === :any || push!(get!(p.sites_kind, s.kind, Site[]), s)
+    # A call-local root-constrained analysis, when supplied, remains the
+    # authority; otherwise _typed_mutation_analysis builds facts for this input.
+    env.tree = tree
+    env.type_ctx = typed_ctx
+    analysis = _typed_mutation_analysis(env, ctx)
+    analysis isa Err && return analysis
+    p.sites_all = _collect_analysis_sites(analysis, ctx)
+    for site in p.sites_all
+        push!(get!(p.sites_kind, :any, Site[]), site)
+        site.kind === :any || push!(get!(p.sites_kind, site.kind, Site[]), site)
     end
     p.prepared = true
     return nothing
@@ -1304,18 +1427,26 @@ function _generation_closed_type(ty::Ty)
     return false
 end
 
-function _default_mutation_inference(tree, type_ctx, factory, meta)
-    meta === nothing && return infer(tree, type_ctx, factory)
-    return infer(tree, type_ctx, factory, meta)
+function _site_binder_monotype(binder::TyLike)
+    if binder isa Ty
+        return TypeSystem.prune(binder)
+    elseif isempty(binder.vars)
+        return TypeSystem.prune(binder.ty)
+    end
+    return nothing
 end
 
-function _run_mutation_inference(ctx, tree, type_ctx, factory, meta)
-    checker = haskey(ctx, :type_inference) ? ctx.type_inference : _default_mutation_inference
-    applicable(checker, tree, type_ctx, factory, meta) || throw(ArgumentError(
-        "type_inference must accept (tree, type_ctx, tyfactory, meta_or_nothing)",
+_site_scope_is_monomorphic(site::Site) =
+    all(binder -> _site_binder_monotype(binder) !== nothing, site.binder_types)
+
+function _site_scope_types(site::Site)
+    _site_scope_is_monomorphic(site) || throw(ArgumentError(
+        "generation does not support quantified visible binder schemes",
     ))
-    return checker(tree, type_ctx, factory, meta)
+    return Ty[_site_binder_monotype(binder) for binder in reverse(site.binder_types)]
 end
+
+_infer_mutation_type(tree, type_ctx, factory) = infer(tree, type_ctx, factory)
 
 function _replacement_generation_kwargs(
     include_local_consts::Bool,
@@ -1326,7 +1457,7 @@ function _replacement_generation_kwargs(
 )
     defaults = (;
         rng=env.rng,
-        scope_tys=reverse(site.binder_types),
+        scope_tys=_site_scope_types(site),
         global_consts=_global_consts(ctx),
         global_consts_ty=ctx.global_consts_ty,
         local_consts=ctx.local_consts,
@@ -1400,6 +1531,7 @@ required_site_kinds(::SubtreeReplacementMutation) = Symbol[:any]
 
 function is_site_eligible(m::SubtreeReplacementMutation, site::Site, env::MutationEnv, ctx::NamedTuple)
     is_site_locked(m.site_lock, site, env, ctx) && return false
+    _site_scope_is_monomorphic(site) || return false
     _generation_closed_type(site.ty) || return false
     return site_selection_weight(m.site_selection, site, env, ctx) > 0
 end
@@ -1592,6 +1724,7 @@ function _merge_replacement_consts!(
 end
 
 function apply(m::SubtreeReplacementMutation, tree::AstTree, site::Site, env::MutationEnv, ctx::NamedTuple)
+    _site_scope_is_monomorphic(site) || return Err(NoEligibleSiteErr())
     result = generate_replacement(m.replacement_generator, site, env, ctx, m.generation_kwargs)
     result isa Err && return result
     result isa GenerationResult || return Err(ArgumentError("replacement generator must return GenerationResult or Err"))
@@ -1620,10 +1753,14 @@ Grow a selected `S : A` into the typed let-like context
 composition step that ordinary finite witness generation and plain subtree
 replacement do not provide on their own.
 
+The actual binder name is chosen fresh against named variables and abstractions
+in the generated context, so an injected `VarNode` cannot be captured by the
+context wrapper.
+
 The generated context sees `seed` as De Bruijn index zero followed by the
-binders already visible at the selected site. Procedural generators remain
+binders already visible at the selected site. FunctionDef-aware generators remain
 injectable, but contexts whose use of `seed` is hidden below a non-core binder
-are conservatively rejected; final injected inference is still authoritative.
+are conservatively rejected; final whole-tree Algorithm W remains authoritative.
 """
 struct ContextualExpansionMutation <: AbstractMutation
     site_selection::AbstractSiteSelectionPolicy
@@ -1656,6 +1793,7 @@ function is_site_eligible(
     env::MutationEnv,
     ctx::NamedTuple,
 )
+    _site_scope_is_monomorphic(site) || return false
     _generation_closed_type(site.ty) || return false
     return site_selection_weight(mutation.site_selection, site, env, ctx) > 0
 end
@@ -1686,6 +1824,9 @@ function apply(
     env::MutationEnv,
     ctx::NamedTuple,
 )
+    _site_scope_is_monomorphic(site) || return Err(NoEligibleSiteErr())
+    context_binders = Ty[_site_binder_monotype(binder) for binder in site.binder_types]
+    push!(context_binders, site.ty)
     context_site = Site(
         site.path,
         site.node,
@@ -1694,7 +1835,7 @@ function apply(
         site.depth + 1,
         site.kind,
         site.ty,
-        Ty[site.binder_types; site.ty],
+        context_binders,
     )
     result = generate_replacement(
         mutation.replacement_generator,
@@ -1721,8 +1862,9 @@ function apply(
         reserved_const_types=ctx.global_consts_ty,
     )
 
+    seed_name = only(_fresh_binder_names(AstTree(context.root), () -> :seed, 1))
     expanded = AstTree(AppNode(
-        AbsNode(:seed, context.root),
+        AbsNode(seed_name, context.root),
         deepcopy(site.node),
     ))
     _replace_site!(tree, site, expanded)
@@ -1736,7 +1878,7 @@ Wrap a selected closed-typed subtree `S : T` with a monomorphic global
 endomorphism `H : T → T`, producing `H S`. This is the direct bounded
 neighborhood for productive unary operators such as square, square root, or a
 shape-specific tensor transform. Polymorphic and local heads remain outside
-this operator; final injected inference still validates the complete tree.
+this operator; final whole-tree Algorithm W still validates the complete tree.
 """
 struct UnaryCompositionMutation{S} <: AbstractMutation
     site_selection::S
@@ -1884,6 +2026,7 @@ function is_site_eligible(
     env::MutationEnv,
     ctx::NamedTuple,
 )
+    _site_scope_is_monomorphic(site) || return false
     site_selection_weight(mutation.site_selection, site, env, ctx) > 0 || return false
     return !isempty(_binary_composition_options(site, ctx))
 end
@@ -1902,6 +2045,7 @@ function apply(
     env::MutationEnv,
     ctx::NamedTuple,
 )
+    _site_scope_is_monomorphic(site) || return Err(NoEligibleSiteErr())
     options = _binary_composition_options(site, ctx)
     isempty(options) && return Err(NoEligibleSiteErr())
     option = rand(env.rng, options)
@@ -2481,7 +2625,8 @@ Rewrites `f` to `λx. f #0`, preserving the inferred type (up to `iscompatible`)
 while increasing structural depth for later CSE/beta moves.
 
 Eligibility: `site.ty` must be (prune-)function-shaped and `site.node` must not be
-an `AbsNode` (to avoid introducing an immediate beta-redex).
+an `AbsNode` (to avoid introducing an immediate beta-redex). The new binder name
+is adjusted to avoid named references in the attempt tree.
 """
 struct EtaExpandMutation <: AbstractMutation end
 required_site_kinds(::EtaExpandMutation) = Symbol[:any]
@@ -2496,7 +2641,8 @@ function apply(::EtaExpandMutation, tree::AstTree, site::Site, env::MutationEnv,
     is_site_eligible(EtaExpandMutation(), site, env, ctx) || return Err(NoEligibleSiteErr())
     f_tree = AstTree(deepcopy(site.node))
     shift_free_variables!(f_tree, 1, 0)
-    name = haskey(ctx, :symfactory) ? ctx.symfactory() : SymbolGenerator()()
+    factory = haskey(ctx, :symfactory) ? ctx.symfactory : SymbolGenerator()
+    name = only(_fresh_binder_names(tree, factory, 1))
     new_subtree = AbsNode(name, AppNode(f_tree.root, IndexNode(0)))
     _replace_site!(tree, site, AstTree(new_subtree))
     return tree
@@ -2608,10 +2754,10 @@ end
 
 Semantics-preserving common subexpression extraction.
 
-This mutation chooses an anchor subexpression, canonicalizes it (alpha-invariant),
-and delegates to the node-anchored `ASTs.CSE.eliminate_node!` path, which
-compares De Bruijn captures by binder identity before rewriting the tree by
-introducing a beta-redex around the LCA of matches.
+This mutation chooses an anchor occurrence and delegates to the common
+`Transforms.eliminate_node!` path.  The transformation consumes the
+attempt-local `ProgramAnalysis.SyntaxIndex`, compares captures by binding
+identity, and introduces a let-like application around a legal host.
 
 When `min_count=1`, this acts as a "zero-cost" structural move: it can extract a
 single occurrence to increase structural diversity without changing semantics.
@@ -2625,20 +2771,37 @@ end
 CSEMutation(; min_count::Int=1) = CSEMutation(min_count)
 required_site_kinds(::CSEMutation) = Symbol[:any]
 
-function is_site_eligible(m::CSEMutation, site::Site, env::MutationEnv, ::NamedTuple)
-    m.min_count <= 1 && return !(site.node isa IndexNode)
+function is_site_eligible(m::CSEMutation, site::Site, env::MutationEnv, ctx::NamedTuple)
+    index = haskey(ctx, :cse_index) ? ctx.cse_index : nothing
+    index isa SyntaxIndex || return false
+    if m.min_count <= 1
+        return !(site.node isa IndexNode)
+    end
     site.node isa AppNode || return false
     env.tree === nothing && return true
     cache_key = Symbol("cse_repeated_nodes_", m.min_count)
-    eligible = get!(env.eligibility_cache, cache_key) do
-        repeated_nodes(env.tree; min_count=m.min_count)
+    cached = get!(env.eligibility_cache, cache_key) do
+        (index, repeated_nodes(index; min_count=m.min_count))
     end
+    cached_index, eligible = cached
     eligible isa Err && return true
-    return get(eligible, site.node, false)
+    id = site.occurrence > 0 ? site.occurrence : occurrence_id(cached_index, site.path)
+    return id !== nothing && id in eligible
 end
 
 function apply(m::CSEMutation, tree::AstTree, site::Site, env::MutationEnv, ctx::NamedTuple)
-    return eliminate_node!(tree, site.node; min_count=m.min_count, factory=ctx.symfactory)
+    haskey(ctx, :cse_index) || return Err(ArgumentError("CSE attempt context lacks its source index"))
+    index = ctx.cse_index
+    index === nothing && return Err(ArgumentError("CSE does not support this syntax tree"))
+    occurrence = site.occurrence > 0 ? site.occurrence : occurrence_id(index, site.path)
+    occurrence === nothing && return Err(ArgumentError("CSE site path is not in the attempt tree"))
+    return eliminate_node!(
+        tree,
+        index,
+        occurrence;
+        min_count=m.min_count,
+        factory=ctx.symfactory,
+    )
 end
 
 function _count_nodes(tree::AstTree)
@@ -2675,6 +2838,34 @@ function _require_ctx_fields(ctx::NamedTuple, fields::Vector{Symbol})
     return nothing
 end
 
+function _fresh_binder_names(tree::AstTree, factory, count::Int)
+    count >= 0 || throw(ArgumentError("binder name count must be non-negative"))
+    used = Set{Symbol}()
+    for node in tree
+        if node isa Union{AbsNode,VarNode}
+            push!(used, node.name)
+        end
+    end
+
+    names = Symbol[]
+    sizehint!(names, count)
+    for _ in 1:count
+        suggestion = factory()
+        suggestion isa Symbol || throw(ArgumentError(
+            "symbol factory must return Symbol, got $(typeof(suggestion))",
+        ))
+        candidate = suggestion
+        suffix = 1
+        while candidate in used
+            candidate = Symbol(string(suggestion), "_", string(suffix))
+            suffix += 1
+        end
+        push!(used, candidate)
+        push!(names, candidate)
+    end
+    return names
+end
+
 """
     mutate_tree(tree::AstTree, target_ty::Ty; kwargs...) -> Union{AstTree,Err}
 
@@ -2692,7 +2883,6 @@ Returns `Err(MaxTryReachedErr())` if no valid mutation can be found within `max_
 - `global_consts`: optional runtime values for global constants used by generated replacements
 - `const_symfactory`: per-call deterministic local-constant symbol factory (default: `ConstSymbolFactory()`)
 - `tyfactory`, `symfactory`: local factories used by type inference and CSE
-- `type_inference`: four-argument callable used for site typing and final validation
 
 ## Optional policies (off by default)
 - `bloat_policy::BloatPolicy`
@@ -2712,7 +2902,6 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     local_consts_ty::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     local_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
     tyfactory=newtyvar,
-    type_inference=_default_mutation_inference,
     symfactory=SymbolGenerator(),
     const_symfactory::ConstSymbolFactory=ConstSymbolFactory(),
     bloat_policy::BloatPolicy=BloatPolicy(),
@@ -2728,6 +2917,22 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
 
     # Prepare sites once (the retry loop works on copies of the same input).
     base_type_ctx = merge(global_consts_ty, current_local_consts_ty)
+    uses_cse = any(mutation -> mutation isa CSEMutation, mutations)
+    typed_analysis = _common_mutation_analysis(
+        current_tree,
+        base_type_ctx,
+        tyfactory,
+        target_ty,
+    )
+    if typed_analysis isa Err
+        record!(recorder, nothing, :prepare_err; err_type=typeof(typed_analysis.value))
+        return typed_analysis
+    end
+    cse_index = if uses_cse && typed_analysis isa TypedAnalysis
+        typed_analysis.index
+    else
+        nothing
+    end
     base_ctx = (;
         rng=rng,
         global_consts=global_consts,
@@ -2737,14 +2942,15 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         tyfactory=tyfactory,
         symfactory=symfactory,
         const_symfactory=const_symfactory,
-        type_inference=type_inference,
+        typed_analysis,
+        cse_index,
     )
     env = MutationEnv(
         rng,
         target_ty,
         base_type_ctx,
         current_tree,
-        nothing,
+        typed_analysis,
         chooser isa WeightedPairChooser ? (chooser::WeightedPairChooser).cache_eligibility : false,
         IdDict{Any,Any}(),
         adaptive_policy,
@@ -2764,6 +2970,13 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         attempt_local_consts = copy(current_local_consts)
         attempt_local_consts_ty = copy(current_local_consts_ty)
         attempt_type_ctx = merge(global_consts_ty, attempt_local_consts_ty)
+        choice = choose_pair(chooser, mutations, provider, current_tree, base_type_ctx, env, base_ctx)
+        if choice isa Err
+            record!(recorder, nothing, :choose_err; err_type=typeof(choice.value))
+            return choice
+        end
+
+        m = choice.mutation::AbstractMutation
         attempt_ctx = (;
             rng=rng,
             global_consts=global_consts,
@@ -2773,17 +2986,27 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
             tyfactory=tyfactory,
             symfactory=symfactory,
             const_symfactory=const_symfactory,
-            type_inference=type_inference,
+            cse_index=base_ctx.cse_index,
+            typed_analysis=base_ctx.typed_analysis,
         )
-
-        choice = choose_pair(chooser, mutations, provider, current_tree, base_type_ctx, env, base_ctx)
-        if choice isa Err
-            record!(recorder, nothing, :choose_err; err_type=typeof(choice.value))
-            return choice
+        source_site = _authoritative_site(
+            base_ctx.typed_analysis,
+            choice.site,
+            base_ctx,
+        )
+        if source_site isa Err
+            _update_stat!(env, m, false)
+            record!(recorder, typeof(m), :no_eligible_site; err_type=typeof(source_site.value))
+            continue
         end
-
-        m = choice.mutation::AbstractMutation
-        attempt_site = _remap_site(attempt_tree, choice.site)
+        required = required_site_kinds(m)
+        if !(:any in required || source_site.kind in required) ||
+                !is_site_eligible(m, source_site, env, base_ctx)
+            _update_stat!(env, m, false)
+            record!(recorder, typeof(m), :no_eligible_site; err_type=NoEligibleSiteErr)
+            continue
+        end
+        attempt_site = _remap_authoritative_site(attempt_tree, source_site)
         mutated = apply(m, attempt_tree, attempt_site, env, attempt_ctx)
         if mutated isa Err
             _update_stat!(env, m, false)
@@ -2810,19 +3033,22 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
 
         prune_consts && prune_local_consts!(attempt_tree, attempt_local_consts, attempt_local_consts_ty)
         attempt_type_ctx = merge(global_consts_ty, attempt_local_consts_ty)
-        inferred = _run_mutation_inference(
-            attempt_ctx,
-            attempt_tree,
+        query_ctx, detached_targets = TypeSystem._detached_type_inputs(
             attempt_type_ctx,
+            target_ty,
+        )
+        query_target = only(detached_targets)
+        inferred = _infer_mutation_type(
+            attempt_tree,
+            query_ctx,
             tyfactory,
-            nothing,
         )
         if inferred isa Err
             _update_stat!(env, m, false)
             record!(recorder, typeof(m), :infer_err; err_type=typeof(inferred.value))
             continue
         end
-        if !iscompatible(inferred, target_ty)
+        if !iscompatible(inferred, query_target)
             _update_stat!(env, m, false)
             record!(recorder, typeof(m), :incompatible)
             continue
@@ -2855,6 +3081,7 @@ end
 include("ScopedRewrite.jl")
 include("BindingInsertion.jl")
 include("Graft.jl")
+include("FunctionDefMutation.jl")
 include("ProductPacking.jl")
 include("Population.jl")
 
@@ -2864,7 +3091,7 @@ include("Population.jl")
 
 @testsnippet MutBaseImports begin
     using LambdaRegression.Mutations: prune_local_consts!
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, ConstNode
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AppNode, ConstNode, FunctionDefNode
     using LambdaRegression.TypeSystem: FloatTy, TyLike
     using Random
     using LambdaRegression.Mutations: mutate_tree, ScalarConstMutation, WeightedPairChooser, IndexedProvider, ConstValueMutationPolicy
@@ -2893,8 +3120,188 @@ include("Population.jl")
     using LambdaRegression.TypeSystem: TyFun, IntTy, TyLike, infer, iscompatible
     using LambdaRegression.TypeSystem: TyFun, TyArray, TyNat, FloatTy, TyLike, infer, iscompatible
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, ConstNode
-    using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
+    using LambdaRegression.Programs: ConstSymbolFactory
     using LambdaRegression.Mutations: mutate_tree, BoolConstMutation, WeightedPairChooser, IndexedProvider, MutationAttemptRecorder, mutation_recorder_summary
+end
+
+@testitem "Mutations fresh binder names suffix once per suggestion" setup=[MutBaseImports] begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: VarNode
+    using LambdaRegression.Mutations: _fresh_binder_names
+
+    tree = AstTree(AbsNode(:seed, VarNode(:seed_1)))
+    calls = Ref(0)
+    factory = () -> (calls[] += 1; :seed)
+    names = _fresh_binder_names(tree, factory, 2)
+
+    @test names == [:seed_2, :seed_3]
+    @test calls[] == 2
+end
+
+@testitem "Mutations FunctionDef sites use shared typed binder schemes" setup=[MutBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs: FunctionDefNode
+    using LambdaRegression.ProgramAnalysis: TypedAnalysis, analyze_program
+    using LambdaRegression.TypeSystem: TyFun, IntTy
+
+    self_ty = TyFun(IntTy, IntTy)
+    fd = FunctionDefNode(AbsNode(:x, IndexNode(0)))
+    tree = AstTree(AppNode(ConstNode(:consume), fd))
+    type_ctx = Dict{Symbol,TyLike}(:consume => TyFun(self_ty, IntTy))
+    analysis = analyze_program(tree, type_ctx; target_ty=IntTy)
+    @test analysis isa TypedAnalysis
+    analysis isa TypedAnalysis || return
+
+    sites = LambdaRegression.Mutations._collect_analysis_sites(
+        analysis,
+        (; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}()),
+    )
+    functiondef_site = only(filter(site -> site.node isa FunctionDefNode, sites))
+    body_site = only(filter(
+        site -> site.node isa IndexNode && site.node.index == 0,
+        sites,
+    ))
+    @test functiondef_site.ty == self_ty
+    @test map(LambdaRegression.Mutations._site_binder_monotype, body_site.binder_types) ==
+        TyLike[self_ty, IntTy]
+end
+
+@testitem "Mutations IndexedProvider uses constrained occurrence analysis" setup=[MutBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs:
+        AppNode, AbsNode, ConstNode, FunctionDefNode, IndexNode, VarNode, AstNode
+    using LambdaRegression.Mutations: MutationEnv, AdaptivePolicy, BloatPolicy
+    using LambdaRegression.TypeSystem: TyScheme, TyVar
+
+    shared = ConstNode(:x)
+    tree = AstTree(AppNode(
+        AppNode(ConstNode(:add), shared),
+        shared,
+    ))
+    type_ctx = Dict{Symbol,TyLike}(
+        :add => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
+        :x => FloatTy,
+    )
+    env = MutationEnv(
+        MersenneTwister(42), FloatTy, type_ctx, tree, nothing, false,
+        IdDict{Any,Any}(), AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(),
+        BloatPolicy(),
+    )
+    ctx = (; local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}())
+    provider = IndexedProvider()
+    @test LambdaRegression.Mutations.prepare!(provider, tree, type_ctx, env, ctx) === nothing
+
+    xsites = filter(
+        site -> site.node isa ConstNode && site.node.name === :x,
+        LambdaRegression.Mutations.sites(provider),
+    )
+    @test length(xsites) == 2
+    @test xsites[1].occurrence != xsites[2].occurrence
+    @test xsites[1].node == xsites[2].node
+    @test getfield(xsites[1], :path_cache) === nothing
+    @test getfield(xsites[1], :binder_types_cache) === nothing
+    @test xsites[1].node isa ConstNode
+    @test getfield(xsites[1], :path_cache) === nothing
+    first_path = xsites[1].path
+    @test first_path === xsites[1].path
+    @test [first_path, xsites[2].path] == [[1, 2], [2]]
+    @test xsites[1].ty === FloatTy
+    @test xsites[1].path === xsites[1].path
+    @test xsites[1].binder_types === xsites[1].binder_types
+
+    id_var = newtyvar(0)
+    id_ctx = Dict{Symbol,TyLike}(
+        :id => TyScheme([id_var], TyFun(id_var, id_var)),
+    )
+    id_tree = AstTree(ConstNode(:id))
+    id_env = MutationEnv(
+        MersenneTwister(555), TyFun(IntTy, IntTy), id_ctx, id_tree, nothing,
+        false, IdDict{Any,Any}(), AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(), BloatPolicy(),
+    )
+    id_provider = IndexedProvider()
+    @test LambdaRegression.Mutations.prepare!(
+        id_provider,
+        id_tree,
+        id_ctx,
+        id_env,
+        ctx,
+    ) === nothing
+    @test iscompatible(id_provider.sites_all[1].ty, TyFun(IntTy, IntTy))
+
+    self_ty = TyFun(FloatTy, FloatTy)
+    fd_tree = AstTree(FunctionDefNode(AbsNode(
+        :arg, AppNode(IndexNode(1), IndexNode(0)),
+    )))
+    fd_env = MutationEnv(
+        MersenneTwister(1111), self_ty, Dict{Symbol,TyLike}(), fd_tree, nothing,
+        false, IdDict{Any,Any}(), AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(), BloatPolicy(),
+    )
+    fd_provider = IndexedProvider()
+    @test LambdaRegression.Mutations.prepare!(
+        fd_provider,
+        fd_tree,
+        Dict{Symbol,TyLike}(),
+        fd_env,
+        ctx,
+    ) === nothing
+    self_reference = only(filter(
+        site -> site.node isa IndexNode && site.node.index == 1,
+        LambdaRegression.Mutations.sites(fd_provider),
+    ))
+    @test map(LambdaRegression.Mutations._site_binder_monotype, self_reference.binder_types) ==
+        TyLike[self_ty, FloatTy]
+
+    struct UnknownMutationNode <: AstNode end
+    @test_throws ArgumentError mutate_tree(
+        AstTree(UnknownMutationNode()), IntTy; mutations=LambdaRegression.Mutations.AbstractMutation[],
+    )
+end
+
+@testitem "Mutations preserve polymorphic binder slots and reject quantified generation scopes" setup=[MutBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs: IndexNode
+    using LambdaRegression.Mutations: MutationEnv, AdaptivePolicy, BloatPolicy, PointMutation
+    using LambdaRegression.TypeSystem: TyScheme, TyVar, iscompatible
+
+    quantified_var = newtyvar(0)
+    poly = TyScheme([quantified_var], quantified_var)
+    empty_scheme = TyScheme(TyVar[], FloatTy)
+    mono_site = LambdaRegression.Mutations.Site(
+        Int[], IndexNode(0), nothing, 0, 1, :index, FloatTy, TyLike[empty_scheme],
+    )
+    @test LambdaRegression.Mutations._site_scope_is_monomorphic(mono_site)
+    @test LambdaRegression.Mutations._site_scope_types(mono_site) == [FloatTy]
+
+    # Index 1 addresses the polymorphic middle slot; compressing that slot would
+    # incorrectly make Index 1 refer to the outer Int binder instead.
+    site = LambdaRegression.Mutations.Site(
+        Int[], IndexNode(0), nothing, 0, 3, :index, BoolTy,
+        TyLike[IntTy, poly, BoolTy],
+    )
+    @test length(site.binder_types) == 3
+    @test iscompatible(BoolTy, site.binder_types[2])
+    @test !LambdaRegression.Mutations._site_scope_is_monomorphic(site)
+    env = MutationEnv(
+        MersenneTwister(1), BoolTy, Dict{Symbol,TyLike}(),
+        AstTree(IndexNode(0)), nothing, false, IdDict{Any,Any}(),
+        AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(), BloatPolicy(),
+    )
+    changed = LambdaRegression.Mutations.apply(
+        PointMutation(), env.tree, site, env, NamedTuple(),
+    )
+    @test changed isa AstTree
+    @test changed.root == IndexNode(1)
+
+    generated = LambdaRegression.Mutations._infer_binding_rhs_scheme(
+        AstTree(IndexNode(0)), mono_site, NamedTuple(), Dict{Symbol,TyLike}(), newtyvar,
+    )
+    @test generated isa TyScheme
+    rejected = LambdaRegression.Mutations._infer_binding_rhs_scheme(
+        AstTree(IndexNode(0)), site, NamedTuple(), Dict{Symbol,TyLike}(), newtyvar,
+    )
+    @test rejected isa Err
+    @test rejected.value isa LambdaRegression.Mutations.NoEligibleSiteErr
 end
 
 @testitem "Mutations prune_local_consts! keeps only referenced" setup=[MutBaseImports] begin
@@ -3191,7 +3598,8 @@ end
 @testitem "Mutations ParameterIntroductionMutation creates a typed scalar parameter" setup=[MutBaseImports] begin
     using LambdaRegression.Mutations:
         ParameterIntroductionMutation, PathSiteSelectionPolicy
-    using LambdaRegression.TypeSystem: FADD, SQR, get_type_ctx, infer, iscompatible
+    using LambdaRegression.TypeSystem: get_type_ctx, infer, iscompatible
+    using LambdaRegression.Primitives: FADD, SQR
 
     tree = AstTree(AbsNode(
         :x,
@@ -3389,7 +3797,7 @@ end
     using LambdaRegression.CanonicalGeneration: GenerationResult
     using LambdaRegression.Mutations: SubtreeReplacementMutation, PathSiteSelectionPolicy, DefaultSiteLockPolicy
     using LambdaRegression.Mutations: AbstractReplacementGenerator
-    using LambdaRegression.TypeSystem: FADD
+    using LambdaRegression.Primitives: FADD
 
     struct ConflictingKReplacement <: AbstractReplacementGenerator end
     function LambdaRegression.Mutations.generate_replacement(
@@ -3673,19 +4081,24 @@ end
 end
 
 @testitem "Mutations _remap_site preserves path semantics" setup=[MutBaseImports] begin
+    using LambdaRegression.ProgramAnalysis: analyze_program
     # (λx. (k x)) : Float -> Float
     local_consts = Dict{Symbol,Any}(:k => (x -> x))
     local_consts_ty = Dict{Symbol,TyLike}(:k => TyFun(FloatTy, FloatTy))
     global_consts_ty = Dict{Symbol,TyLike}()
     type_ctx = merge(global_consts_ty, local_consts_ty)
     tree = AstTree(AbsNode(:x, AppNode(ConstNode(:k), IndexNode(0))))
+    stale_tree = AstTree(ConstNode(:k))
+    stale_analysis = analyze_program(
+        stale_tree, type_ctx; target_ty=TyFun(FloatTy, FloatTy),
+    )
 
     env = LambdaRegression.Mutations.MutationEnv(
         MersenneTwister(1111),
         TyFun(FloatTy, FloatTy),
         type_ctx,
-        nothing,
-        nothing,
+        stale_tree,
+        stale_analysis,
         false,
         IdDict{Any,Any}(),
         LambdaRegression.Mutations.AdaptivePolicy(),
@@ -3698,13 +4111,193 @@ end
     LambdaRegression.Mutations.reset!(provider)
     prep = LambdaRegression.Mutations.prepare!(provider, tree, type_ctx, env, ctx)
     @test !(prep isa LambdaRegression.Utils.Err)
+    @test env.analysis !== stale_analysis
+    @test any(node -> node isa IndexNode, env.analysis.index.nodes)
 
     sites = LambdaRegression.Mutations.sites(provider)
     s0 = first(filter(s -> s.node isa IndexNode, sites))
     attempt_tree = deepcopy(tree)
-    remapped = LambdaRegression.Mutations._remap_site(attempt_tree, s0)
+    remapped = LambdaRegression.Mutations._remap_site(
+        attempt_tree,
+        s0,
+        env.analysis::LambdaRegression.ProgramAnalysis.TypedAnalysis,
+        ctx,
+    )
     expected = LambdaRegression.Mutations._node_at_path(attempt_tree, s0.path)
     @test remapped.node == expected
+end
+
+@testitem "Mutations remap chooser sites through the current typed analysis" setup=[MutBaseImports] begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, ConstNode
+    using LambdaRegression.Mutations:
+        AbstractPairChooser, AbstractSiteProvider, MutationEnv, PairChoice, Site,
+        _site_binder_monotype
+    using LambdaRegression.ProgramAnalysis: TypedAnalysis, analyze_program
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, IntTy, TyFun, TyLike
+
+    struct CaptureSiteMutation <: LambdaRegression.Mutations.AbstractMutation
+        seen::Base.RefValue{Any}
+        required_kind::Symbol
+        required_ty::Union{Nothing,TyLike}
+    end
+    CaptureSiteMutation(seen) = CaptureSiteMutation(seen, :any, nothing)
+    LambdaRegression.Mutations.required_site_kinds(m::CaptureSiteMutation) =
+        Symbol[m.required_kind]
+    LambdaRegression.Mutations.is_site_eligible(
+        m::CaptureSiteMutation,
+        site::Site,
+        ::Any,
+        ::NamedTuple,
+    ) = m.required_ty === nothing || site.ty == m.required_ty
+    function LambdaRegression.Mutations.apply(
+        mutation::CaptureSiteMutation,
+        tree::AstTree,
+        site::Site,
+        ::Any,
+        ::NamedTuple,
+    )
+        mutation.seen[] = site
+        return tree
+    end
+
+    struct FixedSiteChooser <: AbstractPairChooser
+        site::Site
+    end
+    function LambdaRegression.Mutations.choose_pair(
+        chooser::FixedSiteChooser,
+        mutations::Vector{<:LambdaRegression.Mutations.AbstractMutation},
+        ::AbstractSiteProvider,
+        ::AstTree,
+        ::Dict{Symbol,<:TyLike},
+        ::MutationEnv,
+        ::NamedTuple,
+    )
+        return PairChoice(first(mutations), chooser.site)
+    end
+
+    tree = AstTree(AbsNode(:outer, AbsNode(:inner, ConstNode(:v))))
+    target_ty = TyFun(IntTy, TyFun(BoolTy, IntTy))
+    type_ctx = Dict{Symbol,TyLike}(:v => IntTy)
+    current = analyze_program(tree, type_ctx; target_ty)
+    @test current isa TypedAnalysis
+    current isa TypedAnalysis || return
+    occurrence = LambdaRegression.Mutations.occurrence_id(current.index, [1, 1])
+    canonical_site = Site(current, occurrence, :const_global)
+
+    # A hand-built proposal may provide only a path. Its other cached claims
+    # deliberately disagree with the current analysis.
+    offered = Site(
+        Int[1, 1], ConstNode(:v), AbsNode(:spoof, ConstNode(:v)), 1,
+        99, :abs, IntTy, TyLike[BoolTy], 0,
+    )
+    accepted = CaptureSiteMutation(Ref{Any}(nothing))
+    result = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(2000),
+        global_consts_ty=type_ctx,
+        mutations=[accepted],
+        chooser=FixedSiteChooser(offered),
+        provider=IndexedProvider(),
+        max_try=1,
+        prune_consts=false,
+    )
+    @test result isa AstTree
+    seen = accepted.seen[]
+    @test seen isa Site
+    @test seen.path == Int[1, 1]
+    @test seen.ty == canonical_site.ty == IntTy
+    @test map(_site_binder_monotype, seen.binder_types) ==
+        map(_site_binder_monotype, canonical_site.binder_types) == TyLike[IntTy, BoolTy]
+    @test seen.depth == 2
+    @test seen.kind == :const_global
+    @test seen.occurrence == occurrence
+
+    # A fake type can satisfy an operator's chooser-time predicate, but the
+    # post-choice check runs on the W-projected source site and rejects it.
+    fake_float = Site(
+        Int[1, 1], ConstNode(:v), AbsNode(:spoof, ConstNode(:v)), 1,
+        2, :const_global, FloatTy, TyLike[FloatTy], 0,
+    )
+    float_only = CaptureSiteMutation(Ref{Any}(nothing), :any, FloatTy)
+    result = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(1234),
+        global_consts_ty=type_ctx,
+        mutations=[float_only],
+        chooser=FixedSiteChooser(fake_float),
+        provider=IndexedProvider(),
+        max_try=1,
+        prune_consts=false,
+    )
+    @test result isa Err
+    @test float_only.seen[] === nothing
+
+    # A fake kind is likewise not authoritative for required-kind routing.
+    fake_abs_kind = Site(
+        Int[1, 1], ConstNode(:v), AbsNode(:spoof, ConstNode(:v)), 1,
+        2, :abs, IntTy, TyLike[BoolTy], 0,
+    )
+    abs_only = CaptureSiteMutation(Ref{Any}(nothing), :abs, nothing)
+    result = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(8000),
+        global_consts_ty=type_ctx,
+        mutations=[abs_only],
+        chooser=FixedSiteChooser(fake_abs_kind),
+        provider=IndexedProvider(),
+        max_try=1,
+        prune_consts=false,
+    )
+    @test result isa Err
+    @test abs_only.seen[] === nothing
+
+    # An occurrence from another analysis is stale even when the selected
+    # node has the same monotype; here the visible binder slots differ.
+    stale_target = TyFun(BoolTy, TyFun(FloatTy, IntTy))
+    stale = analyze_program(tree, type_ctx; target_ty=stale_target)
+    @test stale isa TypedAnalysis
+    stale isa TypedAnalysis || return
+    stale_site = Site(stale, occurrence, :const_global)
+    @test stale_site.ty == canonical_site.ty
+    @test stale_site.binder_types != canonical_site.binder_types
+
+    mismatched = Site(current, occurrence, :const_global)
+    setfield!(mismatched, :path_cache, Int[1])
+    rejected_path = CaptureSiteMutation(Ref{Any}(nothing))
+    result = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(1111),
+        global_consts_ty=type_ctx,
+        mutations=[rejected_path],
+        chooser=FixedSiteChooser(mismatched),
+        provider=IndexedProvider(),
+        max_try=1,
+        prune_consts=false,
+    )
+    @test result isa Err
+    @test rejected_path.seen[] === nothing
+
+    rejected = CaptureSiteMutation(Ref{Any}(nothing))
+    original = deepcopy(tree)
+    result = mutate_tree(
+        tree,
+        target_ty;
+        rng=MersenneTwister(1),
+        global_consts_ty=type_ctx,
+        mutations=[rejected],
+        chooser=FixedSiteChooser(stale_site),
+        provider=IndexedProvider(),
+        max_try=1,
+        prune_consts=false,
+    )
+    @test result isa Err
+    @test rejected.seen[] === nothing
+    @test tree == original
 end
 
 @testitem "Mutations prepare! runs once per mutate_tree call" setup=[MutBaseImports] begin
@@ -3959,12 +4552,17 @@ end
         global_consts_ty,
         tyfactory=newtyvar,
         symfactory=LambdaRegression.ASTs.NodeASTs.SymbolGenerator(),
-        const_symfactory=LambdaRegression.ASTs.Contexts.ConstSymbolFactory(),
+        const_symfactory=LambdaRegression.Programs.ConstSymbolFactory(),
     )
     provider = IndexedProvider()
     prep = LambdaRegression.Mutations.prepare!(provider, tree, type_ctx, env, ctx)
     @test prep === nothing
-    site = only([s for s in LambdaRegression.Mutations.sites(provider) if s.path == Int[1, 2]])
+    site = LambdaRegression.Mutations._remap_site(
+        tree,
+        only([s for s in LambdaRegression.Mutations.sites(provider) if s.path == Int[1, 2]]),
+        env.analysis::LambdaRegression.ProgramAnalysis.TypedAnalysis,
+        ctx,
+    )
 
     result = LambdaRegression.Mutations.apply(EtaExpandMutation(), tree, site, env, ctx)
 
@@ -3974,8 +4572,51 @@ end
     @test iscompatible(infer(tree, global_consts_ty), target_ty)
 end
 
+@testitem "Mutations EtaExpandMutation avoids named variable capture" setup=[MutBaseImports] begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: VarNode, eliminate_bound_variables!
+    using LambdaRegression.Mutations: MutationEnv, AdaptivePolicy, BloatPolicy, apply
+    using LambdaRegression.TypeSystem: infer, iscompatible
+
+    tree = AstTree(
+        AbsNode(
+            :x,
+            AppNode(ConstNode(:make), VarNode(:x)),
+        ),
+    )
+    target_ty = TyFun(IntTy, TyFun(IntTy, IntTy))
+    type_ctx = Dict{Symbol,TyLike}(:make => TyFun(IntTy, TyFun(IntTy, IntTy)))
+    env = MutationEnv(
+        MersenneTwister(42), target_ty, type_ctx, tree, nothing, false,
+        IdDict{Any,Any}(), AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(), BloatPolicy(),
+    )
+    ctx = (; symfactory=() -> :x)
+    source_site = LambdaRegression.Mutations.Site(
+        [1], tree.root.body, tree.root, 1, 1, :any,
+        TyFun(IntTy, IntTy), TyLike[TyFun(IntTy, IntTy)],
+    )
+
+    result = apply(EtaExpandMutation(), tree, source_site, env, ctx)
+
+    @test result isa AstTree
+    @test iscompatible(infer(result, type_ctx), target_ty)
+    normalized = deepcopy(result)
+    eliminate_bound_variables!(normalized)
+    @test normalized.root == AbsNode(
+        :x,
+        AbsNode(
+            :x_1,
+            AppNode(
+                AppNode(ConstNode(:make), IndexNode(1)),
+                IndexNode(0),
+            ),
+        ),
+    )
+end
+
 @testitem "Mutations CondAppPullMutation pulls application through COND + preserves type" setup=[MutBaseImports] begin
-    using LambdaRegression.ASTs.Contexts: COND
+    using LambdaRegression.Primitives: COND
     using LambdaRegression.Mutations: CondAppPullMutation
     using LambdaRegression.TypeSystem: get_type_ctx
 
@@ -4181,7 +4822,8 @@ end
     using LambdaRegression.CanonicalGeneration: GenerationResult
     using LambdaRegression.Mutations: ContextualExpansionMutation, PathSiteSelectionPolicy
     using LambdaRegression.Mutations: AbstractReplacementGenerator, generate_replacement
-    using LambdaRegression.TypeSystem: FADD, get_type_ctx
+    using LambdaRegression.TypeSystem: get_type_ctx
+    using LambdaRegression.Primitives: FADD
 
     struct AddSeedContext <: AbstractReplacementGenerator end
     function LambdaRegression.Mutations.generate_replacement(
@@ -4242,9 +4884,89 @@ end
     @test iscompatible(infer(mutated, global_consts_ty), target_ty)
 end
 
+@testitem "Mutations ContextualExpansionMutation avoids named seed capture" setup=[MutBaseImports] begin
+    using Test
+    using LambdaRegression.CanonicalGeneration: GenerationResult
+    using LambdaRegression.Mutations:
+        AbstractReplacementGenerator,
+        ContextualExpansionMutation,
+        PathSiteSelectionPolicy,
+        MutationEnv,
+        Site,
+        generate_replacement
+    using LambdaRegression.ASTs.NodeASTs: VarNode, eliminate_bound_variables!
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
+
+    struct UsesIndexSeedAndNamedOuter <: AbstractReplacementGenerator end
+    function LambdaRegression.Mutations.generate_replacement(
+        ::UsesIndexSeedAndNamedOuter,
+        site::Site,
+        ::MutationEnv,
+        ctx::NamedTuple,
+        ::NamedTuple,
+    )
+        @test site.binder_types == TyLike[IntTy, IntTy]
+        context = AppNode(
+            AppNode(ConstNode(:combine), IndexNode(0)),
+            VarNode(:seed),
+        )
+        return GenerationResult(
+            AstTree(context),
+            site.ty,
+            copy(ctx.local_consts),
+            copy(ctx.local_consts_ty),
+            Dict{Symbol,Any}(),
+        )
+    end
+
+    original = AstTree(AbsNode(:seed, IndexNode(0)))
+    target_ty = TyFun(IntTy, IntTy)
+    values = Dict{Symbol,Any}(:combine => ((a, b) -> a + b))
+    types = Dict{Symbol,TyLike}(
+        :combine => TyFun(IntTy, TyFun(IntTy, IntTy)),
+    )
+    mutation = ContextualExpansionMutation(
+        site_selection=PathSiteSelectionPolicy(Int[1]),
+        replacement_generator=UsesIndexSeedAndNamedOuter(),
+    )
+    result = mutate_tree(
+        original,
+        target_ty;
+        rng=MersenneTwister(1111),
+        global_consts=values,
+        global_consts_ty=types,
+        mutations=[mutation],
+        chooser=WeightedPairChooser(
+            weights=Dict{Type,Float64}(ContextualExpansionMutation => 1.0),
+        ),
+        provider=IndexedProvider(),
+        max_try=1,
+    )
+
+    @test result isa AstTree
+    result isa AstTree || return
+    @test iscompatible(infer(result, types), target_ty)
+    normalized = deepcopy(result)
+    eliminate_bound_variables!(normalized)
+    @test normalized.root == AbsNode(
+        :seed,
+        AppNode(
+            AbsNode(
+                :seed_1,
+                AppNode(
+                    AppNode(ConstNode(:combine), IndexNode(0)),
+                    IndexNode(1),
+                ),
+            ),
+            IndexNode(0),
+        ),
+    )
+end
+
 @testitem "Mutations UnaryCompositionMutation wraps a typed endomorphism" setup=[MutBaseImports] begin
     using LambdaRegression.Mutations: PathSiteSelectionPolicy, UnaryCompositionMutation
-    using LambdaRegression.TypeSystem: SQR, get_type_ctx
+    using LambdaRegression.TypeSystem: get_type_ctx
+    using LambdaRegression.Primitives: SQR
 
     tree = AstTree(AbsNode(:x, IndexNode(0)))
     target_ty = TyFun(FloatTy, FloatTy)
@@ -4277,7 +4999,8 @@ end
         AbstractReplacementGenerator,
         BinaryCompositionMutation,
         PathSiteSelectionPolicy
-    using LambdaRegression.TypeSystem: FADD, SQR, get_type_ctx
+    using LambdaRegression.TypeSystem: get_type_ctx
+    using LambdaRegression.Primitives: FADD, SQR
 
     struct OneSibling <: AbstractReplacementGenerator end
     function LambdaRegression.Mutations.generate_replacement(
@@ -4329,16 +5052,15 @@ end
 end
 
 @testitem "Mutations target-grounded sites compose inside FunctionDef" setup=[MutBaseImports] begin
-    using LambdaRegression: CanonicalGeneration, Procedural
+    using LambdaRegression: CanonicalGeneration, TypeSystem
     using LambdaRegression.Mutations:
         BinaryCompositionMutation,
         PathSiteSelectionPolicy,
         ScopedReplacementGenerator
     using LambdaRegression.TypeSystem:
-        FADD,
-        UNCONS_CASE,
         TyList,
         get_type_ctx
+    using LambdaRegression.Primitives: FADD, UNCONS_CASE
 
     on_item = AbsNode(
         :head,
@@ -4348,7 +5070,7 @@ end
         AppNode(ConstNode(:FADD), ConstNode(:ONE)),
         ConstNode(:ONE),
     )
-    tree = AstTree(Procedural.FunctionDefNode(AbsNode(
+    tree = AstTree(FunctionDefNode(AbsNode(
         :series,
         AppNode(
             AppNode(
@@ -4369,21 +5091,20 @@ end
     mutation = BinaryCompositionMutation(
         site_selection=PathSiteSelectionPolicy(Int[1, 1, 1, 2, 1, 1]),
         replacement_generator=ScopedReplacementGenerator(
-            Procedural.generate_procedural_scoped;
+            CanonicalGeneration.generate_canonical_scoped;
             include_local_consts=true,
         ),
         generation_kwargs=(;
             providers=(
                 CanonicalGeneration.default_head_providers()...,
                 CanonicalGeneration.SafeListAccessProvider(),
+                CanonicalGeneration.FunctionDefProvider(),
             ),
             sampling_depth_limit=3,
             sampling_node_budget=24,
             guarded_expansion_depth=1,
         ),
     )
-    checker = (candidate, ctx, factory, meta) ->
-        Procedural.infer_procedural(candidate, ctx; factory, meta)
     mutated = mutate_tree(
         tree,
         target_ty;
@@ -4396,11 +5117,10 @@ end
         ),
         provider=IndexedProvider(),
         max_try=5,
-        type_inference=checker,
     )
 
     @test mutated isa AstTree
-    inferred = Procedural.infer_procedural(mutated, global_consts_ty)
+    inferred = TypeSystem.infer_term(mutated, global_consts_ty)
     @test !(inferred isa Err)
     @test iscompatible(inferred, target_ty)
     @test count(

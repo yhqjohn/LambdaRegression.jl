@@ -55,8 +55,9 @@ and rebuild composite types).
 
 ## Quickstart And Customisation
 
-Use [`infer`](@ref) / [`infer_scheme`](@ref) for the built-in `AstTree` representation. For another
-term representation, implement [`term_view`](@ref) and call [`infer_term`](@ref) or
+Use [`infer`](@ref) / [`infer_scheme`](@ref) for the built-in AST representation. The two-argument
+[`infer_term`](@ref) overload uses the same `NodeTermAdapter`; for another term representation,
+implement [`term_view`](@ref) and call the adapter overload of [`infer_term`](@ref) or
 [`infer_scheme_term`](@ref); the W driver, let generalisation, unifier, and failures remain shared.
 Adapter binder names are `Symbol`s; variable references are either `Symbol`s or zero-based De Bruijn
 `Int`s. The W language deliberately reads an application whose function view is `:abs` as the
@@ -80,19 +81,16 @@ module TypeSystem
 
 import Base.Threads
 
-using ..ASTs.NodeASTs: AstTree, AstNode, VarNode, IndexNode, AbsNode, AppNode, ConstNode, LetNode
+using ..ASTs.NodeASTs: AstTree, AstNode, VarNode, IndexNode, AbsNode, AppNode, ConstNode, FunctionDefNode
 using ..Utils
-using ..ASTs.Contexts: COND
 using TestItems
 
 export Ty, TyConst, TyVar, TyRigid, TyFun, TyMu, TyProd, TySum, TyList, TyNat, TyArray, TyScheme, TyLike
-export iscompatible, islesseq, isequal_mu, semantic_typekey, infer, infer_term, infer_scheme_term, UnboundVariableError, OccursCheckError, MismatchError
+export iscompatible, islesseq, isequal_mu, semantic_typekey, infer, infer_term, infer_scheme_term, UnboundVariableError, OccursCheckError, MismatchError, NonFunctionDefinitionError
 export →, ×, μ, ∀, newtyvar, make_tyvar_factory, get_type_ctx, get_ast_type_ctx, collect_types, get_type, infer_scheme
 export type_constructor_tag, type_static_parameters, type_children, rebuild_type, type_node_identity
-export NodeTermAdapter, term_view
-export TRUE, FALSE, NOT
-
-public BoolTy, IntTy, FloatTy, COND, UNCONS_CASE
+export NodeTermAdapter, term_view, record_binding
+public BoolTy, IntTy, FloatTy
 
 # ------------------------------------------------------------
 # Basic type data structures (internal)
@@ -570,6 +568,38 @@ function _query_copy(t::Ty, factory, mapping::Dict{TyVar,TyVar})
     end)
 end
 
+"""Detach one joint context/target query while preserving variable sharing."""
+function _detached_type_inputs(
+    type_ctx::AbstractDict{Symbol,<:TyLike},
+    extras::TyLike...,
+)
+    factory = make_tyvar_factory()
+    variables = Dict{TyVar,TyVar}()
+    mapvar(variable::TyVar) = get!(variables, variable) do
+        factory(variable.level)
+    end
+    function detach(ty::TyLike)
+        if ty isa TyScheme
+            return TyScheme(
+                TyVar[mapvar(variable) for variable in ty.vars],
+                _inst(ty.ty, mapvar),
+            )
+        end
+        return _inst(ty, mapvar)
+    end
+    detached = Dict{Symbol,TyLike}()
+    for (name, ty) in type_ctx
+        detached[name] = detach(ty)
+    end
+    return detached, map(detach, extras)
+end
+
+"""Detach a type context for an isolated query without a target."""
+function _detached_type_ctx(type_ctx::AbstractDict{Symbol,<:TyLike})
+    detached, _ = _detached_type_inputs(type_ctx)
+    return detached
+end
+
 """
     iscompatible(a::TyLike, b::TyLike) -> Bool
 
@@ -958,24 +988,37 @@ end
 """Default [`term_view`](@ref) adapter for the package's `NodeASTs` representation."""
 struct NodeTermAdapter end
 
+"""Finite typing failure for a `FunctionDefNode` with a non-function head."""
+struct NonFunctionDefinitionError
+    inferred::Ty
+end
+
 """
     term_view(adapter, node) -> Tuple
 
 Expose one term node to Algorithm W as `(:const, name)`, `(:var, ref)`,
-`(:abs, name, body)`, `(:app, func, arg)`, `(:let, name, value, body)`,
-`(:letseq, bindings, body)`, or `(:fix, name, body)`. Implementing this single
+`(:abs, name, body)`, `(:app, func, arg)`, or `(:fix, name, body)`. Implementing this single
 function for another finite term representation reuses the same inference driver.
 Constant and named abstraction names are `Symbol`s; `ref` is a `Symbol` or a
-zero-based De Bruijn `Int`. Anonymous `:letseq` and `:fix` binders use `nothing`
-internally so they cannot capture named variables.
+zero-based De Bruijn `Int`. Anonymous `:fix` binders use `nothing` internally
+so they cannot capture named variables.
 
 An `:app` whose `func` has an `:abs` view denotes the let-like form `(λx. M) N`
 and receives let generalisation rather than ordinary monomorphic application.
-`:letseq` generalises each binding before exposing it to subsequent bindings and
-the body. `:fix` exposes one monomorphic self binder and equates its type with the
-body type; callers may impose additional domain constraints on the result.
+Sequential bindings are represented as nested let-like applications, so each
+right-hand side is inferred and generalised before the following body.
+`:fix` exposes one monomorphic self binder and equates its type with the body
+type; callers may impose additional domain constraints on the result.
 """
 function term_view end
+
+"""Optional hook for adapters that retain the scheme of a real binder.
+
+The default W path does not need binding records.  Occurrence-indexed
+adapters may override this hook; it is called with the owning adapter node and
+the exact scheme pushed into `Env`, before that scope is traversed.
+"""
+record_binding(::Any, owner, scheme::TyLike) = nothing
 
 """Adapter hook applied to a fixed-point result before metadata or let generalisation."""
 constrain_fixpoint(adapter, node, ty::Ty, factory) = ty
@@ -985,7 +1028,33 @@ term_view(::NodeTermAdapter, node::VarNode) = (:var, node.name)
 term_view(::NodeTermAdapter, node::IndexNode) = (:var, node.index)
 term_view(::NodeTermAdapter, node::AbsNode) = (:abs, node.name, node.body)
 term_view(::NodeTermAdapter, node::AppNode) = (:app, node.func, node.arg)
-term_view(::NodeTermAdapter, node::LetNode) = (:let, node.name, node.value, node.body)
+term_view(::NodeTermAdapter, node::FunctionDefNode) = (:fix, nothing, node.body)
+
+function _constrain_function_head!(ty::Ty, factory)
+    current = prune(ty)
+    seen = IdSet{Any}()
+    while current isa TyMu
+        current in seen && return false
+        push!(seen, current)
+        current = prune(current.body)
+    end
+    if current isa TyVar
+        constrained = TyFun(factory(current.level), factory(current.level))
+        return isnothing(unify!(current, constrained))
+    end
+    return current isa TyFun
+end
+
+function constrain_fixpoint(
+    ::NodeTermAdapter,
+    ::FunctionDefNode,
+    ty::Ty,
+    factory,
+)
+    _constrain_function_head!(ty, factory) ||
+        return Err(NonFunctionDefinitionError(prune(ty)))
+    return prune(ty)
+end
 
 """
     infer(tree::AstTree, ctx::Dict{Symbol,<:TyLike}[, factory=newtyvar])
@@ -1016,6 +1085,17 @@ function infer_term(root,
                     factory=newtyvar,
                     meta=nothing)
     return _infer_root(root, ctx, adapter, factory, meta, 0)
+end
+
+"""Infer a built-in AST term using the shared [`NodeTermAdapter`](@ref)."""
+function infer_term(
+    root::Union{AstNode,AstTree},
+    ctx::AbstractDict{Symbol,<:TyLike};
+    factory=make_tyvar_factory(),
+    meta=nothing,
+)
+    root_node = root isa AstTree ? root.root : root
+    return _infer_root(root_node, ctx, NodeTermAdapter(), factory, meta, 0)
 end
 
 """Infer and generalise a reusable top-level scheme through a term adapter."""
@@ -1090,7 +1170,9 @@ function _infer(adapter,
     elseif kind === :abs
         name, body = view[2], view[3]
         tv = factory(level)
-        push!(env, name, TyScheme(TyVar[], tv))
+        scheme = TyScheme(TyVar[], tv)
+        push!(env, name, scheme)
+        record_binding(adapter, node, scheme)
         body_ty = @✓ _infer(adapter, body, env, ctx, level, factory, meta)
         pop!(env)
         ty = TyFun(prune(tv), body_ty)
@@ -1102,6 +1184,7 @@ function _infer(adapter,
             arg_ty = @✓ _infer(adapter, arg, env, ctx, level + 1, factory, meta)
             arg_ty = generalize(arg_ty, level)
             push!(env, func_view[2], arg_ty)
+            record_binding(adapter, func, arg_ty)
             body_ty = @✓ _infer(adapter, func_view[3], env, ctx, level, factory, meta)
             pop!(env)
             return _record_meta(meta, node, body_ty, level)
@@ -1112,29 +1195,12 @@ function _infer(adapter,
             @✓ unify!(fun_ty, TyFun(arg_ty, res_ty))
             return _record_meta(meta, node, res_ty, level)
         end
-    elseif kind === :let
-        name, value, body = view[2], view[3], view[4]
-        value_ty = @✓ _infer(adapter, value, env, ctx, level + 1, factory, meta)
-        scheme = generalize(value_ty, level)
-        push!(env, name, scheme)
-        body_ty = @✓ _infer(adapter, body, env, ctx, level, factory, meta)
-        pop!(env)
-        return _record_meta(meta, node, body_ty, level)
-    elseif kind === :letseq
-        bindings, body = view[2], view[3]
-        pushed = 0
-        for binding in bindings
-            binding_ty = @✓ _infer(adapter, binding, env, ctx, level + 1, factory, meta)
-            push!(env, nothing, generalize(binding_ty, level))
-            pushed += 1
-        end
-        body_ty = @✓ _infer(adapter, body, env, ctx, level, factory, meta)
-        foreach(_ -> pop!(env), 1:pushed)
-        return _record_meta(meta, node, body_ty, level)
     elseif kind === :fix
         name, body = view[2], view[3]
         self_ty = factory(level)
-        push!(env, name, TyScheme(TyVar[], self_ty))
+        scheme = TyScheme(TyVar[], self_ty)
+        push!(env, name, scheme)
+        record_binding(adapter, node, scheme)
         body_ty = @✓ _infer(adapter, body, env, ctx, level, factory, meta)
         pop!(env)
         @✓ unify!(self_ty, body_ty)
@@ -1302,164 +1368,17 @@ end
 
 collect_types(args...; kwargs...) = get_type_ctx(args...; kwargs...)
 
-# ------------------------------------------------------------
-# Primitive base types and Prelude constant typing
-# ------------------------------------------------------------
-
-# Primitive value-type constants
+# General host-value atoms remain part of the type layer.  Concrete language
+# primitives and their signatures live in `Primitives`.
 const BoolTy  = TyConst(:Bool)
 const IntTy   = TyConst(:Int)
 const FloatTy = TyConst(:Float)
-const NilErr  = TyConst(:NilErr)
 
-const IntDiscr = IntTy → IntTy → BoolTy
-const IntOp = IntTy → IntTy → IntTy
-const FloatDiscr = FloatTy → FloatTy → BoolTy
-const FloatOp = FloatTy → FloatTy → FloatTy
-
-const TRUE = true
-const FALSE = false
-NOT(x) = !x
-
-# Sum type basic functions
-INL(x) = x
-INR(x) = x
-
-# Product type basic functions
-PAIR(x) = y -> (x, y)
-PAIR(x, y) = (x, y)
-FST(x) = first(x)
-SND(x) = last(x)
-
-# List type basic functions
-struct _NilErr end
-const NILERR = _NilErr()
-CONS(x) = l -> vcat([x], collect(l))
-HEAD(xs) = isempty(xs) ? NILERR : xs[1]
-TAIL(xs) = isempty(xs) ? NILERR : xs[2:end]
-LENGTH(xs) = length(xs)
-CASENILERR(f) = g -> (x ->(x isa _NilErr ? g(x) : f(x)))
-UNCONS_CASE(xs) = ok -> fallback -> (isempty(xs) ? fallback : ok(xs[1])(xs[2:end]))
-TOLIST(xs) = collect(xs)
-
-"""
-    AMAP(f) -> (xs -> ys)
-
-Curried array `map` primitive for fixed-length arrays (`TyArray`).
-
-This is intended as a **length-preserving** eliminator/builder for static-length
-arrays:
-
-- it does not require any type-level nat arithmetic (no `n-1`),
-- it keeps the length index `n` unchanged.
-
-A dense Julia NDArray represents nested logical `TyArray` layers. For rank two
-and above, one `AMAP` therefore maps the slices along the first dimension; use
-nested `AMAP` applications to reach deeper logical layers.
-"""
-function _amap_dense_outer(f, xs::AbstractArray)
-    mapped = map(f, eachslice(xs; dims=1))
-    isempty(mapped) && return mapped
-    return first(mapped) isa AbstractArray ? stack(mapped; dims=1) : mapped
-end
-
-_amap_outer(f, xs::AbstractVector) = map(f, xs)
-_amap_outer(f, xs::AbstractArray) = _amap_dense_outer(f, xs)
-AMAP(f) = xs -> _amap_outer(f, xs)
-
-"""
-    AFOLDL(op) -> (init -> (xs -> acc))
-
-Curried left fold over fixed-length arrays (`TyArray`).
-
-`op` is expected to be curried: `op(acc)(x)`.
-
-As with `AMAP`, a dense rank-two-or-higher Julia array is folded over slices of
-its first dimension, which realizes one outer logical `TyArray` layer.
-"""
-_afoldl_outer(op, init, xs::AbstractVector) =
-    foldl((acc, x) -> op(acc)(x), xs; init=init)
-_afoldl_outer(op, init, xs::AbstractArray) =
-    foldl((acc, x) -> op(acc)(x), eachslice(xs; dims=1); init=init)
-AFOLDL(op) = init -> xs -> _afoldl_outer(op, init, xs)
-
-"""
-    LENF(xs) -> Float64
-
-Float length of an array. This is intentionally `Float`-typed to avoid requiring
-an `Int -> Float` conversion primitive.
-"""
-LENF(xs) = float(length(xs))
-
-FSIN(x) = sin(x)
-FCOS(x) = cos(x)
-FSQRT(x) = sqrt(x)
-SQR(x) = x * x
-
-# Int and Float basic functions
-IEQ(x) = y -> x == y
-ILE(x) = y -> x <= y
-IADD(x) = y -> x + y
-ISUB(x) = y -> x - y
-IMUL(x) = y -> x * y
-
-FEQ(x) = y -> x == y
-FLE(x) = y -> x <= y
-FADD(x) = y -> x + y
-FSUB(x) = y -> x - y
-FMUL(x) = y -> x * y
-FDIV(x) = y -> x / y
-
-_α, _β, _γ = newtyvar(0), newtyvar(0), newtyvar(0)
-
-# Fallbacks for primitive constants (already defined earlier)
-get_type(::Bool)  = BoolTy
-get_type(::Int)   = IntTy
+get_type(::Bool) = BoolTy
+get_type(::Int) = IntTy
 get_type(::Float64) = FloatTy
 get_type(::Float32) = FloatTy
-
-get_type(::typeof(COND)) = ∀([_α], BoolTy → _α → _α → _α)
-get_type(::typeof(NOT)) = BoolTy → BoolTy
-
-get_type(::typeof(INL)) = ∀([_α, _β], _α → (_α + _β))
-get_type(::typeof(INR)) = ∀([_α, _β], _β → (_α + _β))
-# Just an example. As inexchangable sum type is not supported in Julia, case function must be implemented manually for each sum type.
-# get_type(::typeof(CASE)) = ∀([_α, _β, _γ], (_α → _γ) → (_β → _γ) → (_α + _β) → _γ)
-
-get_type(::typeof(PAIR)) = ∀([_α, _β], _α → _β → (_α × _β))
-get_type(::typeof(FST)) = ∀([_α, _β], (_α × _β) → _α)
-get_type(::typeof(SND)) = ∀([_α, _β], (_α × _β) → _β)
-get_type(t::Tuple{T, S}) where {T, S} = get_type(t[1]) × get_type(t[2])
-
-get_type(::typeof(CONS)) = ∀([_α], _α → TyList(_α) → TyList(_α))
-get_type(::typeof(HEAD)) = ∀([_α], TyList(_α) → (_α + NilErr))
-get_type(::typeof(TAIL)) = ∀([_α], TyList(_α) → TyList(_α) + NilErr)
-get_type(::typeof(LENGTH)) = ∀([_α], TyList(_α) → IntTy)
-get_type(::typeof(CASENILERR)) = ∀([_α, _β], (_α → _β) → (NilErr → _β) → (_α + NilErr) → _β)
-get_type(::typeof(UNCONS_CASE)) = ∀([_α, _β], TyList(_α) → (_α → TyList(_α) → _β) → _β → _β)
-get_type(::typeof(TOLIST)) = ∀([_α, _β], TyArray(_α, _β) → TyList(_β))
-
-get_type(::typeof(AMAP)) = ∀([_α, _β, _γ], (_β → _γ) → TyArray(_α, _β) → TyArray(_α, _γ))
-get_type(::typeof(AFOLDL)) = ∀([_α, _β, _γ], (_γ → _β → _γ) → _γ → TyArray(_α, _β) → _γ)
-get_type(::typeof(LENF)) = ∀([_α, _β], TyArray(_α, _β) → FloatTy)
-
-get_type(::typeof(FSIN)) = FloatTy → FloatTy
-get_type(::typeof(FCOS)) = FloatTy → FloatTy
-get_type(::typeof(FSQRT)) = FloatTy → FloatTy
-get_type(::typeof(SQR)) = FloatTy → FloatTy
-
-get_type(::typeof(IEQ)) = IntDiscr
-get_type(::typeof(ILE)) = IntDiscr
-get_type(::typeof(IADD)) = IntOp
-get_type(::typeof(ISUB)) = IntOp
-get_type(::typeof(IMUL)) = IntOp
-
-get_type(::typeof(FEQ)) = FloatDiscr
-get_type(::typeof(FLE)) = FloatDiscr
-get_type(::typeof(FADD)) = FloatOp
-get_type(::typeof(FSUB)) = FloatOp
-get_type(::typeof(FMUL)) = FloatOp
-get_type(::typeof(FDIV)) = FloatOp
+get_type(t::Tuple{T,S}) where {T,S} = get_type(t[1]) × get_type(t[2])
 
 # ------------------------------------------------------------
 # Test items (basic sanity)
@@ -1477,17 +1396,22 @@ get_type(::typeof(FDIV)) = FloatOp
     using LambdaRegression.ASTs.Parse: parse_lambda, @terms
     using LambdaRegression.TypeSystem: TyLike
     using LambdaRegression.TypeSystem: newtyvar, unify!
-    using LambdaRegression.TypeSystem: IntTy, IEQ, ISUB, IMUL, COND, get_type_ctx
+    using LambdaRegression.TypeSystem: IntTy, get_type_ctx
+    using LambdaRegression.Primitives: IEQ, ISUB, IMUL, COND
     using LambdaRegression.TypeSystem: collect_free_vars, prune
-    using LambdaRegression.Reduces: prepare
-    using LambdaRegression.TypeSystem: IntTy, IMUL, ISUB, IEQ, COND, get_type_ctx
-    using LambdaRegression.TypeSystem: COND, IntTy, get_type_ctx
-    using LambdaRegression.TypeSystem: FST, PAIR, IntTy, get_type_ctx
-    using LambdaRegression.TypeSystem: INL, INR, IntTy, BoolTy, get_type_ctx
-    using LambdaRegression.TypeSystem: newtyvar, unify!, prune, get_type, TOLIST
+    using LambdaRegression.Execution: prepare
+    using LambdaRegression.TypeSystem: IntTy, get_type_ctx
+    using LambdaRegression.TypeSystem: IntTy, get_type_ctx
+    using LambdaRegression.Primitives: IMUL, ISUB, IEQ, COND
+    using LambdaRegression.Primitives: COND
+    using LambdaRegression.Primitives: FST, PAIR
+    using LambdaRegression.Primitives: INL, INR
+    using LambdaRegression.TypeSystem: newtyvar, unify!, prune, get_type
+    using LambdaRegression.Primitives: TOLIST
     using LambdaRegression.TypeSystem: TyArray, TyNat, FloatTy, unify!, get_type
-    using LambdaRegression.Reduces: prepare, beta_reduce!
-    using LambdaRegression.TypeSystem: newtyvar, TyLike, IntTy, NilErr, TyList, CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND, get_type_ctx
+    using LambdaRegression.Execution: prepare, beta_reduce!
+    using LambdaRegression.TypeSystem: newtyvar, TyLike, IntTy, TyList, get_type_ctx
+    using LambdaRegression.Primitives: NilErr, CONS, HEAD, TAIL, LENGTH, CASENILERR, IADD, IMUL, IEQ, COND
     using LambdaRegression.TypeSystem: IntTy, get_type_ctx
     using LambdaRegression.TypeSystem: newtyvar, TyFun, iscompatible, IntTy
     using LambdaRegression.TypeSystem: newtyvar, TyFun, typekey, unify!, prune, TyMu, IntTy
@@ -1702,11 +1626,11 @@ end
 
 @testitem "Y combinator infers Fibonacci and safe list sum" setup=[TSBaseImports] begin
     terms = @terms(
-        COND=TypeSystem.COND,
-        IEQ=TypeSystem.IEQ,
-        IADD=TypeSystem.IADD,
-        ISUB=TypeSystem.ISUB,
-        UNCONS_CASE=TypeSystem.UNCONS_CASE,
+        COND=LambdaRegression.Primitives.COND,
+        IEQ=LambdaRegression.Primitives.IEQ,
+        IADD=LambdaRegression.Primitives.IADD,
+        ISUB=LambdaRegression.Primitives.ISUB,
+        UNCONS_CASE=LambdaRegression.Primitives.UNCONS_CASE,
         int0=0,
         int1=1,
     )
@@ -1798,7 +1722,8 @@ end
 
 @testitem "TypeSystem UNCONS_CASE typing and runtime" setup=[TSBaseImports] begin
     using Test
-    using LambdaRegression.TypeSystem: FloatTy, TyList, UNCONS_CASE, get_type
+    using LambdaRegression.TypeSystem: FloatTy, TyList, get_type
+    using LambdaRegression.Primitives: UNCONS_CASE
 
     @test get_type(UNCONS_CASE) isa LambdaRegression.TypeSystem.TyScheme
     @test UNCONS_CASE([1.0, 2.0])(x -> xs -> x)(0.0) == 1.0
@@ -1808,19 +1733,19 @@ end
 @testitem "TypeSystem Array HO primitives typing" setup=[TSBaseImports] begin
     A = TyArray(TyNat(3), FloatTy)
 
-    map_ty = TypeSystem.instantiate(get_type(TypeSystem.AMAP), 0)
+    map_ty = TypeSystem.instantiate(get_type(LambdaRegression.Primitives.AMAP), 0)
     @test unify!(map_ty, (FloatTy → FloatTy) → A → A) === nothing
 
-    fold_ty = TypeSystem.instantiate(get_type(TypeSystem.AFOLDL), 0)
+    fold_ty = TypeSystem.instantiate(get_type(LambdaRegression.Primitives.AFOLDL), 0)
     @test unify!(fold_ty, (FloatTy → FloatTy → FloatTy) → FloatTy → A → FloatTy) === nothing
 
-    lenf_ty = TypeSystem.instantiate(get_type(TypeSystem.LENF), 0)
+    lenf_ty = TypeSystem.instantiate(get_type(LambdaRegression.Primitives.LENF), 0)
     @test unify!(lenf_ty, A → FloatTy) === nothing
 end
 
 @testitem "TypeSystem Array HO primitives preserve dense NDArray nesting" begin
     using Test
-    using LambdaRegression.TypeSystem: AMAP, AFOLDL
+    using LambdaRegression.Primitives: AMAP, AFOLDL
 
     matrix = [1.0 2.0 3.0; 4.0 5.0 6.0]
 
@@ -2058,7 +1983,8 @@ end
 end
 
 @testitem "boolean primitives expose true false and not" setup=[TSBaseImports] begin
-    using LambdaRegression.TypeSystem: TRUE, FALSE, NOT, BoolTy, get_type, get_type_ctx, →
+    using LambdaRegression.TypeSystem: BoolTy, get_type, get_type_ctx, →
+    using LambdaRegression.Primitives: TRUE, FALSE, NOT
 
     @test TRUE === true
     @test FALSE === false
@@ -2072,6 +1998,23 @@ end
     @test ctx[:TRUE] === BoolTy
     @test ctx[:FALSE] === BoolTy
     @test ctx[:NOT] == (BoolTy → BoolTy)
+end
+
+@testitem "joint detached context and target preserve sharing" setup=[TSBaseImports] begin
+    using LambdaRegression.TypeSystem: _detached_type_inputs
+    α = newtyvar(0)
+    open = TyFun(α, α)
+    context = Dict{Symbol,TyLike}(:f => open)
+    detached_one, targets_one = _detached_type_inputs(context, open)
+    @test detached_one[:f].arg === targets_one[1].arg
+    @test α.instance === nothing
+    @test iscompatible(detached_one[:f], TyFun(IntTy, IntTy))
+    @test α.instance === nothing
+
+    detached_two, targets_two = _detached_type_inputs(context, open)
+    @test detached_two[:f].arg === targets_two[1].arg
+    @test iscompatible(detached_two[:f], TyFun(BoolTy, BoolTy))
+    @test α.instance === nothing
 end
 
 end # module TypeSystem

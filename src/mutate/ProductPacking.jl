@@ -84,12 +84,27 @@ _product_projection(head::Symbol, binder_id::Int) =
 _product_pair(head::Symbol, left::_ScopedTerm, right::_ScopedTerm) =
     _ScopedApp(_ScopedApp(_ScopedConst(head), left), right)
 
+function _scoped_has_named_reference(term::_ScopedTerm, name::Symbol)
+    term isa _ScopedFree && return term.name === name
+    if term isa _ScopedAbs
+        return _scoped_has_named_reference(term.body, name)
+    elseif term isa _ScopedApp
+        return _scoped_has_named_reference(term.func, name) ||
+               _scoped_has_named_reference(term.arg, name)
+    end
+    return false
+end
+
 function _product_pack_parts(term::_ScopedTerm)
     bindings, body = _scoped_let_prefix(term, 2)
     length(bindings) == 2 || return nothing
     first_binding, second_binding = bindings
     _scoped_uses_binder(second_binding.rhs, first_binding.binder_id) &&
         return nothing
+    _scoped_has_named_reference(second_binding.rhs, first_binding.name) &&
+        return nothing
+    _scoped_has_named_reference(body, first_binding.name) && return nothing
+    _scoped_has_named_reference(body, second_binding.name) && return nothing
     return (first_binding, second_binding, body)
 end
 
@@ -235,6 +250,7 @@ function _product_unpack_parts(
 )
     term isa _ScopedApp || return nothing
     term.func isa _ScopedAbs || return nothing
+    _scoped_has_named_reference(term.func.body, term.func.name) && return nothing
     heads = _validated_product_heads(capability)
     components = _product_pair_parts(term.arg, heads.pair)
     components === nothing && return nothing
@@ -328,7 +344,7 @@ function apply(
         scoped,
         site.path,
         mutation.capability,
-        ctx.symfactory(),
+        only(_fresh_binder_names(tree, ctx.symfactory, 1)),
     )
     rewritten isa Err && return rewritten
     materialized = _materialize_scoped(rewritten)
@@ -352,8 +368,7 @@ function apply(
         scoped,
         site.path,
         mutation.capability,
-        ctx.symfactory(),
-        ctx.symfactory(),
+        _fresh_binder_names(tree, ctx.symfactory, 2)...,
     )
     rewritten isa Err && return rewritten
     materialized = _materialize_scoped(rewritten)
@@ -365,7 +380,7 @@ end
 @testitem "Product packing mutation API is opt-in" begin
     using Test
     using LambdaRegression: Mutations
-    using LambdaRegression.TypeSystem: FST, PAIR, SND
+    using LambdaRegression.Primitives: FST, PAIR, SND
 
     @test isdefined(Mutations, :AbstractProductCapability)
     @test isdefined(Mutations, :PrimitiveProductCapability)
@@ -390,10 +405,17 @@ end
     using Test
     using Random
     using LambdaRegression: Mutations
-    using LambdaRegression.ASTs.CSE: canonicalize
-    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
-    using LambdaRegression.TypeSystem: FADD, FMUL, FST, PAIR, SND, FloatTy, TyLike, get_type_ctx, →
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, IndexNode, VarNode
+    using LambdaRegression.TypeSystem: FloatTy, TyLike, get_type_ctx, →
+    using LambdaRegression.Primitives: FADD, FMUL, FST, PAIR, SND
     using LambdaRegression.Utils: Err
+
+    alpha_shape(node::AbsNode) = (:abs, alpha_shape(node.body))
+    alpha_shape(node::AppNode) = (:app, alpha_shape(node.func), alpha_shape(node.arg))
+    alpha_shape(node::ConstNode) = (:const, node.name)
+    alpha_shape(node::IndexNode) = (:index, node.index)
+    alpha_shape(node::VarNode) = (:var, node.name)
 
     app2(head, left, right) = AppNode(AppNode(ConstNode(head), left), right)
     original = AstTree(
@@ -469,7 +491,7 @@ end
 
     @test !(unpacked isa Err)
     unpacked isa Err && return
-    @test canonicalize(unpacked, unpacked.root) == canonicalize(original, original.root)
+    @test alpha_shape(unpacked.root) == alpha_shape(original.root)
 
     repeated = Mutations.mutate_tree(
         original,
@@ -489,7 +511,8 @@ end
     using Random
     using LambdaRegression: Mutations
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
-    using LambdaRegression.TypeSystem: FST, PAIR, SND, FloatTy, TyLike, get_type_ctx
+    using LambdaRegression.TypeSystem: FloatTy, TyLike, get_type_ctx
+    using LambdaRegression.Primitives: FST, PAIR, SND
     using LambdaRegression.Utils: Err
 
     values = Dict{Symbol,Any}(
@@ -555,14 +578,149 @@ end
     @test bare_pair == bare_before
 end
 
+@testitem "Product packing avoids captures and rejects named removed-binder uses" begin
+    using Test
+    using Random
+    using LambdaRegression: Mutations
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, IndexNode, VarNode,
+        eliminate_bound_variables!
+    using LambdaRegression.Mutations:
+        _product_pack_parts,
+        _product_unpack_parts,
+        _resolve_scoped,
+        _scoped_at_path,
+        mutate_tree,
+        WeightedPairChooser,
+        ProductPackMutation,
+        PrimitiveProductCapability,
+        IndexedProvider
+    using LambdaRegression.TypeSystem:
+        FloatTy, TyFun, TyLike, TyProd, get_type_ctx, infer, iscompatible
+    using LambdaRegression.Primitives: FST, PAIR, SND
+    using LambdaRegression.Utils: Err
+
+    app2(head, left, right) = AppNode(AppNode(ConstNode(head), left), right)
+    values = Dict{Symbol,Any}(
+        :PAIR => PAIR,
+        :FST => FST,
+        :SND => SND,
+        :ONE => 1.0,
+        :TWO => 2.0,
+    )
+    types = Dict{Symbol,TyLike}(get_type_ctx(values))
+    component_pair = TyProd(FloatTy, FloatTy)
+    target = TyFun(
+        component_pair,
+        TyProd(component_pair, component_pair),
+    )
+    capability = PrimitiveProductCapability()
+    chooser = WeightedPairChooser(
+        weights=Dict{Type,Float64}(ProductPackMutation => 1.0),
+    )
+
+    outer_pair = AstTree(
+        AbsNode(
+            :pair,
+            AppNode(
+                AbsNode(
+                    :x,
+                    AppNode(
+                        AbsNode(
+                            :y,
+                            app2(
+                                :PAIR,
+                                VarNode(:pair),
+                                app2(:PAIR, IndexNode(1), IndexNode(0)),
+                            ),
+                        ),
+                        ConstNode(:TWO),
+                    ),
+                ),
+                ConstNode(:ONE),
+            ),
+        ),
+    )
+    packed = mutate_tree(
+        outer_pair,
+        target;
+        rng=MersenneTwister(8000),
+        mutations=Mutations.AbstractMutation[ProductPackMutation(capability)],
+        chooser,
+        provider=IndexedProvider(),
+        max_try=1,
+        global_consts=values,
+        global_consts_ty=types,
+        symfactory=() -> :pair,
+    )
+    @test packed isa AstTree
+    packed isa AstTree || return
+    @test iscompatible(infer(packed, types), target)
+    normalized = deepcopy(packed)
+    eliminate_bound_variables!(normalized)
+    @test count(node -> node isa AbsNode && node.name === :pair_1, packed) == 1
+    @test count(node -> node isa IndexNode && node.index == 1, normalized) == 1
+
+    named_pack = AstTree(
+        AppNode(
+            AbsNode(
+                :x,
+                AppNode(
+                    AbsNode(
+                        :y,
+                        app2(
+                            :PAIR,
+                            VarNode(:x),
+                            app2(:PAIR, IndexNode(1), IndexNode(0)),
+                        ),
+                    ),
+                    ConstNode(:TWO),
+                ),
+            ),
+            ConstNode(:ONE),
+        ),
+    )
+    named_pack_scoped = _resolve_scoped(named_pack)
+    @test !(named_pack_scoped isa Err)
+    @test _product_pack_parts(named_pack_scoped.root) === nothing
+
+    pair_rhs = app2(:PAIR, ConstNode(:ONE), ConstNode(:TWO))
+    projected_pair = app2(
+        :PAIR,
+        app2(:PAIR, AppNode(ConstNode(:FST), IndexNode(0)), AppNode(ConstNode(:SND), IndexNode(0))),
+        VarNode(:pair),
+    )
+    named_unpack = AstTree(
+        AbsNode(
+            :pair,
+            AppNode(AbsNode(:pair, projected_pair), pair_rhs),
+        ),
+    )
+    named_unpack_scoped = _resolve_scoped(named_unpack)
+    @test !(named_unpack_scoped isa Err)
+    unpack_term = _scoped_at_path(named_unpack_scoped, [1])
+    @test _product_unpack_parts(
+        unpack_term,
+        capability,
+        named_unpack_scoped.next_binder_id,
+    ) === nothing
+end
+
 @testitem "Product packing preserves independent polymorphic lets and component order" begin
     using Test
     using Random
     using LambdaRegression: Mutations
-    using LambdaRegression.ASTs.CSE: canonicalize
-    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
-    using LambdaRegression.TypeSystem: FALSE, FST, PAIR, SND, TRUE, BoolTy, FloatTy, TyLike, TyProd, get_type_ctx
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, IndexNode, VarNode
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, TyLike, TyProd, get_type_ctx
+    using LambdaRegression.Primitives: FALSE, FST, PAIR, SND, TRUE
     using LambdaRegression.Utils: Err
+
+    alpha_shape(node::AbsNode) = (:abs, alpha_shape(node.body))
+    alpha_shape(node::AppNode) = (:app, alpha_shape(node.func), alpha_shape(node.arg))
+    alpha_shape(node::ConstNode) = (:const, node.name)
+    alpha_shape(node::IndexNode) = (:index, node.index)
+    alpha_shape(node::VarNode) = (:var, node.name)
 
     app2(head, left, right) = AppNode(AppNode(ConstNode(head), left), right)
     original = AstTree(
@@ -634,7 +792,7 @@ end
     )
     @test !(unpacked isa Err)
     unpacked isa Err && return
-    @test canonicalize(unpacked, unpacked.root) == canonicalize(original, original.root)
+    @test alpha_shape(unpacked.root) == alpha_shape(original.root)
 end
 
 @testitem "Product packing documents strict-host evaluation behavior" begin
@@ -642,8 +800,9 @@ end
     using Random
     using LambdaRegression: Mutations
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
-    using LambdaRegression.Reduces: beta_reduce!
-    using LambdaRegression.TypeSystem: FST, PAIR, SND, IntTy, TyLike, get_type_ctx
+    using LambdaRegression.Execution: beta_reduce!
+    using LambdaRegression.TypeSystem: IntTy, TyLike, get_type_ctx
+    using LambdaRegression.Primitives: FST, PAIR, SND
     using LambdaRegression.Utils: Err
 
     omega_abs = AbsNode(:self, AppNode(IndexNode(0), IndexNode(0)))
@@ -691,10 +850,17 @@ end
     using Test
     using Random
     using LambdaRegression: Mutations
-    using LambdaRegression.ASTs.CSE: canonicalize
-    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode
-    using LambdaRegression.TypeSystem: FST, PAIR, SND, FloatTy, TyLike, get_type_ctx
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, IndexNode, VarNode
+    using LambdaRegression.TypeSystem: FloatTy, TyLike, get_type_ctx
+    using LambdaRegression.Primitives: FST, PAIR, SND
     using LambdaRegression.Utils: Err
+
+    alpha_shape(node::AbsNode) = (:abs, alpha_shape(node.body))
+    alpha_shape(node::AppNode) = (:app, alpha_shape(node.func), alpha_shape(node.arg))
+    alpha_shape(node::ConstNode) = (:const, node.name)
+    alpha_shape(node::IndexNode) = (:index, node.index)
+    alpha_shape(node::VarNode) = (:var, node.name)
 
     original = AstTree(
         AppNode(
@@ -747,5 +913,5 @@ end
     )
     @test !(unpacked isa Err)
     unpacked isa Err && return
-    @test canonicalize(unpacked, unpacked.root) == canonicalize(original, original.root)
+    @test alpha_shape(unpacked.root) == alpha_shape(original.root)
 end

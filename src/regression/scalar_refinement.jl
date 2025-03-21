@@ -2,14 +2,14 @@
 Automatic scalar-region preparation, contextual refinement, and verified
 materialisation for the program--scalar bridge.
 
-The ordinary `Individual.tree` remains authoritative.  A `ScalarRegion` owns
+The ordinary `Program.tree` remains authoritative.  A `ScalarRegion` owns
 source evidence from `TypedSearch.prepare_source`/`source_hole`, an ordered
 feature boundary, and one parsed `ScalarExpr`; it is a disposable view rather
 than a second program representation.  `search_scalar_region` uses the
 existing scalar population search as a bounded session.  Its low-level
 `X/y` arguments are one-column zero placeholders required by that API only;
 the contextual objective never reads them and scores each materialised whole
-`Individual` through the caller's callback.
+`Program` through the caller's callback.
 
 The first boundary admits only exact `Float` regions and finite real local
 constants.  Non-floating external binders, unsupported syntax, recursive
@@ -21,17 +21,16 @@ using Random: AbstractRNG, default_rng
 
 using ..Utils: Err
 using ..ASTs.NodeASTs:
-    AstNode, AstTree, AbsNode, AppNode, ConstNode, IndexNode, VarNode,
-    LetNode, children
+    AstNode, AstTree, AbsNode, AppNode, ConstNode, FunctionDefNode, IndexNode, VarNode,
+    children
 using ..Trees: setchild!
-using ..Procedural: FunctionDefNode, ScopeNode
-using ..Mutations.Populations: Individual
+using ..Programs: Program, _publish_program
 using ..ScalarSearch:
     ScalarExpr, ScalarSearchConfig, ScalarSearchResult, scalar_from_ast,
     scalar_to_ast, scalar_complexity, scalar_input, search_scalar
 import ..ScalarSearch
 using ..TypedSearch:
-    SourceAnalysis, SourceBoundaryError, SourceHole, prepare_source, source_hole
+    TypedAnalysis, SourceBoundaryError, SourceHole, prepare_source, source_hole
 using ..TypeSystem: FloatTy, Ty, TyLike, prune
 
 export ScalarRegion, ScalarRegionError
@@ -54,8 +53,9 @@ first; named floating inputs use `ConstNode`s in stable lexical-name order.
 The source, parent individual, and context are owned copies.
 """
 struct ScalarRegion
-    individual::Individual
-    source::SourceAnalysis
+    program::Program
+    target_ty::Ty
+    source::TypedAnalysis
     hole::SourceHole
     path::Vector{Int}
     dependencies::Vector{AstNode}
@@ -85,12 +85,12 @@ function _valid_bounds(max_nodes::Int, max_depth::Int)
     return nothing
 end
 
-function _merged_type_context(individual::Individual, type_context, input_types)
+function _merged_type_context(program::Program, type_context, input_types)
     context = _copy_type_context(type_context)
     merge!(context, _copy_type_context(input_types))
-    # Individual-local declarations have the same precedence as their values
+    # Program-local declarations have the same precedence as their values
     # in the ordinary evaluator.  The dictionaries remain caller-owned.
-    merge!(context, Dict{Symbol,TyLike}(deepcopy(individual.local_consts_ty)))
+    merge!(context, Dict{Symbol,TyLike}(program.local_consts_ty))
     return context
 end
 
@@ -125,20 +125,8 @@ function _rewrite_named_float_vars(node::AstNode, names::Set{Symbol})
         )
     elseif node isa AbsNode
         return AbsNode(node.name, _rewrite_named_float_vars(node.body, names))
-    elseif node isa LetNode
-        return LetNode(
-            node.name,
-            _rewrite_named_float_vars(node.value, names),
-            _rewrite_named_float_vars(node.body, names),
-        )
     elseif node isa FunctionDefNode
         return FunctionDefNode(_rewrite_named_float_vars(node.body, names))
-    elseif node isa ScopeNode
-        bindings = AstNode[
-            _rewrite_named_float_vars(binding, names)
-            for binding in node.bindings
-        ]
-        return ScopeNode(bindings, _rewrite_named_float_vars(node.body, names))
     end
     return node
 end
@@ -175,9 +163,9 @@ function _named_dependencies(node::AstNode, input_types)
     return selected, dependencies, types
 end
 
-function _constant_values(individual::Individual)
+function _constant_values(program::Program)
     values = Dict{Symbol,Float64}()
-    for (name, value) in individual.local_consts
+    for (name, value) in program.local_consts
         value isa Real || continue
         converted = Float64(value)
         isfinite(converted) && (values[name] = converted)
@@ -193,7 +181,7 @@ function _source_failure(result)
 end
 
 """
-    prepare_scalar_region(individual, type_context, path;
+    prepare_scalar_region(program, target_ty, type_context, path;
         input_types=Dict(), max_nodes=100_000, max_depth=512)
 
 Prepare one exact-`Float` source occurrence for contextual scalar refinement.
@@ -204,7 +192,8 @@ invented as scalar features.  Unsupported source/seed boundaries and
 zero-feature regions return `Err(ScalarRegionError(...))`.
 """
 function prepare_scalar_region(
-    individual::Individual,
+    program::Program,
+    target_ty::Ty,
     type_context,
     path::AbstractVector{<:Integer};
     input_types=Dict(),
@@ -212,9 +201,8 @@ function prepare_scalar_region(
     max_depth::Int=512,
 )
     _valid_bounds(max_nodes, max_depth)
-    context = _merged_type_context(individual, type_context, input_types)
-    owned_tree = deepcopy(individual.tree)
-    source = prepare_source(owned_tree, context, individual.target_ty;
+    context = _merged_type_context(program, type_context, input_types)
+    source = prepare_source(program.tree, context, target_ty;
         max_nodes, max_depth)
     source isa Err && return _source_failure(source)
     hole = source_hole(source, path)
@@ -227,31 +215,30 @@ function prepare_scalar_region(
 
     external_dependencies, external_types = _external_dependencies(hole)
     declared_inputs = _copy_type_context(input_types)
+    occurrence_node = source.index.nodes[hole.occurrence]
     named, named_dependencies, named_types = _named_dependencies(
-        hole.occurrence.node, declared_inputs)
+        occurrence_node, declared_inputs)
     dependencies = vcat(external_dependencies, named_dependencies)
     dependency_types = vcat(external_types, named_types)
     rewritten = _rewrite_named_float_vars(
-        hole.occurrence.node, Set(named))
+        occurrence_node, Set(named))
     expression = scalar_from_ast(
         rewritten,
         dependencies;
-        constant_values=_constant_values(individual),
+        constant_values=_constant_values(program),
     )
     expression isa Err && return _region_error(:unsupported_seed, expression.value)
     isempty(dependencies) &&
         return _region_error(:zero_features, (path=Int[path...],))
 
-    owned_individual = Individual(
-        source.tree,
-        individual.target_ty;
-        local_consts=deepcopy(individual.local_consts),
-        local_consts_ty=deepcopy(individual.local_consts_ty),
-        fitness=individual.fitness,
-        meta=deepcopy(individual.meta),
+    owned_program = _publish_program(
+        source.index.tree,
+        copy(program.local_consts),
+        Dict{Symbol,TyLike}(program.local_consts_ty),
     )
     return ScalarRegion(
-        owned_individual,
+        owned_program,
+        target_ty,
         source,
         hole,
         Int[path...],
@@ -269,8 +256,6 @@ function _collect_namespace!(names::Set{Symbol}, node::AstNode)
     if node isa Union{ConstNode,VarNode}
         push!(names, node.name)
     elseif node isa AbsNode
-        push!(names, node.name)
-    elseif node isa LetNode
         push!(names, node.name)
     end
     for child in children(node)
@@ -313,7 +298,7 @@ function _replace_path(tree::AstTree, path::Vector{Int}, replacement::AstNode)
 end
 
 """
-    materialize_scalar_region(region, expr) -> Individual | Err
+    materialize_scalar_region(region, expr) -> Program | Err
 
 Replace only the selected occurrence in an owned source copy.  Scalar
 constants receive fresh local names disjoint from the complete source and
@@ -337,26 +322,25 @@ function materialize_scalar_region(region::ScalarRegion, expr)
     # outer age/reproduction layer.  This copies the region-owned value, so no
     # caller-owned tree or dictionary is aliased.
     if ScalarSearch._same_scalar_expression(region.expr, expr)
-        owned_tree = deepcopy(region.individual.tree)
-        length(owned_tree) <= region.max_nodes || return _region_error(
-            :materialization_size, length(owned_tree))
-        checked = prepare_source(owned_tree, region.type_context,
-            region.individual.target_ty;
+        length(region.program.tree) <= region.max_nodes || return _region_error(
+            :materialization_size, length(region.program.tree))
+        checked = prepare_source(region.program.tree, region.type_context,
+            region.target_ty;
             max_nodes=region.max_nodes, max_depth=region.max_depth)
         checked isa Err && return _region_error(:source_check, checked.value)
-        return Individual(
-            checked.tree,
-            region.individual.target_ty;
-            local_consts=deepcopy(region.individual.local_consts),
-            local_consts_ty=deepcopy(region.individual.local_consts_ty),
-            fitness=region.individual.fitness,
-            meta=deepcopy(region.individual.meta),
+        return _publish_program(
+            checked.index.tree,
+            copy(region.program.local_consts),
+            Dict{Symbol,TyLike}(region.program.local_consts_ty),
         )
     end
 
-    local_consts = deepcopy(region.individual.local_consts)
-    local_consts_ty = deepcopy(region.individual.local_consts_ty)
-    reserved = _collect_namespace!(Set{Symbol}(), region.source.tree.root)
+    # The published source remains read-only; scalar edits only extend this
+    # fresh map with newly named blocks, so borrowed values and aliases stay
+    # intact without re-copying opaque host resources.
+    local_consts = copy(region.program.local_consts)
+    local_consts_ty = Dict{Symbol,TyLike}(region.program.local_consts_ty)
+    reserved = _collect_namespace!(Set{Symbol}(), region.source.index.tree.root)
     union!(reserved, keys(region.type_context))
     union!(reserved, keys(local_consts))
     union!(reserved, keys(local_consts_ty))
@@ -366,7 +350,7 @@ function materialize_scalar_region(region::ScalarRegion, expr)
     )
     replacement isa Err && return _region_error(:materialization, replacement.value)
 
-    tree = deepcopy(region.source.tree)
+    tree = deepcopy(region.source.index.tree)
     replaced = _replace_path(tree, region.path, replacement)
     replaced isa Err && return replaced
     length(replaced) <= region.max_nodes || return _region_error(
@@ -376,17 +360,10 @@ function materialize_scalar_region(region::ScalarRegion, expr)
 
     context = Dict{Symbol,TyLike}(region.type_context)
     merge!(context, local_consts_ty)
-    checked = prepare_source(replaced, context, region.individual.target_ty;
+    checked = prepare_source(replaced, context, region.target_ty;
         max_nodes=region.max_nodes, max_depth=region.max_depth)
     checked isa Err && return _region_error(:source_check, checked.value)
-    return Individual(
-        checked.tree,
-        region.individual.target_ty;
-        local_consts=local_consts,
-        local_consts_ty=local_consts_ty,
-        fitness=nothing,
-        meta=deepcopy(region.individual.meta),
-    )
+    return _publish_program(checked.index.tree, local_consts, local_consts_ty)
 end
 
 function _result_property(result, name::Symbol, fallback)
@@ -434,15 +411,18 @@ end
         stop_loss=nothing, search_backend=search_scalar)
 
 Run one bounded scalar-search session seeded by the ordinary parent region.
-Every structural or constant-refinement objective call materialises a fresh
-whole `Individual` and invokes `score(individual)`, so changing folds,
-recursion, and other enclosing semantics remain part of the objective.  The
+Every structural or constant-refinement objective entrance attempts to
+materialise a fresh whole `Program`. Successfully source-checked candidates
+invoke `score(program)`, so changing folds, recursion, and other enclosing
+semantics remain part of the objective. Materialisation refusals remain charged
+objective entrances but do not call `score`; `diagnostics.objective_calls`
+counts these entrances, not just successful calls through to the scorer. The
 backend keyword follows the `search_scalar(X, y; config, rng,
 initial_population, objective, stop_loss)` contract and lets a caller
 coordinator provide its persistent multi-island implementation later.
 
 The return value is `(candidates, diagnostics)`; each returned candidate has
-`individual`, `expr`, `loss`, and `complexity`.  Final archive members are
+`program`, `expr`, `loss`, and `complexity`.  Final archive members are
 source-checked once more, and those boundary checks are reported separately
 from structural and constant-refinement calls.
 """
@@ -495,7 +475,7 @@ function search_scalar_region(
             continue
         end
         push!(candidates, (
-            individual=candidate,
+            program=candidate,
             expr=entry.expr,
             loss=entry.loss,
             complexity=entry.complexity,
@@ -533,19 +513,20 @@ end
 @testitem "scalar region captures binder and named Float dependencies" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression:
         ScalarRegion, materialize_scalar_region, prepare_scalar_region
     using LambdaRegression.ScalarSearch
-    using LambdaRegression.TypedSearch: SourceAnalysis, prepare_source
-    using LambdaRegression.TypeSystem: FADD, FloatTy, TyFun, TyLike, get_type
+    using LambdaRegression.TypedSearch: TypedAnalysis, prepare_source
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, get_type
+    using LambdaRegression.Primitives: FADD
 
     tree = AstTree(AbsNode(:x, AppNode(
         AppNode(ConstNode(:FADD), IndexNode(0)), ConstNode(:u))))
     target = TyFun(FloatTy, FloatTy)
     context = Dict{Symbol,TyLike}(:FADD => get_type(FADD))
     region = prepare_scalar_region(
-        Individual(tree, target), context, [1];
+        Program(tree), target, context, [1];
         input_types=Dict{Symbol,TyLike}(:u => FloatTy),
     )
     @test region isa ScalarRegion
@@ -557,7 +538,7 @@ end
         ScalarSearch.scalar_binary(:+, ScalarSearch.scalar_input(1),
             ScalarSearch.scalar_input(2)),
     )
-    @test changed isa Individual
+    @test changed isa Program
     @test changed.tree.root isa AbsNode
     @test changed.tree.root.body isa AppNode
     @test prepare_source(
@@ -567,26 +548,27 @@ end
             changed.local_consts_ty,
         ),
         target,
-    ) isa SourceAnalysis
+    ) isa TypedAnalysis
 end
 
 @testitem "scalar region constants are hygienic and owned" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression:
         ScalarRegion, materialize_scalar_region, prepare_scalar_region
     using LambdaRegression.ScalarSearch
-    using LambdaRegression.TypeSystem: FADD, FloatTy, TyFun, TyLike, get_type
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, get_type
+    using LambdaRegression.Primitives: FADD
 
     body = AppNode(AppNode(ConstNode(:FADD), IndexNode(0)), ConstNode(:c))
-    parent = Individual(
-        AstTree(AbsNode(:x, body)), TyFun(FloatTy, FloatTy);
+    parent = Program(
+        AstTree(AbsNode(:x, body));
         local_consts=Dict{Symbol,Any}(:c => 2.0),
         local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy),
     )
     context = Dict{Symbol,TyLike}(:FADD => get_type(FADD))
-    region = prepare_scalar_region(parent, context, [1])
+    region = prepare_scalar_region(parent, TyFun(FloatTy, FloatTy), context, [1])
     @test region isa ScalarRegion
     before = deepcopy(parent.tree)
     first_candidate = materialize_scalar_region(
@@ -599,8 +581,8 @@ end
         ScalarSearch.scalar_binary(:+, ScalarSearch.scalar_input(1),
             ScalarSearch.scalar_constant(4.0)),
     )
-    @test first_candidate isa Individual
-    @test second_candidate isa Individual
+    @test first_candidate isa Program
+    @test second_candidate isa Program
     @test parent.tree == before
     @test first_candidate.local_consts[:c] == 2.0
     @test first_candidate.local_consts_ty[:c] == FloatTy
@@ -615,27 +597,27 @@ end
 @testitem "scalar region exact seed roundtrip preserves owned namespace" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression:
         ScalarRegion, materialize_scalar_region, prepare_scalar_region
     using LambdaRegression.ScalarSearch
-    using LambdaRegression.TypeSystem: FADD, FloatTy, TyFun, TyLike, get_type
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, get_type
+    using LambdaRegression.Primitives: FADD
 
-    parent = Individual(
+    parent = Program(
         AstTree(AbsNode(:x, AppNode(
             AppNode(ConstNode(:FADD), IndexNode(0)),
-            AppNode(AppNode(ConstNode(:FADD), ConstNode(:c)), ConstNode(:c))))),
-        TyFun(FloatTy, FloatTy);
+            AppNode(AppNode(ConstNode(:FADD), ConstNode(:c)), ConstNode(:c)))));
         local_consts=Dict{Symbol,Any}(:c => 3.0),
         local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy),
     )
-    region = prepare_scalar_region(parent, Dict{Symbol,TyLike}(:FADD => get_type(FADD)), [1])
+    region = prepare_scalar_region(parent, TyFun(FloatTy, FloatTy), Dict{Symbol,TyLike}(:FADD => get_type(FADD)), [1])
     @test region isa ScalarRegion
     roundtrip = materialize_scalar_region(region, region.expr)
-    @test roundtrip isa Individual
-    @test roundtrip.tree == region.individual.tree
-    @test roundtrip.local_consts == region.individual.local_consts == parent.local_consts
-    @test roundtrip.local_consts_ty == region.individual.local_consts_ty
+    @test roundtrip isa Program
+    @test roundtrip.tree == region.program.tree
+    @test roundtrip.local_consts == region.program.local_consts == parent.local_consts
+    @test roundtrip.local_consts_ty == region.program.local_consts_ty
     @test roundtrip.tree !== parent.tree
     @test roundtrip.local_consts !== parent.local_consts
 
@@ -644,7 +626,7 @@ end
         ScalarSearch.scalar_binary(:+, ScalarSearch.scalar_input(1),
             ScalarSearch.scalar_constant(1.0)),
     )
-    @test changed isa Individual
+    @test changed isa Program
     @test changed.tree != roundtrip.tree
     @test haskey(changed.local_consts, :c)
 end
@@ -652,8 +634,7 @@ end
 @testitem "scalar region preserves recursive outer structure" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
-    using LambdaRegression.Procedural: FunctionDefNode
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression:
         ScalarRegion, materialize_scalar_region, prepare_scalar_region
     using LambdaRegression.ScalarSearch
@@ -661,12 +642,12 @@ end
 
     target = TyFun(FloatTy, FloatTy)
     recursive = AstTree(FunctionDefNode(AbsNode(:x, IndexNode(0))))
-    parent = Individual(recursive, target)
-    region = prepare_scalar_region(parent, Dict{Symbol,TyLike}(), [1, 1])
+    parent = Program(recursive)
+    region = prepare_scalar_region(parent, target, Dict{Symbol,TyLike}(), [1, 1])
     @test region isa ScalarRegion
     @test region.dependencies == [IndexNode(0)]
     candidate = materialize_scalar_region(region, ScalarSearch.scalar_input(1))
-    @test candidate isa Individual
+    @test candidate isa Program
     @test candidate.tree.root isa FunctionDefNode
     @test candidate.tree.root.body.body == IndexNode(0)
 end
@@ -675,20 +656,19 @@ end
     using Test
     using Random: MersenneTwister
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression:
         ScalarRegion, prepare_scalar_region, search_scalar_region
     using LambdaRegression.ScalarSearch: ScalarSearchConfig
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
 
-    parent = Individual(AstTree(AbsNode(:x, IndexNode(0))),
-        TyFun(FloatTy, FloatTy))
-    region = prepare_scalar_region(parent, Dict{Symbol,TyLike}(), [1])
+    parent = Program(AstTree(AbsNode(:x, IndexNode(0))))
+    region = prepare_scalar_region(parent, TyFun(FloatTy, FloatTy), Dict{Symbol,TyLike}(), [1])
     @test region isa ScalarRegion
     seen = Ref(0)
     score = individual -> begin
         seen[] += 1
-        individual isa Individual || error("not an Individual")
+        individual isa Program || error("not a Program")
         return Float64(length(individual.tree))
     end
     config = ScalarSearchConfig(
@@ -710,39 +690,39 @@ end
     @test result.diagnostics.objective_calls >= seen[]
     @test result.diagnostics.structural_evaluations > 0
     @test 1 <= length(result.candidates) <= 3
-    @test all(candidate -> candidate.individual isa Individual, result.candidates)
+    @test all(candidate -> candidate.program isa Program, result.candidates)
 end
 
 @testitem "scalar region refuses unsupported and zero-feature seeds" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: ScalarRegion, prepare_scalar_region
     using LambdaRegression.Utils: Err
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
 
     target = TyFun(FloatTy, FloatTy)
-    unsupported = Individual(AstTree(AbsNode(:x, AppNode(
-        AppNode(ConstNode(:BAD), IndexNode(0)), IndexNode(0)))), target)
+    unsupported = Program(AstTree(AbsNode(:x, AppNode(
+        AppNode(ConstNode(:BAD), IndexNode(0)), IndexNode(0)))))
     context = Dict{Symbol,TyLike}(:BAD => TyFun(FloatTy, TyFun(FloatTy, FloatTy)))
-    bad_region = prepare_scalar_region(unsupported, context, [1])
+    bad_region = prepare_scalar_region(unsupported, target, context, [1])
     @test bad_region isa Err
     @test bad_region.value.reason == :unsupported_seed
 
-    constant = Individual(AstTree(ConstNode(:c)), FloatTy;
+    constant = Program(AstTree(ConstNode(:c));
         local_consts=Dict{Symbol,Any}(:c => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy))
-    zero_region = prepare_scalar_region(constant, Dict{Symbol,TyLike}(), Int[])
+    zero_region = prepare_scalar_region(constant, FloatTy, Dict{Symbol,TyLike}(), Int[])
     @test zero_region isa Err
     @test zero_region.value.reason == :zero_features
 
     # A constant seed remains eligible when a visible Float binder can supply
     # a later mutation; only a region with no available dependency is refused.
-    reachable = Individual(AstTree(AbsNode(:x, ConstNode(:c))), target;
+    reachable = Program(AstTree(AbsNode(:x, ConstNode(:c)));
         local_consts=Dict{Symbol,Any}(:c => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy))
     reachable_region = prepare_scalar_region(
-        reachable, Dict{Symbol,TyLike}(), [1])
+        reachable, target, Dict{Symbol,TyLike}(), [1])
     @test reachable_region isa ScalarRegion
     @test reachable_region.dependencies == [IndexNode(0)]
 end
@@ -750,14 +730,13 @@ end
 @testitem "scalar region score exceptions propagate" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: prepare_scalar_region, search_scalar_region
     using LambdaRegression.ScalarSearch: ScalarSearchConfig
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
 
-    parent = Individual(AstTree(AbsNode(:x, IndexNode(0))),
-        TyFun(FloatTy, FloatTy))
-    region = prepare_scalar_region(parent, Dict{Symbol,TyLike}(), [1])
+    parent = Program(AstTree(AbsNode(:x, IndexNode(0))))
+    region = prepare_scalar_region(parent, TyFun(FloatTy, FloatTy), Dict{Symbol,TyLike}(), [1])
     config = ScalarSearchConfig(
         population_size=2,
         max_evaluations=2,

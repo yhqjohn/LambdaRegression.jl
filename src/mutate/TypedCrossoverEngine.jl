@@ -2,19 +2,11 @@
 # the existing public `recombine` seam; tests here exercise that seam only.
 using TestItems
 
-using ...Procedural:
-    FunctionDefNode, functiondef_recursion_summary, prepare_procedural_snapshot
+using ...ProgramAnalysis: functiondef_recursion_summary
 
 struct _DirectionalPair
-    recipient_site::Any
-    donor_site::Any
-    recipient_view::CrossoverSite
-    donor_view::CrossoverSite
-end
-
-function _engine_contains_functiondef(node::AstNode)::Bool
-    node isa FunctionDefNode && return true
-    return any(_engine_contains_functiondef, children(node))
+    recipient::CrossoverSite
+    donor::CrossoverSite
 end
 
 function _engine_snapshot(
@@ -22,24 +14,15 @@ function _engine_snapshot(
     type_ctx::AbstractDict{Symbol,<:TyLike},
     target_ty::Ty,
     tyfactory_ctor,
-    ;
-    site_path::Union{Nothing,Vector{Int}}=nothing,
 )
-    if _engine_contains_functiondef(tree.root)
-        return prepare_procedural_snapshot(
-            tree,
-            type_ctx;
-            factory=tyfactory_ctor(),
-            target_ty,
-            site_path,
-        )
-    end
-    return prepare_core_snapshot(
+    # `TypedAnalysis` is the shared fact source for ordinary and FunctionDef
+    # syntax. Site contracts are projected from integer IDs only after a
+    # candidate has been selected.
+    return prepare_typed_analysis(
         tree,
         type_ctx;
         factory=tyfactory_ctor(),
         target_ty,
-        site_path,
     )
 end
 
@@ -50,80 +33,56 @@ struct _PreparedCrossoverParent
     global_consts_ty::Dict{Symbol,TyLike}
     target_ty::Ty
     snapshot::Any
-    scoped::Any
     contextual_key::Any
 end
 
 function _prepare_crossover_parent(
-    individual::Individual,
+    program::Program,
+    target_ty::Ty,
     global_consts_ty::Dict{Symbol,TyLike};
     tyfactory_ctor=make_tyvar_factory,
 )
-    type_ctx = merge(global_consts_ty, individual.local_consts_ty)
-    snapshot = _engine_snapshot(
-        individual.tree,
-        type_ctx,
-        individual.target_ty,
-        tyfactory_ctor,
+    type_ctx = merge(global_consts_ty, program.local_consts_ty)
+    snapshot = prepare_typed_analysis(
+        program,
+        type_ctx;
+        factory=tyfactory_ctor(),
+        target_ty,
     )
     snapshot isa Err && return snapshot
     return _PreparedCrossoverParent(
-        individual.tree,
-        individual.local_consts,
-        individual.local_consts_ty,
+        program.tree,
+        program.local_consts,
+        program.local_consts_ty,
         global_consts_ty,
-        individual.target_ty,
+        target_ty,
         snapshot,
-        _resolve_scoped(individual.tree),
         _contextual_subtree_key(
-            individual.tree.root,
-            individual.local_consts,
-            individual.local_consts_ty,
+            program.tree.root,
+            program.local_consts,
+            program.local_consts_ty,
         ),
     )
 end
 
 function _checked_prepared_parent(
     prepared::_PreparedCrossoverParent,
-    individual::Individual,
+    program::Program,
+    target_ty::Ty,
     global_consts_ty::Dict{Symbol,TyLike},
 )
-    prepared.tree === individual.tree &&
-        prepared.local_consts === individual.local_consts &&
-        prepared.local_consts_ty === individual.local_consts_ty &&
+    target_ok = prepared.target_ty === target_ty ||
+        (isempty(collect_free_vars(prepared.target_ty)) &&
+         isempty(collect_free_vars(target_ty)) &&
+         isequal_mu(prepared.target_ty, target_ty))
+    prepared.tree === program.tree &&
+        prepared.local_consts === program.local_consts &&
+        prepared.local_consts_ty === program.local_consts_ty &&
         prepared.global_consts_ty === global_consts_ty &&
-        prepared.target_ty === individual.target_ty || throw(ArgumentError(
+        target_ok || throw(ArgumentError(
             "prepared crossover analysis belongs to another parent or type context",
         ))
     return prepared
-end
-
-_engine_site_type(site) = begin
-    demand = getproperty(site, :demand)
-    demand isa TyScheme ? demand.ty : demand
-end
-
-function _engine_policy_site(site)
-    boundary = Tuple(getproperty(site, :boundary_visible))
-    binder_schemes = getproperty(site, :binder_schemes)
-    binder_types = Union{Nothing,TyLike}[
-        get(binder_schemes, binder, nothing)
-        for binder in reverse(boundary)
-    ]
-    capture_levels = Int[]
-    for binder in keys(getproperty(site, :external_occurrences))
-        position = findfirst(==(binder), boundary)
-        position === nothing || push!(capture_levels, position - 1)
-    end
-    sort!(unique!(capture_levels))
-    return CrossoverSite(
-        collect(Int, getproperty(site, :path)),
-        length(boundary),
-        _engine_site_type(site),
-        getproperty(site, :offer),
-        binder_types,
-        capture_levels,
-    )
 end
 
 _engine_is_domain_exclusion(error)::Bool =
@@ -281,11 +240,17 @@ function _engine_replays_target(child_site, original_target_site)::Bool
         return !(replay isa Err) && replay
     end
 
+    child_boundary = Tuple(getproperty(child_site, :boundary_visible))
+    original_boundary = Tuple(getproperty(original_target_site, :boundary_visible))
+    child_positions = Dict{Any,Int}(binder => index for (index, binder) in enumerate(child_boundary))
+    original_positions = Dict{Any,Int}(binder => index for (index, binder) in enumerate(original_boundary))
+    candidate_allowed = (source, target) ->
+        get(child_positions, source, 0) == get(original_positions, target, -1)
     batch = try
         _snapshot_open_retrieval_bounded(
             child_site,
             [original_target_site];
-            candidate_allowed=(source, target) -> source == target,
+            candidate_allowed,
             max_answers=1,
         )
     catch error
@@ -294,45 +259,40 @@ function _engine_replays_target(child_site, original_target_site)::Bool
     end
     group_count = length(getproperty(child_site, :external_occurrences))
     return any(batch.answers) do answer
-        length(answer.h) == group_count &&
-            all(pair -> first(pair) == last(pair), answer.h)
+        length(answer.h) == group_count && all(
+            pair -> get(child_positions, first(pair), 0) ==
+                    get(original_positions, last(pair), -1),
+            answer.h,
+        )
     end
 end
 
 function _engine_application_roles_stable(
-    original_scoped,
     original_tree::AstTree,
     child_tree::AstTree,
     path::Vector{Int},
 )
-    if original_scoped isa Err
-        original_node = original_tree.root
-        child_node = child_tree.root
-        for child_index in path
-            if original_node isa AppNode || child_node isa AppNode
-                original_node isa AppNode && child_node isa AppNode || return false
-                (original_node.func isa AbsNode) ==
-                    (child_node.func isa AbsNode) || return false
-            end
-            original_children = children(original_node)
-            child_children = children(child_node)
-            1 <= child_index <= length(original_children) || return false
-            1 <= child_index <= length(child_children) || return false
-            original_node = original_children[child_index]
-            child_node = child_children[child_index]
+    original_node = original_tree.root
+    child_node = child_tree.root
+    for child_index in path
+        if original_node isa AppNode || child_node isa AppNode
+            original_node isa AppNode && child_node isa AppNode || return false
+            (original_node.func isa AbsNode) ==
+                (child_node.func isa AbsNode) || return false
         end
-        return true
+        original_children = children(original_node)
+        child_children = children(child_node)
+        1 <= child_index <= length(original_children) || return false
+        1 <= child_index <= length(child_children) || return false
+        original_node = original_children[child_index]
+        child_node = child_children[child_index]
     end
-    retained = _retained_application_ancestors(original_scoped, path)
-    retained isa Err && return false
-    child_scoped = _resolve_scoped(child_tree)
-    child_scoped isa Err && return false
-    return _application_roles_stable(original_scoped, child_scoped, retained)
+    return true
 end
 
 """
     recombine(op::TypedSubtreeSwapCrossover, recipient, donor; kwargs...)
-        -> Individual or Err
+        -> Program or Err
 
 Insert one closed or contextually open donor fragment into a directed recipient
 site. Retrieval checks `recipient demand ≼ donor offer`, transports all declared
@@ -345,8 +305,10 @@ Custom pair-weight policies retain exact positive-pair enumeration before the
 """
 function recombine(
     op::TypedSubtreeSwapCrossover,
-    recipient::Individual,
-    donor::Individual;
+    recipient::Program,
+    donor::Program;
+    recipient_target::Ty,
+    donor_target::Ty,
     rng::AbstractRNG=MersenneTwister(2000),
     global_consts_ty::Union{Nothing,Dict{Symbol,TyLike}}=nothing,
     tyfactory_ctor=make_tyvar_factory,
@@ -368,51 +330,63 @@ function recombine(
     recipient_prepared = _prepared_recipient === nothing ?
         _prepare_crossover_parent(
             recipient,
+            recipient_target,
             global_consts_ty;
             tyfactory_ctor,
         ) :
-        _checked_prepared_parent(_prepared_recipient, recipient, global_consts_ty)
+        _checked_prepared_parent(
+            _prepared_recipient, recipient, recipient_target, global_consts_ty,
+        )
     recipient_prepared isa Err && return recipient_prepared
     donor_prepared = _prepared_donor === nothing ?
         _prepare_crossover_parent(
             donor,
+            donor_target,
             global_consts_ty;
             tyfactory_ctor,
         ) :
-        _checked_prepared_parent(_prepared_donor, donor, global_consts_ty)
+        _checked_prepared_parent(
+            _prepared_donor, donor, donor_target, global_consts_ty,
+        )
     donor_prepared isa Err && return donor_prepared
     recipient_snapshot = recipient_prepared.snapshot
     donor_snapshot = donor_prepared.snapshot
 
-    recipient_sites = op.allow_root ? recipient_snapshot.sites :
-        filter(site -> !isempty(site.path), recipient_snapshot.sites)
-    donor_sites = op.allow_root ? donor_snapshot.sites :
-        filter(site -> !isempty(site.path), donor_snapshot.sites)
+    recipient_ids = typed_analysis_site_ids(
+        recipient_snapshot; include_root=op.allow_root,
+    )
+    donor_ids = typed_analysis_site_ids(
+        donor_snapshot; include_root=op.allow_root,
+    )
+    recipient_sites = CrossoverSite[
+        CrossoverSite(recipient_snapshot, id) for id in recipient_ids
+    ]
+    donor_sites = CrossoverSite[
+        CrossoverSite(donor_snapshot, id) for id in donor_ids
+    ]
     length(recipient_sites) >= op.min_sites ||
         return Err(NoEligibleCrossoverSiteErr())
     length(donor_sites) >= op.min_sites ||
         return Err(NoEligibleCrossoverSiteErr())
     if donor_path !== nothing
         selected_path = Tuple(Int.(collect(donor_path)))
-        donor_sites = filter(
-            site -> Tuple(getproperty(site, :path)) == selected_path,
-            donor_sites,
+        donor_ids = typed_analysis_site_ids(
+            donor_snapshot;
+            include_root=op.allow_root,
+            site_path=selected_path,
         )
+        donor_sites = CrossoverSite[
+            CrossoverSite(donor_snapshot, id) for id in donor_ids
+        ]
         isempty(donor_sites) && return Err(NoEligibleCrossoverSiteErr())
     end
 
-    recipient_views = [_engine_policy_site(site) for site in recipient_sites]
-    donor_views = [_engine_policy_site(site) for site in donor_sites]
-    recipient_weights = Float64[
-        _checked_crossover_weight(
-            crossover_site_weight(op.selection, view, recipient_role),
-        ) for view in recipient_views
-    ]
-    donor_weights = Float64[
-        _checked_crossover_weight(
-            crossover_site_weight(op.selection, view, donor_role),
-        ) for view in donor_views
-    ]
+    recipient_weights = _crossover_site_weights(
+        op.selection, recipient_sites, recipient_role,
+    )
+    donor_weights = _crossover_site_weights(
+        op.selection, donor_sites, donor_role,
+    )
 
     pair_proposals, proposals_exhaustive =
         _crossover_pair_weights_factorized(op.selection) ?
@@ -429,34 +403,27 @@ function recombine(
     logweights = Float64[]
     for (recipient_index, donor_index) in pair_proposals
         recipient_site = recipient_sites[recipient_index]
-        recipient_view = recipient_views[recipient_index]
         donor_site = donor_sites[donor_index]
-        donor_view = donor_views[donor_index]
         if op.require_same_depth &&
-           recipient_view.depth != donor_view.depth
+           crossover_site_depth(recipient_site) != crossover_site_depth(donor_site)
             continue
         end
-        iscompatible(recipient_view.ty, donor_view.ty) || continue
+        iscompatible(crossover_site_type(recipient_site), crossover_site_type(donor_site)) || continue
         pair_weight = _checked_crossover_weight(
             recipient_role === :left ?
                 crossover_pair_weight(
                     op.selection,
-                    recipient_view,
-                    donor_view,
+                    recipient_site,
+                    donor_site,
                 ) :
                 crossover_pair_weight(
                     op.selection,
-                    donor_view,
-                    recipient_view,
+                    donor_site,
+                    recipient_site,
                 ),
         )
         pair_weight > 0 || continue
-        push!(pairs, _DirectionalPair(
-            recipient_site,
-            donor_site,
-            recipient_view,
-            donor_view,
-        ))
+        push!(pairs, _DirectionalPair(recipient_site, donor_site))
         push!(logweights,
             proposals_exhaustive ?
                 log(recipient_weights[recipient_index]) +
@@ -479,7 +446,6 @@ function recombine(
             Err(CrossoverMaxTryReachedErr(op.max_try))
     end
 
-    recipient_scoped = recipient_prepared.scoped
     recipient_contextual_key = recipient_prepared.contextual_key
     order = _weighted_crossover_order(rng, logweights)
     attempts = 0
@@ -490,10 +456,16 @@ function recombine(
     for order_index in 1:min(op.max_try, length(order))
         attempts += 1
         pair = pairs[order[order_index]]
-        path = pair.recipient_view.path
+        path = crossover_site_path(pair.recipient)
+        recipient_site = typed_analysis_site(
+            pair.recipient.analysis, pair.recipient.id,
+        )
+        donor_site = typed_analysis_site(
+            pair.donor.analysis, pair.donor.id,
+        )
         witness_batch = _engine_witness_mappings(
-            pair.donor_site,
-            pair.recipient_site,
+            donor_site,
+            recipient_site,
             max_open_answers_per_pair=op.max_open_answers_per_pair,
         )
         mappings = witness_batch.mappings
@@ -506,20 +478,20 @@ function recombine(
         isempty(mappings) && continue
         saw_witness = true
         for mapping in mappings
-            category = _engine_exchange_category(pair.donor_site, mapping)
+            category = _engine_exchange_category(donor_site, mapping)
             selected_event = (
                 event=:selected,
                 outcome=:selected,
                 target_path=Tuple(path),
-                donor_path=Tuple(pair.donor_view.path),
+                donor_path=Tuple(crossover_site_path(pair.donor)),
                 category,
                 attempt=attempts,
             )
             _engine_trace(trace_callback, selected_event)
             transported = transport_subtree(
                 donor.tree,
-                pair.donor_site,
-                pair.recipient_site,
+                donor_site,
+                recipient_site,
                 mapping,
             )
             if transported isa Err
@@ -531,9 +503,13 @@ function recombine(
             end
 
             tree = deepcopy(recipient.tree)
-            local_consts = deepcopy(recipient.local_consts)
-            local_consts_ty = _detached_type_ctx(recipient.local_consts_ty)
-            donor_local_consts_ty = _detached_type_ctx(donor.local_consts_ty)
+            # Published Program material is already owned and read-only.  The
+            # child edits fresh dictionaries, while preserving value aliases
+            # and the declaration graph; query-local detachment belongs to
+            # each snapshot/W boundary, not to publication.
+            local_consts = copy(recipient.local_consts)
+            local_consts_ty = copy(recipient.local_consts_ty)
+            donor_local_consts_ty = copy(donor.local_consts_ty)
             factory = const_symfactory_ctor()
             _separate_local_global_namespace!(
                 tree,
@@ -544,7 +520,7 @@ function recombine(
             )
             _remap_donor_locals!(
                 transported,
-                deepcopy(donor.local_consts),
+                copy(donor.local_consts),
                 donor_local_consts_ty,
                 local_consts,
                 local_consts_ty,
@@ -558,12 +534,7 @@ function recombine(
                 ))
                 continue
             end
-            if !_engine_application_roles_stable(
-                recipient_scoped,
-                recipient.tree,
-                tree,
-                path,
-            )
+            if !_engine_application_roles_stable(recipient.tree, tree, path)
                 _engine_trace(trace_callback, merge(
                     selected_event,
                     (; event=:terminal, outcome=:transport_rejected),
@@ -590,33 +561,31 @@ function recombine(
 
             child_ctx = merge(global_consts_ty, local_consts_ty)
             child_snapshot = _engine_snapshot(
-                tree,
-            child_ctx,
-            recipient.target_ty,
-            tyfactory_ctor,
-            site_path=path,
-        )
-            if child_snapshot isa Err ||
-               !iscompatible(child_snapshot.root_type, recipient.target_ty)
-                _engine_trace(trace_callback, merge(
-                    selected_event,
-                    (; event=:terminal, outcome=:invalid_child),
-                ))
-                continue
-            end
-            child_site_index = findfirst(
-                site -> Tuple(site.path) == Tuple(pair.recipient_site.path),
-                child_snapshot.sites,
+                tree, child_ctx, recipient_target, tyfactory_ctor,
             )
-            if child_site_index === nothing
+            if child_snapshot isa Err ||
+               !iscompatible(child_snapshot.root_type, recipient_target)
                 _engine_trace(trace_callback, merge(
                     selected_event,
                     (; event=:terminal, outcome=:invalid_child),
                 ))
                 continue
             end
-            child_site = child_snapshot.sites[child_site_index]
-            if !_engine_replays_target(child_site, pair.recipient_site)
+            child_site_ids = typed_analysis_site_ids(
+                child_snapshot;
+                include_root=true,
+                site_path=Tuple(path),
+            )
+            child_site_id = isempty(child_site_ids) ? nothing : only(child_site_ids)
+            if child_site_id === nothing
+                _engine_trace(trace_callback, merge(
+                    selected_event,
+                    (; event=:terminal, outcome=:invalid_child),
+                ))
+                continue
+            end
+            child_site = typed_analysis_site(child_snapshot, child_site_id)
+            if !_engine_replays_target(child_site, recipient_site)
                 _engine_trace(trace_callback, merge(
                     selected_event,
                     (; event=:terminal, outcome=:invalid_child),
@@ -624,14 +593,7 @@ function recombine(
                 continue
             end
 
-            child = Individual(
-                tree,
-                recipient.target_ty;
-                local_consts,
-                local_consts_ty,
-                fitness=nothing,
-                meta=(;),
-            )
+            child = _publish_program(tree, local_consts, local_consts_ty)
             _engine_trace(trace_callback, merge(
                 selected_event,
                 (; event=:terminal, outcome=:changed),
@@ -709,6 +671,7 @@ end
 
     donor_binder = BinderId(:abs, (), 9)
     donor = (;
+        demand=IntTy,
         offer=IntTy,
         external_occurrences=Dict(
             donor_binder => [(path=(1,), use_type=IntTy)],
@@ -749,13 +712,15 @@ end
     using Test
     using Random
     using LambdaRegression.ASTs.NodeASTs:
-        AbsNode, AppNode, AstTree, ConstNode, IndexNode
+        AbsNode, AppNode, AstTree, ConstNode, FunctionDefNode, IndexNode
     using LambdaRegression.Mutations.Populations:
-        AbstractCrossoverSelectionPolicy, CrossoverSite, Individual,
+        AbstractCrossoverSelectionPolicy, CrossoverSite, Program,
+        crossover_site_path,
         TypedSubtreeSwapCrossover, recombine
     import LambdaRegression.Mutations.Populations: crossover_pair_weight
     using LambdaRegression.TypeSystem:
-        FADD, FMUL, FSUB, FloatTy, TyFun, get_type_ctx
+        FloatTy, TyFun, get_type_ctx
+    using LambdaRegression.Primitives: FADD, FMUL, FSUB
     using LambdaRegression.Utils: Err
 
     mutable struct SparseRootBodyPair <: AbstractCrossoverSelectionPolicy
@@ -767,7 +732,8 @@ end
         right::CrossoverSite,
     )
         policy.calls += 1
-        return left.path == [1] && right.path == [1] ? 1.0 : 0.0
+        return crossover_site_path(left) == [1] &&
+               crossover_site_path(right) == [1] ? 1.0 : 0.0
     end
 
     add(left, right) = AppNode(AppNode(ConstNode(:FADD), left), right)
@@ -785,13 +751,11 @@ end
     ])
     recipient_body = foldl(add, recipient_terms)
     donor_body = foldl(mul, donor_terms)
-    recipient = Individual(
+    recipient = Program(
         AstTree(AbsNode(:x, recipient_body)),
-        TyFun(FloatTy, FloatTy),
     )
-    donor = Individual(
+    donor = Program(
         AstTree(AbsNode(:x, donor_body)),
-        TyFun(FloatTy, FloatTy),
     )
     values = Dict{Symbol,Any}(
         :FADD => FADD,
@@ -808,6 +772,8 @@ end
         donor;
         rng=MersenneTwister(8000),
         global_consts_ty=get_type_ctx(values),
+        recipient_target=TyFun(FloatTy, FloatTy),
+        donor_target=TyFun(FloatTy, FloatTy),
     )
     @test policy.calls > 64
     @test !(child isa Err)
@@ -817,11 +783,11 @@ end
 @testitem "directional engine recombines an open core ancestor transactionally" begin
     using Test
     using Random
-    using LambdaRegression.ASTs.Contexts: ConstSymbolFactory
+    using LambdaRegression.Programs: ConstSymbolFactory
     using LambdaRegression.ASTs.NodeASTs:
-        AbsNode, AppNode, AstTree, ConstNode, IndexNode
+        AbsNode, AppNode, AstTree, ConstNode, FunctionDefNode, IndexNode
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
         _prepare_crossover_parent, recombine
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer
     using LambdaRegression.Utils: Err
@@ -851,18 +817,16 @@ end
             ),
         ),
     ))
-    recipient = Individual(
+    recipient = Program(
         recipient_tree,
-        TyFun(IntTy, int_function);
         local_consts=Dict{Symbol,Any}(:payload => 99, :old => identity),
         local_consts_ty=Dict{Symbol,TyLike}(
             :payload => IntTy,
             :old => int_function,
         ),
     )
-    donor = Individual(
+    donor = Program(
         donor_tree,
-        TyFun(IntTy, int_function);
         local_consts=Dict{Symbol,Any}(:payload => [2]),
         local_consts_ty=Dict{Symbol,TyLike}(:payload => IntTy),
     )
@@ -881,6 +845,8 @@ end
         donor;
         rng=MersenneTwister(1111),
         global_consts_ty=global_types,
+        recipient_target=TyFun(IntTy, int_function),
+        donor_target=TyFun(IntTy, int_function),
         const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
         trace_callback=event -> push!(events, event),
     )
@@ -897,7 +863,6 @@ end
         if value isa Vector{Int}
     ]
     @test copied_payloads == [[2]]
-    push!(only(copied_payloads), 3)
     @test donor.local_consts[:payload] == [2]
     @test recipient.tree == before_recipient.tree
     @test recipient.local_consts == before_recipient.local_consts
@@ -915,9 +880,15 @@ end
         donor;
         rng=MersenneTwister(1111),
         global_consts_ty=global_types,
+        recipient_target=TyFun(IntTy, int_function),
+        donor_target=TyFun(IntTy, int_function),
         const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
-        _prepared_recipient=_prepare_crossover_parent(recipient, global_types),
-        _prepared_donor=_prepare_crossover_parent(donor, global_types),
+        _prepared_recipient=_prepare_crossover_parent(
+            recipient, TyFun(IntTy, int_function), global_types,
+        ),
+        _prepared_donor=_prepare_crossover_parent(
+            donor, TyFun(IntTy, int_function), global_types,
+        ),
     )
     @test !(prepared_child isa Err)
     prepared_child isa Err || @test prepared_child.tree == child.tree
@@ -927,12 +898,11 @@ end
     using Test
     using Random
     using LambdaRegression.ASTs.NodeASTs:
-        AbsNode, AppNode, AstTree, ConstNode, IndexNode
+        AbsNode, AppNode, AstTree, ConstNode, FunctionDefNode, IndexNode
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
-        _snapshot_open_retrieval, prepare_core_snapshot, recombine
-    using LambdaRegression.Procedural:
-        FunctionDefNode, prepare_procedural_snapshot
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
+        _snapshot_open_retrieval, prepare_typed_analysis,
+        typed_analysis_site_ids, typed_analysis_site, recombine
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
 
@@ -942,7 +912,7 @@ end
         :ONE => IntTy,
         :USE_FUN => TyFun(int_function, IntTy),
     )
-    recipient = Individual(
+    recipient = Program(
         AstTree(FunctionDefNode(AbsNode(
             :x,
             AppNode(
@@ -950,9 +920,8 @@ end
                 ConstNode(:ONE),
             ),
         ))),
-        int_function,
     )
-    donor = Individual(
+    donor = Program(
         AstTree(FunctionDefNode(AbsNode(
             :x,
             AppNode(
@@ -960,7 +929,6 @@ end
                 AppNode(IndexNode(1), IndexNode(0)),
             ),
         ))),
-        int_function,
     )
     op = TypedSubtreeSwapCrossover(
         max_try=1,
@@ -974,6 +942,8 @@ end
         donor;
         rng=MersenneTwister(1234),
         global_consts_ty=global_types,
+        recipient_target=int_function,
+        donor_target=int_function,
         trace_callback=event -> push!(events, event),
     )
     @test !(child isa Err)
@@ -981,7 +951,7 @@ end
     @test last(events).outcome === :changed
     @test last(events).category === :functiondef_self
 
-    ordinary = Individual(
+    ordinary = Program(
         AstTree(AbsNode(
             :f,
             AppNode(
@@ -989,15 +959,16 @@ end
                 AbsNode(:x, AppNode(IndexNode(1), IndexNode(0))),
             ),
         )),
-        TyFun(int_function, IntTy),
     )
-    donor_snapshot = prepare_procedural_snapshot(donor.tree, global_types)
-    ordinary_snapshot = prepare_core_snapshot(ordinary.tree, global_types)
-    donor_site = only(filter(site -> site.path == (1,), donor_snapshot.sites))
-    ordinary_site = only(filter(
-        site -> site.path == (1, 2),
-        ordinary_snapshot.sites,
-    ))
+    donor_snapshot = prepare_typed_analysis(donor, global_types)
+    ordinary_snapshot = prepare_typed_analysis(ordinary, global_types)
+    donor_site = typed_analysis_site(
+        donor_snapshot, only(typed_analysis_site_ids(donor_snapshot; site_path=[1])),
+    )
+    ordinary_site = typed_analysis_site(
+        ordinary_snapshot,
+        only(typed_analysis_site_ids(ordinary_snapshot; site_path=[1, 2])),
+    )
     @test !isempty(_snapshot_open_retrieval(donor_site, [ordinary_site]))
 
     rejected = recombine(
@@ -1010,6 +981,8 @@ end
         donor;
         rng=MersenneTwister(8000),
         global_consts_ty=global_types,
+        recipient_target=TyFun(int_function, IntTy),
+        donor_target=int_function,
     )
     @test rejected isa Err
 end
@@ -1020,21 +993,19 @@ end
     using LambdaRegression.ASTs.NodeASTs:
         AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.Mutations.Populations:
-        Individual, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
+        Program, PathCrossoverSelectionPolicy, TypedSubtreeSwapCrossover,
         recombine
-    using LambdaRegression.Procedural: FunctionDefNode
+    using LambdaRegression.ASTs.NodeASTs: FunctionDefNode
     using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
     using LambdaRegression.Utils: Err
 
-    renamed_recipient = Individual(
+    renamed_recipient = Program(
         AstTree(ConstNode(:left)),
-        IntTy;
         local_consts=Dict{Symbol,Any}(:left => 1),
         local_consts_ty=Dict{Symbol,TyLike}(:left => IntTy),
     )
-    renamed_donor = Individual(
+    renamed_donor = Program(
         AstTree(ConstNode(:right)),
-        IntTy;
         local_consts=Dict{Symbol,Any}(:right => 1),
         local_consts_ty=Dict{Symbol,TyLike}(:right => IntTy),
     )
@@ -1048,6 +1019,8 @@ end
         renamed_donor;
         rng=MersenneTwister(42),
         global_consts_ty=Dict{Symbol,TyLike}(),
+        recipient_target=IntTy,
+        donor_target=IntTy,
     )
     @test no_op isa Err
 
@@ -1055,13 +1028,11 @@ end
         :F => TyFun(IntTy, IntTy),
         :ONE => IntTy,
     )
-    procedural_recipient = Individual(
+    procedural_recipient = Program(
         AstTree(FunctionDefNode(AppNode(ConstNode(:F), ConstNode(:ONE)))),
-        IntTy,
     )
-    closed_identity = Individual(
+    closed_identity = Program(
         AstTree(AbsNode(:x, IndexNode(0))),
-        TyFun(IntTy, IntTy),
     )
     role_drift = recombine(
         TypedSubtreeSwapCrossover(
@@ -1074,6 +1045,31 @@ end
         closed_identity;
         rng=MersenneTwister(555),
         global_consts_ty=global_types,
+        recipient_target=IntTy,
+        donor_target=TyFun(IntTy, IntTy),
     )
     @test role_drift isa Err
+end
+
+@testitem "directional prepared parent reuses an identical open target only" begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AstTree, IndexNode
+    using LambdaRegression.Mutations.Populations:
+        Program, _prepare_crossover_parent, _checked_prepared_parent
+    using LambdaRegression.TypeSystem: TyFun, TyLike, make_tyvar_factory
+    using LambdaRegression.Utils: Err
+
+    free = make_tyvar_factory()(0)
+    open_target = TyFun(free, free)
+    program = Program(AstTree(AbsNode(:x, IndexNode(0))))
+    globals = Dict{Symbol,TyLike}()
+    prepared = _prepare_crossover_parent(program, open_target, globals)
+    @test !(prepared isa Err)
+    prepared isa Err && return
+
+    @test _checked_prepared_parent(prepared, program, open_target, globals) === prepared
+    @test_throws ArgumentError _checked_prepared_parent(
+        prepared, program, TyFun(free, free), globals,
+    )
+    @test free.instance === nothing
 end

@@ -155,8 +155,8 @@ This type is used to identify and access nodes within the tree.
 # Implementation Requirements
 Subtypes of [`AbstractTree`](@ref) must implement this method to specify
 the type used for node indexing. For example:
-- DfsTree might return `Int` for integer indices
-- NodeTree might return the node/subtree type itself
+- indexed tree implementations may return an integer type
+- object-based trees may use node or subtree handles
 
 There is also a convenience method `NodeIndex(tree::AbstractTree)` that calls
 `NodeIndex(typeof(tree))` for tree instances.
@@ -187,8 +187,8 @@ Set a new tree as the root of the current tree.
 
 # Returns
 Returns a tree with the new root. The behavior depends on the implementation:
-- For mutable trees (like `NodeTree`): Returns a new tree with the new root
-- For array-based trees (like `DfsTree`): Modifies the tree in-place and returns it
+- For `NodeTree`: Returns a new tree with the new root
+- For mutable storage-backed trees: May modify the tree in place and return it
 
 # Implementation Requirements
 Subtypes of [`AbstractTree`](@ref) must implement this method to:
@@ -754,10 +754,9 @@ end
 
 
 ########################################################
-# 6. Reference Implementation
+# 6. Shared Utilities
 ########################################################
 
-include("dfstrees.jl")
 include("utils.jl")
 
 ########################################################

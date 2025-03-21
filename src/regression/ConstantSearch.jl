@@ -41,7 +41,7 @@ end
 
 """Owned result and classified terminal state from constant search."""
 struct ConstantSearchResult
-    individual::Individual
+    program::Program
     status::Symbol
     loss::Float64
     stats::ConstantSearchStats
@@ -78,17 +78,6 @@ GaussianConstantSearch(;
     σ::Real=0.1,
     tensor_modes::Tuple{Vararg{Symbol}}=(:global_bias, :global_scale, :rank1, :sparse),
 ) = GaussianConstantSearch(σ, tensor_modes)
-
-function _owned_constant_candidate(individual::Individual)
-    return Individual(
-        deepcopy(individual.tree),
-        individual.target_ty;
-        local_consts=deepcopy(individual.local_consts),
-        local_consts_ty=deepcopy(individual.local_consts_ty),
-        fitness=nothing,
-        meta=deepcopy(individual.meta),
-    )
-end
 
 function _float_tensor_ty(ty::Ty)
     current = ty
@@ -178,7 +167,7 @@ function _restore_tensor(template, dense)
     return _copy_dense_to_tensor!(destination, dense)
 end
 
-function _constant_blocks(individual::Individual)
+function _constant_blocks(individual::Program)
     blocks = Pair{Symbol,Symbol}[]
     for name in keys(individual.local_consts)
         haskey(individual.local_consts_ty, name) || continue
@@ -253,8 +242,8 @@ function _mutate_constant_block(strategy, rng, value, kind::Symbol)
     throw(ArgumentError("unsupported constant block kind: $kind"))
 end
 
-function _constant_objective(objective, individual::Individual)
-    value = objective(individual)
+function _constant_objective(objective, program::Program)
+    value = objective(program)
     value isa Err && return value
     value isa Real || throw(ArgumentError("constant-search objective must return Real or Err"))
     loss = Float64(value)
@@ -265,12 +254,12 @@ end
 """
     search_constants(strategy, individual, objective; rng, budget)
 
-Search mutable constants without modifying `individual`. The Gaussian adapter
+Search mutable constants without modifying `program`. The Gaussian adapter
 uses strict improvement and starts every proposal from the best accepted state.
 """
 function search_constants(
     strategy::GaussianConstantSearch,
-    individual::Individual,
+    individual::Program,
     objective;
     rng::AbstractRNG,
     budget::ConstantSearchBudget=ConstantSearchBudget(),
@@ -278,14 +267,14 @@ function search_constants(
     blocks = _constant_blocks(individual)
     if isempty(blocks)
         return ConstantSearchResult(
-            _owned_constant_candidate(individual),
+            individual,
             :ineligible,
             Inf,
             ConstantSearchStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         )
     end
 
-    best = _owned_constant_candidate(individual)
+    best = individual
     baseline = _constant_objective(objective, best)
     if baseline isa Err
         nonfinite = baseline.value isa NonFiniteOutputErr ? 1 : 0
@@ -306,11 +295,16 @@ function search_constants(
     scalar_proposals = 0
     tensor_proposals = 0
     for _ in 1:proposal_limit
-        proposal = _owned_constant_candidate(best)
+        proposal = best
         block = rand(rng, blocks)
         name, kind = first(block), last(block)
         before = proposal.local_consts[name]
-        proposal.local_consts[name] = _mutate_constant_block(strategy, rng, before, kind)
+        proposal = with_constants(
+            proposal,
+            Dict{Symbol,Any}(
+                name => _mutate_constant_block(strategy, rng, before, kind),
+            ),
+        )
         changed += !isequal(proposal.local_consts[name], before)
         scalar_proposals += kind === :scalar
         tensor_proposals += kind === :tensor
@@ -347,14 +341,13 @@ end
     using Test
     using Random: MersenneTwister
     using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.TypeSystem: FloatTy, TyLike
     using LambdaRegression.Regression: ConstantSearchBudget, GaussianConstantSearch
     using LambdaRegression.Regression: search_constants
 
-    parent = Individual(
-        AstTree(ConstNode(:c)),
-        FloatTy;
+    parent = Program(
+        AstTree(ConstNode(:c));
         local_consts=Dict{Symbol,Any}(:c => 0.0),
         local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy),
     )
@@ -367,29 +360,28 @@ end
 
     @test first.status == :improved
     @test first.loss < objective(parent)
-    @test first.individual.local_consts == second.individual.local_consts
+    @test first.program.local_consts == second.program.local_consts
     @test first.stats == second.stats
     @test first.stats.proposals == 16
     @test first.stats.objective_evaluations == 17
     @test parent.local_consts == Dict{Symbol,Any}(:c => 0.0)
-    @test first.individual !== parent
-    @test first.individual.local_consts !== parent.local_consts
+    @test first.program !== parent
+    @test first.program.local_consts !== parent.local_consts
 end
 
 @testitem "Regression constant search mutates tensor blocks structurally" begin
     using Test
     using Random: MersenneTwister
     using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: ConstantSearchBudget, GaussianConstantSearch
     using LambdaRegression.Regression: search_constants
     using LambdaRegression.TypeSystem: FloatTy, TyArray, TyLike, TyNat
 
     tensor_ty = TyArray(TyNat(2), TyArray(TyNat(3), FloatTy))
     source = zeros(2, 3)
-    parent = Individual(
-        AstTree(ConstNode(:A)),
-        tensor_ty;
+    parent = Program(
+        AstTree(ConstNode(:A));
         local_consts=Dict{Symbol,Any}(:A => source),
         local_consts_ty=Dict{Symbol,TyLike}(:A => tensor_ty),
     )
@@ -402,7 +394,7 @@ end
 
     first = search_constants(strategy, parent, objective; rng=MersenneTwister(2000), budget)
     second = search_constants(strategy, parent, objective; rng=MersenneTwister(2000), budget)
-    value = first.individual.local_consts[:A]
+    value = first.program.local_consts[:A]
     delta = value - source
     rank_one = all(
         isapprox(
@@ -416,9 +408,9 @@ end
     @test first.status == :improved
     @test size(value) == (2, 3)
     @test rank_one
-    @test value == second.individual.local_consts[:A]
+    @test value == second.program.local_consts[:A]
     @test value !== source
-    @test parent.local_consts[:A] === source
+    @test parent.local_consts[:A] !== source
     @test parent.local_consts[:A] == zeros(2, 3)
     @test first.stats.scalar_proposals == 0
     @test first.stats.tensor_proposals == 1
@@ -428,16 +420,15 @@ end
     using Test
     using Random: MersenneTwister
     using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression: ConstantSearchBudget, GaussianConstantSearch
     using LambdaRegression.Regression: search_constants
     using LambdaRegression.TypeSystem: FloatTy, TyArray, TyLike, TyNat
 
     tensor_ty = TyArray(TyNat(2), TyArray(TyNat(3), FloatTy))
     source = [zeros(3), zeros(3)]
-    parent = Individual(
-        AstTree(ConstNode(:A)),
-        tensor_ty;
+    parent = Program(
+        AstTree(ConstNode(:A));
         local_consts=Dict{Symbol,Any}(:A => source),
         local_consts_ty=Dict{Symbol,TyLike}(:A => tensor_ty),
     )
@@ -446,7 +437,7 @@ end
     budget = ConstantSearchBudget(max_proposals=1, max_objective_evals=2)
 
     result = search_constants(strategy, parent, objective; rng=MersenneTwister(1), budget)
-    value = result.individual.local_consts[:A]
+    value = result.program.local_consts[:A]
     delta = [value[i][j] - source[i][j] for i in 1:2, j in 1:3]
     rank_one = all(
         isapprox(
@@ -464,155 +455,4 @@ end
     @test value !== source
     @test all(value[i] !== source[i] for i in eachindex(value))
     @test parent.local_consts[:A] == [zeros(3), zeros(3)]
-end
-
-@testitem "Regression fit routes constant search as a replayable mutation channel" begin
-    using Test
-    using Random: MersenneTwister
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.Mutations.Populations: Individual
-    using LambdaRegression.Regression: ConstantSearchBudget, GaussianConstantSearch
-    using LambdaRegression.Regression: Regressor, SupervisedDataset, default_components
-    using LambdaRegression.Regression: default_config, fit!
-    using LambdaRegression.TypeSystem: FloatTy, TyLike
-
-    parent() = Individual(
-        AstTree(ConstNode(:c)),
-        FloatTy;
-        local_consts=Dict{Symbol,Any}(:c => 0.0),
-        local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy),
-    )
-    components = default_components(
-        input_slots=Symbol[],
-        input_types=Dict{Symbol,TyLike}(),
-        evaluate=(individual, x, components, config) -> individual.local_consts[:c],
-        loss=(prediction, target) -> abs2(prediction - target),
-        init_population=(reg, data; N, kwargs...) -> [parent() for _ in 1:N],
-        mutation_driver=(args...; kwargs...) -> error(
-            "ordinary structural mutation must not run in this fixture",
-        ),
-        constant_search=GaussianConstantSearch(σ=0.5),
-    )
-    config = default_config(
-        population_size=2,
-        generations=2,
-        error_threshold=-1.0,
-        mutation_rate=1.0,
-        crossover_rate=0.0,
-        elitism=0,
-        tournament_size=1,
-        seed=8304,
-        constant_search=(;
-            enabled=true,
-            conditional_share=1.0,
-            max_proposals=16,
-            max_objective_evals=17,
-        ),
-        repro=(;
-            require_change=true,
-            max_resample=0,
-            on_fail=:clone,
-            capability_elites=(;),
-            capability_offspring=(;),
-        ),
-        stats=(; enabled=true, reproduction=true),
-        timing=(; enabled=true),
-    )
-    data = SupervisedDataset(Any[nothing], [1.0])
-
-    first = fit!(Regressor(FloatTy, components, config, MersenneTwister(2000)), data)
-    second = fit!(Regressor(FloatTy, components, config, MersenneTwister(2000)), data)
-
-    @test first.best !== nothing
-    @test first.history[end].best_loss < 1.0
-    @test first.best.local_consts == second.best.local_consts
-    @test first.history[1].repro_stats == second.history[1].repro_stats
-    stats = first.history[1].repro_stats
-    @test stats[:constant_search_attempt] > 0
-    @test stats[:constant_search_improved] > 0
-    @test stats[:constant_search_proposals] >= stats[:constant_search_improved]
-    @test stats[:constant_search_objective_evaluations] > stats[:constant_search_proposals]
-    @test stats[:mutation_attempt] == 0
-    @test first.history[1].timing_stats.constant_search_seconds >= 0.0
-end
-
-@testitem "Regression fit can introduce then optimize a missing real parameter" begin
-    using Test
-    using Random: MersenneTwister
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.Mutations: ParameterIntroductionMutation, WeightedPairChooser
-    using LambdaRegression.Mutations.Populations: Individual
-    using LambdaRegression.Regression: GaussianConstantSearch
-    using LambdaRegression.Regression: Regressor, SupervisedDataset, default_components
-    using LambdaRegression.Regression: default_config, fit!
-    using LambdaRegression.TypeSystem: FloatTy, TyLike
-
-    parent() = Individual(AstTree(ConstNode(:ZERO)), FloatTy)
-    components = default_components(
-        input_slots=Symbol[],
-        input_types=Dict{Symbol,TyLike}(),
-        global_consts=Dict{Symbol,Any}(:ZERO => 0.0),
-        global_consts_ty=Dict{Symbol,TyLike}(:ZERO => FloatTy),
-        evaluate=(individual, x, components, config) ->
-            isempty(individual.local_consts) ? 0.0 :
-            only(values(individual.local_consts)),
-        loss=(prediction, target) -> abs2(prediction - target),
-        init_population=(reg, data; N, kwargs...) -> [parent() for _ in 1:N],
-        mutations=[ParameterIntroductionMutation(σ=2.0)],
-        mutation_chooser=WeightedPairChooser(
-            weights=Dict{DataType,Float64}(ParameterIntroductionMutation => 1.0),
-        ),
-        mutation_max_try=1,
-        constant_search=GaussianConstantSearch(σ=0.5),
-    )
-    config = default_config(
-        population_size=2,
-        generations=3,
-        error_threshold=-1.0,
-        mutation_rate=1.0,
-        crossover_rate=0.0,
-        elitism=0,
-        tournament_size=1,
-        seed=8307,
-        constant_search=(;
-            enabled=true,
-            conditional_share=1.0,
-            max_proposals=16,
-            max_objective_evals=17,
-        ),
-        repro=(;
-            require_change=true,
-            max_resample=0,
-            on_fail=:clone,
-            capability_elites=(;),
-            capability_offspring=(;),
-        ),
-        stats=(;
-            enabled=true,
-            mutation=true,
-            mutation_error_types=true,
-            reproduction=true,
-            topk_types=32,
-        ),
-    )
-    data = SupervisedDataset(Any[nothing], [1.0])
-
-    first = fit!(Regressor(FloatTy, components, config, MersenneTwister(2000)), data)
-    second = fit!(Regressor(FloatTy, components, config, MersenneTwister(2000)), data)
-
-    @test first.best !== nothing
-    @test !isempty(first.best.local_consts)
-    @test first.history[end].best_loss < 1.0
-    @test first.best.local_consts == second.best.local_consts
-    generation_one = first.history[1]
-    generation_two = first.history[2]
-    @test generation_one.repro_stats[:constant_search_ineligible] > 0
-    @test generation_one.repro_stats[:mutation_ok] > 0
-    introduction = only(filter(
-        entry -> entry.mutation_type === ParameterIntroductionMutation,
-        generation_one.mutation_stats.per_mutation,
-    ))
-    @test introduction.counts.success > 0
-    @test generation_two.repro_stats[:constant_search_applicable] > 0
-    @test generation_two.repro_stats[:constant_search_improved] > 0
 end

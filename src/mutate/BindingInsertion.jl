@@ -211,7 +211,8 @@ host selection. It must return a finite, nonnegative `Real`; zero excludes a
 host. `host_path` is an attempt-local read-only `Vector{Int}` that is reused as
 successively deeper prefixes; copy it inside the callback only when retaining
 it after the call. The operator uses `ctx.symfactory` when present and otherwise
-creates a local `SymbolGenerator`. Expected failures are an invalid source
+creates a local `SymbolGenerator`; its suggestion is made fresh against named
+variables and abstractions in the attempt tree. Expected failures are an invalid source
 path, no positive legal host, an invalid host weight, or scoped materialisation
 failure.
 """
@@ -277,7 +278,8 @@ function apply(
     next_binder_id = scoped.next_binder_id
     copied_source, next_binder_id =
         _freshen_scoped_binders(source, next_binder_id)
-    name = haskey(ctx, :symfactory) ? ctx.symfactory() : SymbolGenerator()()
+    name_factory = haskey(ctx, :symfactory) ? ctx.symfactory : SymbolGenerator()
+    name = only(_fresh_binder_names(tree, name_factory, 1))
     rewritten = _insert_unused_scoped_binding(
         scoped,
         host_path,
@@ -541,69 +543,227 @@ function _visible_scoped_binders(
     return visible
 end
 
+function _analysis_binding_host(
+    host::Site,
+    analysis::TypedAnalysis,
+    env::MutationEnv,
+)
+    env.tree === nothing && return Err(NoEligibleSiteErr())
+    occurrence = if host.occurrence > 0
+        host.occurrence
+    else
+        current = 1
+        for child_index in host.path
+            children = analysis.index.children[current]
+            1 <= child_index <= length(children) || return Err(NoEligibleSiteErr())
+            current = children[child_index]
+        end
+        current
+    end
+    1 <= occurrence <= length(analysis) || return Err(NoEligibleSiteErr())
+    haskey(analysis.metadata, occurrence) || return Err(NoEligibleSiteErr())
+
+    # The Site is remapped onto the attempt tree before apply, while this
+    # analysis belongs to the unchanged source tree. Occurrence IDs are the
+    # bridge; the path is checked only to ensure both still describe the same
+    # position, never to reconstruct types or binder schemes.
+    source_path = path(analysis.index, occurrence)
+    source_path == host.path || return Err(NoEligibleSiteErr())
+
+    raw_ty = analysis.metadata[occurrence][1]
+    raw_ty isa Ty || return Err(NoEligibleSiteErr())
+    binder_types = TyLike[]
+    for binder in reverse(visible_binder_ids(analysis.index, occurrence))
+        haskey(analysis.binder_schemes, binder) || throw(ArgumentError(
+            "typed analysis lacks a scheme for visible binder $binder",
+        ))
+        push!(binder_types, analysis.binder_schemes[binder])
+    end
+
+    # Keep the callback Site owned by the attempt tree. The occurrence/path
+    # check above aligns it with source analysis, from which only type facts
+    # and complete binder schemes are projected.
+    return Site(
+        host.path,
+        host.node,
+        host.parent,
+        host.child_index,
+        host.depth,
+        host.kind,
+        TypeSystem.prune(raw_ty),
+        binder_types,
+        occurrence,
+    )
+end
+
 function _authoritative_binding_host(
     host::Site,
     env::MutationEnv,
     ctx::NamedTuple,
 )
-    cache = get!(env.eligibility_cache, _authoritative_binding_host) do
-        Dict{Tuple,Any}()
-    end
-    key = Tuple(host.path)
-    return get!(cache, key) do
-        meta = _typed_occurrence_metadata(env, ctx)
-        meta isa Err && return meta
-        tree = env.tree
-        tree === nothing && return Err(NoEligibleSiteErr())
+    analysis = _typed_mutation_analysis(env, ctx)
+    analysis isa Err && return analysis
+    return _analysis_binding_host(host, analysis, env)
+end
 
-        path = collect(Int, host.path)
-        node = tree.root
-        parent = nothing
-        raw_binder_types = Ty[]
-        node_path = Int[]
-        for (offset, child_index) in pairs(path)
-            if node isa AbsNode
-                child_index == 1 || return Err(_ScopedPathErr(path, offset))
-                occurrence_key = Tuple(node_path)
-                haskey(meta, occurrence_key) || return Err(NoEligibleSiteErr())
-                abs_ty = TypeSystem.prune(meta[occurrence_key][1])
-                abs_ty isa TyFun || return Err(NoEligibleSiteErr())
-                push!(raw_binder_types, abs_ty.arg)
-            end
-            kids = children(node)
-            1 <= child_index <= length(kids) ||
-                return Err(_ScopedPathErr(path, offset))
-            parent = node
-            node = kids[child_index]
-            push!(node_path, child_index)
+@testitem "Generated binding hosts reuse indexed occurrence schemes" setup=[BindingInsertionTestSupport] begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: IndexNode
+    using LambdaRegression.Mutations:
+        Site, _authoritative_binding_host, _remap_site
+    using LambdaRegression.ProgramAnalysis: TypedAnalysis, analyze_program
+    using LambdaRegression.TypeSystem:
+        BoolTy, IntTy, TyFun, TyLike, TyProd, TyScheme
+
+    shared_id_use = IndexNode(0)
+    type_ctx = Dict{Symbol,TyLike}(
+        :pair => TyFun(IntTy, TyFun(BoolTy, TyProd(IntTy, BoolTy))),
+        :one => IntTy,
+        :truth => BoolTy,
+    )
+    tree = AstTree(AppNode(
+        AbsNode(:id, AppNode(
+            AppNode(ConstNode(:pair), AppNode(shared_id_use, ConstNode(:one))),
+            AppNode(shared_id_use, ConstNode(:truth)),
+        )),
+        AbsNode(:value, IndexNode(0)),
+    ))
+    target_ty = TyProd(IntTy, BoolTy)
+    analysis = analyze_program(tree, type_ctx; target_ty)
+    @test analysis isa TypedAnalysis
+    analysis isa TypedAnalysis || return
+
+    id_abs = findfirst(
+        node -> node isa AbsNode && node.name === :id,
+        analysis.index.nodes,
+    )
+    @test id_abs !== nothing
+    id_abs === nothing && return
+    id_binder = analysis.index.owner_binder[id_abs]
+    id_uses = findall(==(id_binder), analysis.index.reference_binder)
+    @test length(id_uses) == 2
+    @test id_uses[1] != id_uses[2]
+
+    recorded_scheme = analysis.binder_schemes[id_binder]
+    @test recorded_scheme isa TyScheme
+    @test length(recorded_scheme.vars) == 1
+    attempt_tree = deepcopy(tree)
+    env = binding_env(attempt_tree, target_ty, type_ctx; seed=141)
+    ctx = (; typed_analysis=analysis,
+        global_consts=Dict{Symbol,Any}(),
+        global_consts_ty=type_ctx,
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+    )
+    source_site = Site(analysis, first(id_uses), :index)
+    warmed_host = _authoritative_binding_host(source_site, env, ctx)
+    @test warmed_host isa Site
+    warmed_host isa Site || return
+    @test warmed_host.node === source_site.node
+    @test getfield(warmed_host, :analysis) === nothing
+
+    attempt_site = _remap_site(attempt_tree, source_site, analysis, ctx)
+    host = _authoritative_binding_host(attempt_site, env, ctx)
+
+    @test host isa Site
+    host isa Site || return
+    @test host.occurrence == first(id_uses)
+    @test getfield(host, :analysis) === nothing
+    @test host.path == [1, 1, 1, 2, 1]
+    @test host.node === attempt_site.node
+    @test host.parent === attempt_site.parent
+    @test host.ty == TyFun(IntTy, IntTy)
+    @test length(host.binder_types) == 1
+    @test only(host.binder_types) === recorded_scheme
+    @test env.analysis isa TypedAnalysis
+end
+
+@testitem "Generated binding callbacks see each remapped attempt host" setup=[BindingInsertionTestSupport] begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, ConstNode
+    using LambdaRegression.CanonicalGeneration: GenerationResult
+    using LambdaRegression.Mutations:
+        AbstractReplacementGenerator, GeneratedBindingInsertionMutation,
+        Site, _authoritative_binding_host, _remap_site, apply, generate_binding_rhs
+    using LambdaRegression.ProgramAnalysis: analyze_program
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike
+    using LambdaRegression.Utils: Err
+
+    struct _FirstBindingAttemptRejected end
+    mutable struct AttemptSiteRecordingRHS <: AbstractReplacementGenerator
+        seen::Vector{Tuple{AstNode,Union{Nothing,AstNode}}}
+    end
+    function LambdaRegression.Mutations.generate_binding_rhs(
+        generator::AttemptSiteRecordingRHS,
+        rhs_ty::TyLike,
+        site::Site,
+        ::MutationEnv,
+        ::NamedTuple,
+        ::NamedTuple,
+    )
+        push!(generator.seen, (site.node, site.parent))
+        if length(generator.seen) == 1
+            return Err(_FirstBindingAttemptRejected())
         end
-
-        haskey(meta, key) || return Err(NoEligibleSiteErr())
-        raw_node_ty = meta[key][1]
-        raw_node_ty isa Ty || return Err(NoEligibleSiteErr())
-        binder_types = _target_refined_binder_types(
-            tree,
-            path,
-            env.target_ty,
-            raw_binder_types,
-        )
-        node_ty = _target_refined_site_ty(
-            tree,
-            path,
-            env.target_ty,
-            raw_node_ty,
-        )
-        return Site(
-            path,
-            node,
-            parent,
-            isempty(path) ? 0 : last(path),
-            length(binder_types),
-            _site_kind(node, ctx),
-            node_ty,
-            binder_types,
+        return GenerationResult(
+            AstTree(ConstNode(:two)),
+            rhs_ty,
+            Dict{Symbol,Any}(),
+            Dict{Symbol,TyLike}(),
+            Dict{Symbol,Any}(:source => :attempt_site_recording),
         )
     end
+
+    source = AstTree(AbsNode(:x, AppNode(ConstNode(:f), ConstNode(:one))))
+    target_ty = TyFun(IntTy, IntTy)
+    type_ctx = Dict{Symbol,TyLike}(
+        :f => TyFun(IntTy, IntTy), :one => IntTy, :two => IntTy,
+    )
+    analysis = analyze_program(source, type_ctx; target_ty)
+    occurrence = only(findall(
+        node -> node isa AppNode,
+        analysis.index.nodes,
+    ))
+    source_site = Site(analysis, occurrence, :app)
+    env = binding_env(source, target_ty, type_ctx; seed=143)
+    ctx = (; typed_analysis=analysis,
+        global_consts=Dict{Symbol,Any}(:one => 1, :two => 2),
+        global_consts_ty=type_ctx,
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+        symfactory=SymbolGenerator(),
+    )
+    # Reproduce chooser eligibility before the retry attempts. The resulting
+    # host must not become a cached callback object for later attempts.
+    @test _authoritative_binding_host(source_site, env, ctx) isa Site
+
+    generator = AttemptSiteRecordingRHS(Tuple{AstNode,Union{Nothing,AstNode}}[])
+    mutation = GeneratedBindingInsertionMutation(
+        TyLike[IntTy]; replacement_generator=generator,
+    )
+    attempt_one = deepcopy(source)
+    site_one = _remap_site(attempt_one, source_site, analysis, ctx)
+    failed = apply(mutation, attempt_one, site_one, env, ctx)
+    @test failed isa Err
+    @test attempt_one == source
+
+    attempt_two = deepcopy(source)
+    site_two = _remap_site(attempt_two, source_site, analysis, ctx)
+    changed = apply(mutation, attempt_two, site_two, env, ctx)
+    @test changed isa AstTree
+    @test length(generator.seen) == 2
+    @test generator.seen[1][1] === site_one.node
+    @test generator.seen[1][2] === site_one.parent
+    @test generator.seen[2][1] === site_two.node
+    @test generator.seen[2][2] === site_two.parent
+    @test generator.seen[1][1] !== generator.seen[2][1]
+    @test generator.seen[1][2] !== generator.seen[2][2]
+    @test changed == AstTree(AbsNode(:x,
+        AppNode(
+            AbsNode(Symbol("0"), AppNode(ConstNode(:f), ConstNode(:one))),
+            ConstNode(:two),
+        ),
+    ))
 end
 
 const _BINDING_CONTEXT_RIGID_PREFIX = "##binding_rhs_context#"
@@ -646,6 +806,8 @@ function _infer_binding_rhs_scheme(
     type_ctx::Dict{Symbol,TyLike},
     factory,
 )
+    all(expected -> _site_binder_monotype(expected) !== nothing, host.binder_types) ||
+        return Err(NoEligibleSiteErr())
     observed = AppNode(
         AbsNode(Symbol("##binding_rhs_probe"), IndexNode(0)),
         deepcopy(replacement.root),
@@ -653,20 +815,15 @@ function _infer_binding_rhs_scheme(
     for index in reverse(eachindex(host.binder_types))
         observed = AbsNode(Symbol("##binding_rhs_scope", index), observed)
     end
-    inferred = _run_mutation_inference(
-        ctx,
-        AstTree(observed),
-        type_ctx,
-        factory,
-        nothing,
-    )
+    inferred = _infer_mutation_type(AstTree(observed), type_ctx, factory)
     inferred isa Err && return inferred
 
     current = inferred
     context_vars = _binding_context_free_vars(type_ctx)
-    for expected in host.binder_types
+    for binder_scheme in host.binder_types
         current = TypeSystem.prune(current)
         current isa TyFun || return Err(_GeneratedBindingRHSShapeErr(current))
+        expected = _site_binder_monotype(binder_scheme)::Ty
         expected_copy = TypeSystem._query_copy(
             expected,
             factory,
@@ -829,7 +986,8 @@ function apply(
     resolved_rhs isa Err && return resolved_rhs
     rhs, next_binder_id = resolved_rhs
 
-    name = haskey(ctx, :symfactory) ? ctx.symfactory() : SymbolGenerator()()
+    name_factory = haskey(ctx, :symfactory) ? ctx.symfactory : SymbolGenerator()
+    name = only(_fresh_binder_names(tree, name_factory, 1))
     rewritten = _insert_unused_scoped_binding(
         scoped,
         authoritative_host.path,
@@ -841,12 +999,10 @@ function apply(
     candidate = _materialize_scoped(rewritten)
     candidate isa Err && return candidate
 
-    inferred_root = _run_mutation_inference(
-        ctx,
+    inferred_root = _infer_mutation_type(
         candidate,
         merge(env.type_ctx, staged_local_consts_ty),
         factory,
-        nothing,
     )
     inferred_root isa Err && return inferred_root
     target_copy = TypeSystem._query_copy(
@@ -901,15 +1057,13 @@ function apply(
     ::LetInlineMutation,
     tree::AstTree,
     site::Site,
-    ::MutationEnv,
-    ::NamedTuple,
+    env::MutationEnv,
+    ctx::NamedTuple,
 )
-    current_site = try
-        _remap_site(tree, site)
-    catch error
-        error isa BoundsError || rethrow()
-        return Err(NoEligibleSiteErr())
-    end
+    analysis = _typed_mutation_analysis(env, ctx)
+    analysis isa Err && return analysis
+    current_site = _remap_site(tree, site, analysis, ctx)
+    current_site isa Err && return current_site
     current_site.node isa AppNode || return Err(NoEligibleSiteErr())
     app = current_site.node::AppNode
     app.func isa AbsNode || return Err(NoEligibleSiteErr())
@@ -1017,6 +1171,58 @@ end
     root_site = binding_site(expected, Int[], IntTy)
     env2 = binding_env(expected, IntTy, type_ctx; seed=12)
     @test apply(LetPruneMutation(), deepcopy(expected), root_site, env2, ctx) == original
+end
+
+@testitem "SourceBindingInsertionMutation avoids named variable capture" setup=[BindingInsertionTestSupport] begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: VarNode, eliminate_bound_variables!
+    using LambdaRegression.Mutations: SourceBindingInsertionMutation, apply
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
+
+    original = AstTree(
+        AbsNode(
+            :x,
+            AppNode(
+                AppNode(ConstNode(:g), ConstNode(:y)),
+                VarNode(:x),
+            ),
+        ),
+    )
+    target_ty = TyFun(IntTy, IntTy)
+    type_ctx = Dict{Symbol,TyLike}(
+        :g => TyFun(IntTy, TyFun(IntTy, IntTy)),
+        :y => IntTy,
+    )
+    choose_body_host = (_, host_path, _, _, _) -> host_path == [1] ? 1.0 : 0.0
+    mutation = SourceBindingInsertionMutation(host_weight=choose_body_host)
+    ctx = merge(binding_ctx(), (; symfactory=() -> :x))
+    attempt = deepcopy(original)
+    result = apply(
+        mutation,
+        attempt,
+        binding_site(original, [1, 1, 2], IntTy),
+        binding_env(original, target_ty, type_ctx),
+        ctx,
+    )
+
+    @test result isa AstTree
+    result isa AstTree || return
+    @test iscompatible(infer(result, type_ctx), target_ty)
+    normalized = deepcopy(result)
+    eliminate_bound_variables!(normalized)
+    @test normalized.root == AbsNode(
+        :x,
+        AppNode(
+            AbsNode(
+                :x_1,
+                AppNode(
+                    AppNode(ConstNode(:g), ConstNode(:y)),
+                    IndexNode(1),
+                ),
+            ),
+            ConstNode(:y),
+        ),
+    )
 end
 
 @testitem "SourceBindingInsertionMutation limits hosts to captured binder scope" setup=[BindingInsertionTestSupport] begin
@@ -1478,7 +1684,7 @@ end
     quantified = fresh(0)
     type_ctx = merge(
         TypeSystem.get_type_ctx(Dict{Symbol,Any}(
-            :PAIR => TypeSystem.PAIR,
+            :PAIR => LambdaRegression.Primitives.PAIR,
             :one => 1,
             :truth => true,
         )),
@@ -1852,6 +2058,94 @@ end
         @test failed.value isa error_type
         @test attempt == original
     end
+end
+
+@testitem "GeneratedBindingInsertionMutation avoids named variable capture" setup=[BindingInsertionTestSupport] begin
+    using Test
+    using LambdaRegression: CanonicalGeneration, Mutations, ProgramAnalysis
+    using LambdaRegression.ASTs.NodeASTs: VarNode, eliminate_bound_variables!
+    using LambdaRegression.Mutations:
+        AbstractReplacementGenerator,
+        GeneratedBindingInsertionMutation,
+        _remap_site,
+        apply
+    using LambdaRegression.CanonicalGeneration: GenerationResult
+    using LambdaRegression.ProgramAnalysis: analyze_program
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
+
+    struct FixedYBindingRHS <: AbstractReplacementGenerator end
+    function LambdaRegression.Mutations.generate_binding_rhs(
+        ::FixedYBindingRHS,
+        rhs_ty::TyLike,
+        ::Mutations.Site,
+        ::Mutations.MutationEnv,
+        ::NamedTuple,
+        ::NamedTuple,
+    )
+        return GenerationResult(
+            AstTree(ConstNode(:y)),
+            rhs_ty,
+            Dict{Symbol,Any}(),
+            Dict{Symbol,TyLike}(),
+            Dict{Symbol,Any}(),
+        )
+    end
+
+    original = AstTree(
+        AbsNode(
+            :x,
+            AppNode(
+                AppNode(ConstNode(:g), ConstNode(:y)),
+                VarNode(:x),
+            ),
+        ),
+    )
+    target_ty = TyFun(IntTy, IntTy)
+    type_ctx = Dict{Symbol,TyLike}(
+        :g => TyFun(IntTy, TyFun(IntTy, IntTy)),
+        :y => IntTy,
+    )
+    analysis = analyze_program(original, type_ctx; target_ty)
+    occurrence = Mutations.occurrence_id(analysis.index, [1])
+    source_site = Mutations.Site(analysis, occurrence, :any)
+    attempt = deepcopy(original)
+    env = binding_env(original, target_ty, type_ctx)
+    ctx = merge(
+        binding_ctx(),
+        (;
+            typed_analysis=analysis,
+            global_consts=Dict{Symbol,Any}(:g => ((a, b) -> (a, b)), :y => 1),
+            global_consts_ty=type_ctx,
+            local_consts=Dict{Symbol,Any}(),
+            local_consts_ty=Dict{Symbol,TyLike}(),
+            symfactory=() -> :x,
+        ),
+    )
+    attempt_site = _remap_site(attempt, source_site, analysis, ctx)
+    mutation = GeneratedBindingInsertionMutation(
+        TyLike[IntTy];
+        replacement_generator=FixedYBindingRHS(),
+    )
+    result = apply(mutation, attempt, attempt_site, env, ctx)
+
+    @test result isa AstTree
+    result isa AstTree || return
+    @test iscompatible(infer(result, type_ctx), target_ty)
+    normalized = deepcopy(result)
+    eliminate_bound_variables!(normalized)
+    @test normalized.root == AbsNode(
+        :x,
+        AppNode(
+            AbsNode(
+                :x_1,
+                AppNode(
+                    AppNode(ConstNode(:g), ConstNode(:y)),
+                    IndexNode(1),
+                ),
+            ),
+            ConstNode(:y),
+        ),
+    )
 end
 
 @testitem "GeneratedBindingInsertionMutation verifies polymorphic and lying RHS generators" setup=[BindingInsertionTestSupport] begin

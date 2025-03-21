@@ -1,17 +1,25 @@
 """
     AgeSearch
 
-Small resumable outer search over complete lambda/FunctionDef AST individuals.
+Small resumable outer search over complete lambda/FunctionDef AST programs.
 
-The state owns its frozen task, one RNG stream per island, populations, a
+The state borrows the caller's regressor, component world, and dataset; the
+caller must keep the task-defining parts semantically stable for the state's
+lifetime. Caller-owned mutable resources keep their identity, so intentional
+recorder/provider mutations remain observable. One state may share such a
+resource across its sequential islands; independent states need separate
+mutable resources unless sharing is deliberate. Default component closures
+must continue to match the world held by their component fields.
+
+The state owns one RNG stream per island, scored populations, counters, a
 bounded recent-offspring buffer, and a loss-by-written-complexity archive.
 `advance_age_search!` performs a bounded number of *outer* proposal attempts;
 the existing mutation and crossover implementations retain ownership of their
 inner retry limits. This layer intentionally does not add scheduling policy,
-teacher structures, or a second evaluator. The state copies the dataset,
-regressor container, and candidate material; injected component callables and
-external resources remain caller-owned and must stay unchanged for the state
-lifetime. A changed task or component world requires a new state.
+teacher structures, or a second evaluator. A changed task or component world
+requires a new state. Candidate scoring uses Regression's shared per-sample
+loop while this state retains its own invalid-candidate accounting and penalty
+policy.
 """
 
 export AgeSearchState, AgeSearchIndividual, AgeSearchMigration
@@ -27,10 +35,10 @@ struct AgeSearchNoValidErr end
 
 Owned, scored record used by an age-search population. `parent_ids` is an
 explicit ancestry tuple; an empty tuple means that the caller did not provide
-provenance (for example, a plain migrant `Individual`).
+provenance (for example, a plain migrant `Program`).
 """
 struct AgeSearchIndividual
-    individual::Individual
+    program::Program
     id::UInt64
     parent_ids::Tuple{Vararg{UInt64}}
     origin::Symbol
@@ -92,7 +100,12 @@ struct AgeSearchReport
     cursor::Int
 end
 
-"""Mutable state for a persistent complete-AST age search."""
+"""Mutable state for a persistent complete-AST age search.
+
+`reg` and `data` are borrowed from the caller and must remain stable while the
+state is used. Populations, score records, RNG streams, archive, and counters
+are owned by this state.
+"""
 mutable struct AgeSearchState
     reg::Regressor
     data::SupervisedDataset
@@ -111,7 +124,7 @@ end
 
 """Migration input retaining explicit provenance when it is available."""
 struct AgeSearchMigration
-    individual::Individual
+    program::Program
     parent_ids::Tuple{Vararg{UInt64}}
 end
 
@@ -147,8 +160,8 @@ function _age_preflight_task(reg::Regressor, data::SupervisedDataset)
     input_types isa AbstractDict{Symbol,<:TyLike} || return ArgumentError(
         "input_types must map symbols to types",
     )
-    eval_fn = get(c, :evaluate, evaluate_default)
-    eval_fn === evaluate_default && isempty(slots) && return ArgumentError(
+    uses_default_evaluator = !haskey(c, :prepare_evaluate) && !haskey(c, :evaluate)
+    uses_default_evaluator && isempty(slots) && return ArgumentError(
         "input_slots must be non-empty for evaluate_default",
     )
     length(unique(slots)) == length(slots) || return ArgumentError(
@@ -201,25 +214,10 @@ function _age_expected_exception(issue, components::NamedTuple; loss::Bool=false
            issue isa Populations.CrossoverMaxTryReachedErr
 end
 
-function _age_copy_individual(ind::Individual)
-    return Individual(
-        deepcopy(ind.tree), ind.target_ty;
-        local_consts=deepcopy(ind.local_consts),
-        local_consts_ty=deepcopy(ind.local_consts_ty),
-        fitness=ind.fitness,
-        meta=deepcopy(ind.meta),
-    )
-end
-
-function _age_same_individual(a::Individual, b::Individual)
-    return a.target_ty == b.target_ty && a.tree == b.tree &&
+function _age_same_program(a::Program, b::Program)
+    return a.tree == b.tree &&
         isequal(a.local_consts, b.local_consts) &&
         isequal(a.local_consts_ty, b.local_consts_ty)
-end
-
-function _age_same_target(a::Individual, b::Individual)
-    return TypeSystem.iscompatible(a.target_ty, b.target_ty) &&
-        TypeSystem.iscompatible(b.target_ty, a.target_ty)
 end
 
 function _age_next_id!(state::AgeSearchState)
@@ -233,9 +231,9 @@ function _age_birth!(state::AgeSearchState)
     return state.birth_clock
 end
 
-function _age_record(
+function _age_make_record(
     state::AgeSearchState,
-    ind::Individual,
+    program::Program,
     parent_ids::Tuple{Vararg{UInt64}},
     origin::Symbol,
     loss::Float64,
@@ -243,16 +241,8 @@ function _age_record(
     valid::Bool;
     birth::UInt64=UInt64(0),
 )
-    owned = _age_copy_individual(ind)
-    scored = Individual(
-        owned.tree, owned.target_ty;
-        local_consts=owned.local_consts,
-        local_consts_ty=owned.local_consts_ty,
-        fitness=valid ? loss : nothing,
-        meta=owned.meta,
-    )
     return AgeSearchIndividual(
-        scored, _age_next_id!(state), parent_ids, origin, loss, complexity,
+        program, _age_next_id!(state), parent_ids, origin, loss, complexity,
         valid, birth,
     )
 end
@@ -313,27 +303,39 @@ end
 
 function _age_validate_candidate(
     state::AgeSearchState,
-    ind::Individual,
+    program::Program,
     label::AbstractString,
 )
-    issue = _validate_individual_contract(ind, state.reg, state.reg.components, label)
+    issue = _validate_program_contract(program, state.reg.target_ty,
+        state.reg.components, label)
     issue === nothing || throw(issue)
     policy = get(state.reg.components, :bloat_policy, Mutations.BloatPolicy())
-    _within_bloat_limit(ind.tree, policy) || return :bloat
-    rejection = _individual_candidate_rejection(ind, state.reg.components)
+    _within_bloat_limit(program.tree, policy) || return :bloat
+    rejection = _program_candidate_rejection(program, state.reg.components)
     rejection === nothing || return rejection
     return nothing
 end
 
 """Score one candidate and account for its original-task objective work."""
-function _age_score!(state::AgeSearchState, ind::Individual, source::Symbol)
+function _age_count_samples!(state::AgeSearchState, source::Symbol, count::Int)
+    state.counters.sample_executions += count
+    if source === :init
+        state.counters.init_sample_executions += count
+    elseif source === :migration
+        state.counters.migration_sample_executions += count
+    else
+        state.counters.advance_sample_executions += count
+    end
+    return nothing
+end
+
+function _age_score!(state::AgeSearchState, program::Program, source::Symbol)
     components = state.reg.components
     config = state.reg.config
-    eval_fn = get(components, :evaluate, evaluate_default)
     loss_fn = get(components, :loss, mse)
     penalty = _age_error_penalty(state.reg)
     complexity_fn = get(components, :complexity, _node_count)
-    complexity = complexity_fn(ind.tree)
+    complexity = complexity_fn(program.tree)
     complexity isa Integer || throw(ArgumentError("complexity must return an integer"))
     complexity = Int(complexity)
 
@@ -346,7 +348,7 @@ function _age_score!(state::AgeSearchState, ind::Individual, source::Symbol)
         state.counters.advance_objective_calls += 1
     end
 
-    rejection = _individual_candidate_rejection(ind, components)
+    rejection = _program_candidate_rejection(program, components)
     if rejection !== nothing
         state.counters.invalids += 1
         if source === :init
@@ -359,57 +361,17 @@ function _age_score!(state::AgeSearchState, ind::Individual, source::Symbol)
         return false, penalty, complexity
     end
 
-    prepared = eval_fn === evaluate_default ?
-        prepare_default_evaluator(ind, components, config; copy_tree=true) : nothing
-    total = 0.0
-    valid = true
-    for (x, y) in zip(state.data.X, state.data.Y)
-        state.counters.sample_executions += 1
-        if source === :init
-            state.counters.init_sample_executions += 1
-        elseif source === :migration
-            state.counters.migration_sample_executions += 1
-        else
-            state.counters.advance_sample_executions += 1
-        end
-        yhat = try
-            prepared === nothing ? eval_fn(ind, x, components, config) : prepared(x)
-        catch issue
-            _age_expected_exception(issue, components) || rethrow()
-            valid = false
-            total += penalty
-            continue
-        end
-        if yhat isa Err
-            strict_errors = get(config, :strict_errors, false)
-            strict_errors && !_age_expected_exception(yhat.value, components) && throw(yhat.value)
-            valid = false
-            total += penalty
-            continue
-        elseif !_finite_prediction(yhat)
-            valid = false
-            total += penalty
-            continue
-        end
-        sample_loss = try
-            loss_fn(yhat, y)
-        catch issue
-            _age_expected_exception(issue, components; loss=true) || rethrow()
-            valid = false
-            total += penalty
-            continue
-        end
-        finite_loss = _finite_real_loss(sample_loss)
-        if finite_loss === nothing
-            valid = false
-            total += penalty
-        else
-            total += finite_loss
-        end
-    end
-    loss = total / max(length(state.data.X), 1)
-    isfinite(loss) || (valid = false; loss = penalty)
-    if !valid
+    prepared = prepare_task_evaluator(
+        program, state.reg.target_ty, components, config; copy_tree=true,
+    )
+    result = score_samples(state.data, prepared, loss_fn;
+        failure_mode=:continue_penalty,
+        failure_penalty=penalty,
+        candidate_failure=issue -> _age_expected_exception(issue, components),
+        loss_failure=issue -> _age_expected_exception(issue, components; loss=true),
+        strict_returned_errors=get(config, :strict_errors, false),
+        on_samples=count -> _age_count_samples!(state, source, count))
+    if !result.valid
         state.counters.invalids += 1
         if source === :init
             state.counters.init_invalids += 1
@@ -419,20 +381,20 @@ function _age_score!(state::AgeSearchState, ind::Individual, source::Symbol)
             state.counters.advance_invalids += 1
         end
     end
-    return valid, Float64(loss), complexity
+    return result.valid, Float64(result.score), complexity
 end
 
 function _age_score_record!(
     state::AgeSearchState,
-    ind::Individual,
+    program::Program,
     parent_ids::Tuple{Vararg{UInt64}},
     origin::Symbol,
     source::Symbol,
 )
-    admissibility = _age_validate_candidate(state, ind, "$(origin) candidate")
+    admissibility = _age_validate_candidate(state, program, "$(origin) candidate")
     if admissibility !== nothing
         complexity_fn = get(state.reg.components, :complexity, _node_count)
-        complexity = Int(complexity_fn(ind.tree))
+        complexity = Int(complexity_fn(program.tree))
         state.counters.invalids += 1
         if source === :init
             state.counters.init_invalids += 1
@@ -441,9 +403,9 @@ function _age_score_record!(
         else
             state.counters.advance_invalids += 1
         end
-        return _age_record(
+        return _age_make_record(
             state,
-            ind,
+            program,
             parent_ids,
             origin,
             _age_error_penalty(state.reg),
@@ -451,17 +413,17 @@ function _age_score_record!(
             false,
         )
     end
-    valid, loss, complexity = _age_score!(state, ind, source)
-    return _age_record(state, ind, parent_ids, origin, loss, complexity, valid)
+    valid, loss, complexity = _age_score!(state, program, source)
+    return _age_make_record(state, program, parent_ids, origin, loss, complexity, valid)
 end
 
 function _age_mutation(state::AgeSearchState, parent::AgeSearchIndividual, rng::AbstractRNG)
     c = state.reg.components
     mutation_driver = get(c, :mutation_driver, Mutations.mutate_tree)
-    local_consts = copy(parent.individual.local_consts)
-    local_consts_ty = copy(parent.individual.local_consts_ty)
+    local_consts = copy(parent.program.local_consts)
+    local_consts_ty = copy(parent.program.local_consts_ty)
     mutated = mutation_driver(
-        parent.individual.tree,
+        parent.program.tree,
         state.reg.target_ty;
         rng,
         mutations=c.mutations,
@@ -480,16 +442,10 @@ function _age_mutation(state::AgeSearchState, parent::AgeSearchIndividual, rng::
         const_symfactory=c.const_symfactory_ctor(),
         bloat_policy=get(c, :bloat_policy, Mutations.BloatPolicy()),
         adaptive_policy=get(c, :mutation_adaptive_policy, Mutations.AdaptivePolicy()),
-        type_inference=get(c, :type_inference, nothing),
     )
     mutated isa Err && return mutated
     mutated isa AstTree || throw(ArgumentError("mutation_driver must return AstTree or Err"))
-    return Individual(
-        mutated, state.reg.target_ty;
-        local_consts, local_consts_ty,
-        fitness=nothing,
-        meta=(;),
-    )
+    return _publish_program(mutated, local_consts, local_consts_ty)
 end
 
 function _age_crossover(
@@ -503,8 +459,10 @@ function _age_crossover(
     op === nothing && return Err(Populations.NoEligibleCrossoverPairErr())
     children = Populations.crossover(
         op,
-        left.individual,
-        right.individual;
+        left.program,
+        right.program;
+        target_a=state.reg.target_ty,
+        target_b=state.reg.target_ty,
         rng,
         global_consts_ty=merge(c.global_consts_ty, c.input_types),
         tyfactory_ctor=c.tyfactory_ctor,
@@ -517,7 +475,7 @@ function _age_crossover(
     ))
     chosen = rand(rng, 1:2)
     child = children[chosen]
-    child isa Individual || throw(ArgumentError("crossover children must be Individuals"))
+    child isa Program || throw(ArgumentError("crossover children must be Programs"))
     return child
 end
 
@@ -531,13 +489,13 @@ function _age_call_proposal(
 )
     result = proposal(state, population, left, right; rng)
     result isa Err && return result
-    if result isa Individual
+    if result isa Program
         return (:proposal, result)
     elseif result isa Tuple && length(result) == 2 && result[1] isa Symbol
-        result[2] isa Individual || throw(ArgumentError("proposal child must be an Individual"))
+        result[2] isa Program || throw(ArgumentError("proposal child must be a Program"))
         return (result[1], result[2])
     end
-    throw(ArgumentError("proposal must return Individual, (label, Individual), or Err"))
+    throw(ArgumentError("proposal must return Program, (label, Program), or Err"))
 end
 
 function _age_add_operator!(counters::AgeSearchCounters, label::Symbol)
@@ -567,7 +525,12 @@ end
 
 Construct and score each island exactly once through `init_population`, with a
 distinct derived seed per island. Initialization has no hidden population fill;
-invalid records remain visible but cannot breed.
+invalid records remain visible but cannot breed. The state borrows `reg` and
+`data` without copying them. Keep the task, component world, and dataset stable
+for the state's lifetime; injected mutable resources retain their identity.
+Construct default components against the final world and do not replace
+world-defining component fields afterward, because default callables may close
+over that world.
 """
 function initialize_age_search(
     reg::Regressor,
@@ -587,11 +550,9 @@ function initialize_age_search(
     task_error = _age_preflight_task(reg, data)
     task_error === nothing || return Err(task_error)
     root_seed = seed === nothing ? rand(reg.rng, UInt64) : UInt64(seed)
-    frozen_reg = deepcopy(reg)
-    frozen_data = SupervisedDataset(deepcopy(data.X), deepcopy(data.Y))
     state = AgeSearchState(
-        frozen_reg,
-        frozen_data,
+        reg,
+        data,
         root_seed,
         Vector{Vector{AgeSearchIndividual}}(),
         AbstractRNG[],
@@ -604,27 +565,28 @@ function initialize_age_search(
         nothing,
         AgeSearchCounters(),
     )
-    global_type_ctx = merge(frozen_reg.components.global_consts_ty, frozen_reg.components.input_types)
+    global_type_ctx = merge(reg.components.global_consts_ty, reg.components.input_types)
     for island in 1:population_count
         island_seed = _derive_seed(root_seed, :age_init, island)
         push!(state.rngs, MersenneTwister(UInt32[UInt32(island_seed & 0xffffffff), UInt32(island_seed >> 32)]))
-        result = frozen_reg.components.init_population(
-            frozen_reg,
-            frozen_data;
+        result = reg.components.init_population(
+            reg,
+            data;
             N=population_size,
             seed=island_seed,
             global_type_ctx=global_type_ctx,
         )
         result isa Err && return result
-        issue = _preflight_initial_population(result, frozen_reg, frozen_reg.components, population_size)
+        issue = _preflight_initial_population(result, reg, reg.components, population_size)
         issue === nothing || return Err(issue)
         pop = AgeSearchIndividual[]
         for (slot, raw) in enumerate(result)
-            candidate = _age_copy_individual(raw)
+            raw isa Program || throw(ArgumentError("init_population must return Programs"))
+            candidate = raw
             record = _age_score_record!(state, candidate, (), :initial, :init)
             if record.birth == 0
                 record = AgeSearchIndividual(
-                    record.individual, record.id, record.parent_ids, record.origin,
+                    record.program, record.id, record.parent_ids, record.origin,
                     record.loss, record.complexity, record.valid, _age_birth!(state),
                 )
             end
@@ -642,9 +604,10 @@ end
                         proposal=nothing)
 
 Run at most `max_attempts` outer proposals and at most `max_evaluations`
-candidate objective calls. Each changed candidate is scored in the frozen
-original task; a valid changed candidate replaces the oldest member of its
-round-robin island, regardless of whether its loss improves.
+candidate objective calls. Each changed candidate is scored against the
+borrowed task (which the caller must keep stable); a valid changed candidate
+replaces the oldest member of its round-robin island, regardless of whether
+its loss improves.
 """
 function advance_age_search!(
     state::AgeSearchState;
@@ -713,9 +676,9 @@ function advance_age_search!(
             state.counters.expected_failures += 1
             continue
         end
-        child_result isa Individual || throw(ArgumentError("proposal operator returned an invalid child"))
-        if _age_same_individual(child_result, left.individual) ||
-           (label !== :mutation && _age_same_individual(child_result, right.individual))
+        child_result isa Program || throw(ArgumentError("proposal operator returned an invalid child"))
+        if _age_same_program(child_result, left.program) ||
+           (label !== :mutation && _age_same_program(child_result, right.program))
             state.counters.unchanged += 1
             continue
         end
@@ -732,7 +695,7 @@ function advance_age_search!(
             continue
         end
         record = AgeSearchIndividual(
-            record.individual, record.id, record.parent_ids, record.origin,
+            record.program, record.id, record.parent_ids, record.origin,
             record.loss, record.complexity, record.valid, _age_birth!(state),
         )
         _age_insert!(state, record, island)
@@ -755,31 +718,31 @@ end
 
 function _age_migration_parts(value)
     if value isa AgeSearchIndividual
-        return value.individual, value.parent_ids
+        return value.program, value.parent_ids
     elseif value isa AgeSearchMigration
-        return value.individual, value.parent_ids
-    elseif value isa Individual
+        return value.program, value.parent_ids
+    elseif value isa Program
         return value, Tuple{Vararg{UInt64}}()
-    elseif value isa NamedTuple && haskey(value, :individual)
+    elseif value isa NamedTuple && haskey(value, :program)
         parents = haskey(value, :parent_ids) ?
             Tuple(UInt64(parent) for parent in value.parent_ids) : Tuple{Vararg{UInt64}}()
-        value.individual isa Individual || throw(ArgumentError("migration individual must be Individual"))
-        return value.individual, parents
+        value.program isa Program || throw(ArgumentError("migration program must be Program"))
+        return value.program, parents
     end
-    throw(ArgumentError("migrant must be Individual, AgeSearchIndividual, AgeSearchMigration, or a named record"))
+    throw(ArgumentError("migrant must be Program, AgeSearchIndividual, AgeSearchMigration, or a named record"))
 end
 
-function _age_live_duplicate(state::AgeSearchState, candidate::Individual, population::Int)
-    return any(record -> _age_same_individual(record.individual, candidate), state.populations[population])
+function _age_live_duplicate(state::AgeSearchState, candidate::Program, population::Int)
+    return any(record -> _age_same_program(record.program, candidate), state.populations[population])
 end
 
 """
     inject_age_migrants!(state, individuals; population=1,
                          max_evaluations=length(individuals), max_migrants=...)
 
-Freshly validate and score caller-provided individuals in the frozen task,
+Freshly validate and score caller-provided programs in the borrowed task,
 then insert valid non-duplicates using ordinary oldest replacement. Any loss
-stored on an incoming record is deliberately ignored. Plain `Individual`s have
+stored on an incoming record is deliberately ignored. Plain `Program`s have
 empty ancestry; use `AgeSearchMigration` or a named record with `parent_ids` to
 provide provenance explicitly.
 """
@@ -801,13 +764,17 @@ function inject_age_migrants!(
         raw, parents = _age_migration_parts(value)
         report = merge(report, (attempts=report.attempts + 1,))
         state.counters.migration_attempts += 1
-        candidate = _age_copy_individual(raw)
-        _age_validate_candidate(state, candidate, "migrant $(report.attempts)")
-        if _age_live_duplicate(state, candidate, population)
+        _age_validate_candidate(state, raw, "migrant $(report.attempts)")
+        if _age_live_duplicate(state, raw, population)
             report = merge(report, (duplicates=report.duplicates + 1,))
             state.counters.migration_duplicates += 1
             continue
         end
+        candidate = Program(
+            raw.tree;
+            local_consts=raw.local_consts,
+            local_consts_ty=raw.local_consts_ty,
+        )
         before_objective = state.counters.migration_objective_calls
         before_samples = state.counters.migration_sample_executions
         record = _age_score_record!(state, candidate, parents, :migration, :migration)
@@ -820,7 +787,7 @@ function inject_age_migrants!(
             continue
         end
         record = AgeSearchIndividual(
-            record.individual, record.id, record.parent_ids, record.origin,
+            record.program, record.id, record.parent_ids, record.origin,
             record.loss, record.complexity, record.valid, _age_birth!(state),
         )
         _age_insert!(state, record, population)
@@ -838,11 +805,10 @@ end
     using Test
     using Random
     using LambdaRegression.Utils: Err
-    using LambdaRegression: Procedural
-    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode, ConstNode
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode, ConstNode, FunctionDefNode
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
     using LambdaRegression.Mutations: AbstractMutation, ScalarConstMutation
-    using LambdaRegression.Mutations.Populations: Individual
+    using LambdaRegression.Programs: Program
     using LambdaRegression.Regression:
         Regressor, SupervisedDataset, default_components, default_config,
         initialize_age_search, advance_age_search!, inject_age_migrants!,
@@ -857,8 +823,8 @@ end
             mutations=AbstractMutation[],
             crossover_op=nothing,
         )
-        identity = Individual(AstTree(AbsNode(:z, IndexNode(0))), target_ty)
-        evaluate === nothing && (evaluate = (ind, x, components, config) -> x)
+        identity = Program(AstTree(AbsNode(:z, IndexNode(0))))
+        evaluate === nothing && (evaluate = (ind, x, target_ty, components, config) -> x)
         components = merge(base, (;
             init_population=(reg, data; N, seed, global_type_ctx) ->
                 [identity for _ in 1:N],
@@ -866,7 +832,6 @@ end
         ))
         config = default_config(
             population_size=population_size,
-            generations=1,
             tournament_size=1,
             error_penalty=99.0,
         )
@@ -878,9 +843,8 @@ end
 
 @testitem "Age search chunked continuation preserves cursor and accounting" setup=[AgeSearchBaseImports] begin
     reg, data = age_test_fixture(population_size=2)
-    candidate = Individual(
-        AstTree(AbsNode(:z, ConstNode(:k))),
-        TyFun(FloatTy, FloatTy);
+    candidate = Program(
+        AstTree(AbsNode(:z, ConstNode(:k)));
         local_consts=Dict{Symbol,Any}(:k => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:k => FloatTy),
     )
@@ -899,12 +863,82 @@ end
         [[r.birth for r in p] for p in chunked.populations]
 end
 
+@testitem "Age search borrows task and data and preserves caller resources and init seeds" setup=[AgeSearchBaseImports] begin
+    globals = Dict{Symbol,Any}(:offset => 1.0)
+    global_types = Dict{Symbol,TyLike}(:offset => FloatTy)
+    inputs = Symbol[:x]
+    input_types = Dict{Symbol,TyLike}(:x => FloatTy)
+    observed_diagnostics = Any[]
+    observer = diagnostics -> push!(observed_diagnostics, diagnostics)
+    components = default_components(
+        global_consts=globals,
+        global_consts_ty=global_types,
+        input_slots=inputs,
+        input_types=input_types,
+        mutations=AbstractMutation[],
+        crossover_op=nothing,
+        initialization_observer=observer,
+        force_lambda_root_probability=1.0,
+        init_candidates_per_individual=1,
+        init_target_nodes=(2,),
+        init_max_try=2,
+    )
+
+    default_init = components.init_population
+    init_seeds = UInt64[]
+    borrowed_data = SupervisedDataset([1.0, 2.0], [1.0, 2.0])
+    original_X = copy(borrowed_data.X)
+    original_Y = copy(borrowed_data.Y)
+    init_population = function (init_reg, init_data; N, seed, global_type_ctx)
+        # The default initializer closes over these exact world dictionaries.
+        @test init_reg.components.global_consts === globals
+        @test init_reg.components.global_consts_ty === global_types
+        @test init_data === borrowed_data
+        push!(init_seeds, seed)
+        default_init(init_reg, init_data; N, seed, global_type_ctx)
+    end
+    components = merge(components, (; init_population, init_seeds))
+    config = default_config(
+        population_size=1,
+        tournament_size=1,
+        error_penalty=99.0,
+    )
+    reg = Regressor(TyFun(FloatTy, FloatTy), components, config, MersenneTwister(1234))
+    root_seed = UInt64(41)
+
+    state = initialize_age_search(
+        reg, borrowed_data; population_count=2, population_size=1, seed=root_seed,
+    )
+
+    expected_seeds = [
+        LambdaRegression.Regression._derive_seed(root_seed, :age_init, island)
+        for island in 1:2
+    ]
+    @test state.reg === reg
+    @test state.data === borrowed_data
+    @test state.reg.components.init_population === init_population
+    @test state.reg.components.init_seeds === init_seeds
+    @test init_seeds == expected_seeds
+    @test [rand(rng, UInt64) for rng in state.rngs] == [
+        rand(Random.MersenneTwister(UInt32[
+            UInt32(seed & 0xffffffff), UInt32(seed >> 32),
+        ]), UInt64) for seed in expected_seeds
+    ]
+    @test state.counters.init_objective_calls == 2
+    @test state.counters.init_sample_executions == 4
+    @test state.birth_clock == 2
+    @test length(observed_diagnostics) == 2
+    @test state.reg.components.initialization_observer === observer
+    @test borrowed_data.X == original_X
+    @test borrowed_data.Y == original_Y
+end
+
 @testitem "Age search accepts worse and neutral valid births" setup=[AgeSearchBaseImports] begin
-    evaluate = (ind, x, components, config) -> haskey(ind.local_consts, :bad) ? x + 2 : x
+    evaluate = (ind, x, target_ty, components, config) -> haskey(ind.local_consts, :bad) ? x + 2 : x
     reg, data = age_test_fixture(evaluate=evaluate, population_size=2)
     state = initialize_age_search(reg, data; population_count=1, population_size=2, seed=12)
-    bad = Individual(
-        AstTree(AbsNode(:z, ConstNode(:bad))), TyFun(FloatTy, FloatTy);
+    bad = Program(
+        AstTree(AbsNode(:z, ConstNode(:bad)));
         local_consts=Dict{Symbol,Any}(:bad => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:bad => FloatTy),
     )
@@ -918,18 +952,18 @@ end
 end
 
 @testitem "Age search bounds invalid and unchanged proposals and zero budget" setup=[AgeSearchBaseImports] begin
-    evaluate = (ind, x, components, config) -> haskey(ind.local_consts, :bad) ? Err(:invalid) : x
+    evaluate = (ind, x, target_ty, components, config) -> haskey(ind.local_consts, :bad) ? Err(:invalid) : x
     reg, data = age_test_fixture(evaluate=evaluate, population_size=1)
     state = initialize_age_search(reg, data; population_count=1, population_size=1, seed=13)
-    invalid = Individual(
-        AstTree(AbsNode(:z, ConstNode(:bad))), TyFun(FloatTy, FloatTy);
+    invalid = Program(
+        AstTree(AbsNode(:z, ConstNode(:bad)));
         local_consts=Dict{Symbol,Any}(:bad => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:bad => FloatTy),
     )
     n = Ref(0)
     proposal = (state, island, left, right; rng) -> begin
         n[] += 1
-        n[] == 1 ? (:invalid, invalid) : (:clone, left.individual)
+        n[] == 1 ? (:invalid, invalid) : (:clone, left.program)
     end
     report = advance_age_search!(state; max_attempts=2, max_evaluations=1, proposal)
     @test report.attempts == 1
@@ -942,15 +976,20 @@ end
 end
 
 @testitem "Age search migration owns candidates, rescoring stale loss, and archives old best" setup=[AgeSearchBaseImports] begin
-    evaluate = (ind, x, components, config) -> haskey(ind.local_consts, :bad) ? x + 2 : x
+    evaluate = (ind, x, target_ty, components, config) -> haskey(ind.local_consts, :bad) ? x + 2 : x
     reg, data = age_test_fixture(evaluate=evaluate, population_size=1)
     state = initialize_age_search(reg, data; population_count=1, population_size=1, seed=14)
     old_best = state.best
-    migrant = Individual(
-        AstTree(AbsNode(:z, ConstNode(:bad))), TyFun(FloatTy, FloatTy);
+    migration_before = (
+        attempts=state.counters.migration_attempts,
+        objective_calls=state.counters.migration_objective_calls,
+        sample_executions=state.counters.migration_sample_executions,
+        accepted=state.counters.migration_accepted,
+    )
+    migrant = Program(
+        AstTree(AbsNode(:z, ConstNode(:bad)));
         local_consts=Dict{Symbol,Any}(:bad => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:bad => FloatTy),
-        fitness=0.0,
     )
     migration = inject_age_migrants!(
         state,
@@ -961,24 +1000,59 @@ end
     )
     migrant.local_consts[:bad] = 123.0
     @test migration.accepted == 1
+    @test migration.objective_calls == 1
+    @test migration.sample_executions == 2
+    @test state.counters.migration_attempts == migration_before.attempts + 1
+    @test state.counters.migration_objective_calls == migration_before.objective_calls + 1
+    @test state.counters.migration_sample_executions == migration_before.sample_executions + 2
+    @test state.counters.migration_accepted == migration_before.accepted + 1
     @test state.populations[1][1].loss == 4.0
     @test state.populations[1][1].parent_ids == (UInt64(77),)
     @test state.archive[old_best.complexity].id == old_best.id
-    @test state.populations[1][1].individual.local_consts[:bad] == 1.0
+    @test state.populations[1][1].program.local_consts[:bad] == 1.0
 end
 
 @testitem "Age search propagates unexpected evaluator exceptions" setup=[AgeSearchBaseImports] begin
-    evaluate = (ind, x, components, config) -> error("unexpected evaluator failure")
+    evaluate = (ind, x, target_ty, components, config) -> error("unexpected evaluator failure")
     reg, data = age_test_fixture(evaluate=evaluate, population_size=1)
     @test_throws ErrorException initialize_age_search(reg, data; population_count=1, population_size=1, seed=15)
 end
 
 @testitem "Age search honors strict errors for unknown returned Err" setup=[AgeSearchBaseImports] begin
-    evaluate = (ind, x, components, config) -> Err(ErrorException("unknown candidate failure"))
+    evaluate = (ind, x, target_ty, components, config) -> Err(ErrorException("unknown candidate failure"))
     reg, data = age_test_fixture(evaluate=evaluate, population_size=1)
     strict_config = merge(reg.config, (; strict_errors=true))
     strict_reg = Regressor(reg.target_ty, reg.components, strict_config, MersenneTwister(555))
     @test_throws ErrorException initialize_age_search(strict_reg, data; population_count=1, population_size=1, seed=152)
+end
+
+@testitem "Age search shared task scoring penalizes each bad sample and continues" setup=[AgeSearchBaseImports] begin
+    evaluate = (ind, x, target_ty, components, config) -> x == 2.0 ? Err(:invalid) : x
+    reg, _ = age_test_fixture(evaluate=evaluate, population_size=1)
+    data = SupervisedDataset([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
+    state = initialize_age_search(reg, data; population_count=1, population_size=1, seed=153)
+    record = only(state.populations[1])
+    @test record.valid == false
+    @test record.loss == 33.0
+    @test state.counters.init_sample_executions == 3
+    @test state.counters.sample_executions == 3
+    @test state.counters.init_invalids == 1
+    @test state.counters.invalids == 1
+
+    should_throw = Ref(false)
+    evaluator = (ind, x, target_ty, components, config) ->
+        should_throw[] ? error("unexpected after initialization") : x
+    throwing_reg, throwing_data = age_test_fixture(
+        evaluate=evaluator, population_size=1,
+    )
+    throwing_state = initialize_age_search(
+        throwing_reg, throwing_data; population_count=1, population_size=1, seed=154,
+    )
+    should_throw[] = true
+    @test_throws ErrorException LambdaRegression.Regression._age_score!(
+        throwing_state, only(throwing_state.populations[1]).program, :advance,
+    )
+    @test throwing_state.counters.advance_sample_executions == 1
 end
 
 @testitem "Age search rejects empty objective data" setup=[AgeSearchBaseImports] begin
@@ -991,8 +1065,8 @@ end
 
 @testitem "Age search validates a real complete FunctionDef binding AST" setup=[AgeSearchBaseImports] begin
     target_ty = TyFun(FloatTy, FloatTy)
-    tree = AstTree(Procedural.FunctionDefNode(AbsNode(:x, IndexNode(0))))
-    individual = Individual(tree, target_ty)
+    tree = AstTree(FunctionDefNode(AbsNode(:x, IndexNode(0))))
+    individual = Program(tree)
     base = default_components(
         global_consts=Dict{Symbol,Any}(),
         global_consts_ty=Dict{Symbol,TyLike}(),
@@ -1002,15 +1076,15 @@ end
         crossover_op=nothing,
         init_population=(reg, data; N, seed, global_type_ctx) -> [individual for _ in 1:N],
     )
-    reg = Regressor(target_ty, base, default_config(population_size=1, generations=1), MersenneTwister(555))
+    reg = Regressor(target_ty, base, default_config(population_size=1), MersenneTwister(555))
     state = initialize_age_search(reg, SupervisedDataset([3.0], [3.0]); population_count=1, population_size=1, seed=16)
     @test state.populations[1][1].valid
     @test state.populations[1][1].loss == 0.0
 end
 
 @testitem "Age search invokes the real mutation toolbox once" setup=[AgeSearchBaseImports] begin
-    candidate = Individual(
-        AstTree(AbsNode(:z, ConstNode(:k))), TyFun(FloatTy, FloatTy);
+    candidate = Program(
+        AstTree(AbsNode(:z, ConstNode(:k)));
         local_consts=Dict{Symbol,Any}(:k => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:k => FloatTy),
     )
@@ -1025,12 +1099,12 @@ end
         init_population=(reg, data; N, seed, global_type_ctx) -> [candidate for _ in 1:N],
     )
     components = merge(base, (;
-        evaluate=(ind, x, c, cfg) -> first(values(ind.local_consts)),
+        evaluate=(ind, x, target_ty, c, cfg) -> first(values(ind.local_consts)),
     ))
-    reg = Regressor(TyFun(FloatTy, FloatTy), components, default_config(population_size=1, generations=1), MersenneTwister(2000))
+    reg = Regressor(TyFun(FloatTy, FloatTy), components, default_config(population_size=1), MersenneTwister(2000))
     state = initialize_age_search(reg, SupervisedDataset([0.0], [1.0]); population_count=1, population_size=1, seed=17)
     report = advance_age_search!(state; max_attempts=1, max_evaluations=1, mutation_weight=1.0, crossover_weight=0.0)
     @test report.mutation_attempts == 1
     @test report.accepted == 1
-    @test state.populations[1][1].individual.local_consts != candidate.local_consts
+    @test state.populations[1][1].program.local_consts != candidate.local_consts
 end

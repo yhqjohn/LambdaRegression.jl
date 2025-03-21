@@ -411,73 +411,6 @@ function _resolved_scoped(env::MutationEnv)
     end
 end
 
-struct _TypedOccurrence
-    node::AstNode
-    path::Tuple
-end
-
-Base.:(==)(left::_TypedOccurrence, right::_TypedOccurrence) =
-    left.path == right.path
-Base.isequal(left::_TypedOccurrence, right::_TypedOccurrence) =
-    isequal(left.path, right.path)
-Base.hash(occurrence::_TypedOccurrence, seed::UInt) =
-    hash(occurrence.path, hash(:TypedOccurrence, seed))
-
-struct _TypedOccurrenceAdapter end
-
-_typed_occurrence_child(
-    occurrence::_TypedOccurrence,
-    node::AstNode,
-    child_index::Int,
-) = _TypedOccurrence(node, (occurrence.path..., child_index))
-
-function TypeSystem.term_view(
-    ::_TypedOccurrenceAdapter,
-    occurrence::_TypedOccurrence,
-)
-    node = occurrence.node
-    node isa ConstNode && return (:const, node.name)
-    node isa VarNode && return (:var, node.name)
-    node isa IndexNode && return (:var, node.index)
-    node isa AbsNode && return (
-        :abs,
-        node.name,
-        _typed_occurrence_child(occurrence, node.body, 1),
-    )
-    node isa AppNode && return (
-        :app,
-        _typed_occurrence_child(occurrence, node.func, 1),
-        _typed_occurrence_child(occurrence, node.arg, 2),
-    )
-    throw(ArgumentError(
-        "typed occurrence inference does not support $(typeof(node))",
-    ))
-end
-
-function _typed_occurrence_metadata(env::MutationEnv, ctx::NamedTuple)
-    return get!(env.eligibility_cache, _typed_occurrence_metadata) do
-        env.tree === nothing && return Err(NoEligibleSiteErr())
-        root = _TypedOccurrence(env.tree.root, ())
-        meta = Dict{_TypedOccurrence,Tuple{TyLike,TyLike}}()
-        factory = haskey(ctx, :tyfactory) ? ctx.tyfactory : newtyvar
-        inferred = try
-            TypeSystem.infer_term(
-                root,
-                env.type_ctx,
-                _TypedOccurrenceAdapter();
-                factory,
-                meta,
-            )
-        catch error
-            return Err(error)
-        end
-        inferred isa Err && return inferred
-        return Dict{Tuple,Tuple{TyLike,TyLike}}(
-            occurrence.path => bounds for (occurrence, bounds) in meta
-        )
-    end
-end
-
 function _retained_application_ancestors(
     scoped::_ScopedTree,
     path::AbstractVector{<:Integer},
@@ -1142,18 +1075,6 @@ end
     )
 
     @test resolved.next_binder_id == 3
-end
-
-@testitem "ScopedRewrite rejects unsupported AST nodes" begin
-    using Test
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode, LetNode
-    using LambdaRegression.Mutations: _resolve_scoped
-    using LambdaRegression.Utils: Err
-
-    result = _resolve_scoped(
-        AstTree(LetNode(:x, ConstNode(:value), ConstNode(:body))),
-    )
-    @test result isa Err
 end
 
 @testitem "LetPruneMutation prunes an unused root let" begin

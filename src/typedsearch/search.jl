@@ -1712,7 +1712,7 @@ end
     using LambdaRegression.TypedSearch: _typed_search_options
     using LambdaRegression.ASTs.NodeASTs
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
-    using LambdaRegression.Procedural: evaluate_procedural
+    using LambdaRegression.Execution: evaluate_native
     using Random: MersenneTwister
     ctx = Dict{Symbol,TyLike}(:one => FloatTy)
     values = Dict{Symbol,Any}(:one => 1.0)
@@ -1728,7 +1728,7 @@ end
     objective = function(term)
         calls[] += 1
         tree = export_hole(term, language, hole)
-        value = evaluate_procedural(tree, values; args=(2.0,))
+        value = evaluate_native(tree, values; args=(2.0,))
         return (value - 1.0)^2
     end
     config = _typed_search_options(population_size=4, attempts=40, evaluations=20,
@@ -1744,7 +1744,7 @@ end
     @test result.stats.attempts == result.stats.changed + result.stats.failures + result.stats.unchanged
     @test !isempty(result.frontier)
     @test all(m -> validate(m.term, language) === true, result.population)
-    @test all(m -> prepare_source(export_hole(m.term, language, hole), ctx, target) isa SourceAnalysis,
+    @test all(m -> prepare_source(export_hole(m.term, language, hole), ctx, target) isa TypedAnalysis,
         result.frontier)
 end
 
@@ -2078,8 +2078,8 @@ end
     using Test
     using LambdaRegression.TypedSearch
     using LambdaRegression.TypedSearch: _typed_search_options
-    using LambdaRegression.TypedSearch: _RegularizedFrequency,
-        _typed_frequency_key, _typed_observe_frequency!
+    using LambdaRegression.SearchPolicies: _RegularizedFrequency
+    using LambdaRegression.TypedSearch: _typed_frequency_key, _typed_observe_frequency!
     using LambdaRegression.TypeSystem: FloatTy
     using Random: MersenneTwister
 

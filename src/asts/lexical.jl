@@ -15,7 +15,8 @@ module LexicalContexts
 using TestItems
 
 import ...Trees: children
-using ..NodeASTs: AstNode, AbsNode, AppNode, ConstNode, IndexNode, LetNode, VarNode
+using ..NodeASTs:
+    AstNode, AbsNode, AppNode, ConstNode, FunctionDefNode, IndexNode, VarNode
 
 export BinderId, child_role, visible_binders
 
@@ -31,7 +32,7 @@ struct BinderId
     ordinal::Int
 
     function BinderId(kind::Symbol, owner_path::Tuple{Vararg{Int}}, ordinal::Int)
-        kind in (:abs, :let, :scope, :function_def) ||
+        kind in (:abs, :function_def) ||
             throw(ArgumentError("unknown lexical binder kind: $kind"))
         all(>(0), owner_path) ||
             throw(ArgumentError("owner paths use positive child indices"))
@@ -55,10 +56,9 @@ function child_role(node::AbsNode, child_index::Int)
     return (kind=:body, ordinal=nothing)
 end
 
-function child_role(node::LetNode, child_index::Int)
-    child_index == 1 && return (kind=:value, ordinal=nothing)
-    child_index == 2 && return (kind=:body, ordinal=nothing)
-    return _child_bounds_error(node, child_index)
+function child_role(node::FunctionDefNode, child_index::Int)
+    child_index == 1 || return _child_bounds_error(node, child_index)
+    return (kind=:function_body, ordinal=nothing)
 end
 
 child_role(node::Union{ConstNode,IndexNode,VarNode}, child_index::Int) =
@@ -91,25 +91,25 @@ function visible_binders(
 end
 
 function visible_binders(
-    node::LetNode,
+    node::FunctionDefNode,
     child_index::Int;
     path::Tuple{Vararg{Int}}=(),
     outer::Tuple=(),
 )
     child_role(node, child_index)
-    child_index == 1 && return outer
-    return (BinderId(:let, path, 1), outer...)
+    return (BinderId(:function_def, path, 1), outer...)
 end
 
 @testitem "Core AST nodes expose child-specific lexical contexts" begin
     using Test
     using LambdaRegression.ASTs.LexicalContexts
-    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, ConstNode, IndexNode, LetNode
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, ConstNode, FunctionDefNode, IndexNode
 
     outer = (BinderId(:abs, (7,), 1),)
     app = AppNode(ConstNode(:f), ConstNode(:x))
     abstraction = AbsNode(:x, IndexNode(0))
-    let_node = LetNode(:x, ConstNode(:value), IndexNode(0))
+    function_def = FunctionDefNode(IndexNode(0))
 
     @test child_role(app, 1) == (kind=:function, ordinal=nothing)
     @test child_role(app, 2) == (kind=:argument, ordinal=nothing)
@@ -117,11 +117,12 @@ end
     @test child_role(abstraction, 1) == (kind=:body, ordinal=nothing)
     @test visible_binders(abstraction, 1; path=(2,), outer) ==
         (BinderId(:abs, (2,), 1), outer...)
-    @test visible_binders(let_node, 1; path=(3,), outer) === outer
-    @test visible_binders(let_node, 2; path=(3,), outer) ==
-        (BinderId(:let, (3,), 1), outer...)
+    @test child_role(function_def, 1) == (kind=:function_body, ordinal=nothing)
+    @test visible_binders(function_def, 1; path=(4,), outer) ==
+        (BinderId(:function_def, (4,), 1), outer...)
     @test_throws BoundsError child_role(app, 3)
     @test_throws BoundsError child_role(ConstNode(:leaf), 1)
+    @test_throws ArgumentError BinderId(:scope, (), 1)
     @test_throws ArgumentError BinderId(:unknown, (), 1)
 end
 

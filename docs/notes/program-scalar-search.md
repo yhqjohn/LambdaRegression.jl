@@ -1,24 +1,23 @@
-# Alternating program and scalar search
+# Program-guided specialised search
 
-The ordinary typed AST is the authoritative individual. Scalar and
-frozen-type representations are specialised views that return ordinary
-programs after verified materialisation.
+LambdaRegression keeps the ordinary lambda and function-definition AST as the
+authoritative program. It owns source semantics, lexical sharing,
+serialization, and written complexity. Search and execution use derived views
+that are checked against explicit contexts.
 
-General program search and local search form repeated alternating phases. A
-complete-program population changes bindings, sharing, types, and context.
-Bounded local phases refine eligible scalar or frozen typed regions. Returned
-candidates are rechecked, scored in the enclosing task, and made available to
-the next program phase.
+The architecture separates general typed program search, scalar search for
+dense real-valued regions, frozen occurrence-typed search, and execution
+preparation with a general fallback. A specialised candidate becomes a
+program candidate only after source reconstruction, type checking, capture
+avoidance, and contextual scoring.
 
-Specialised phases are intentionally incomplete. General AST variation can
-introduce abstractions, polymorphic uses, recursion, and combinations that a
-local language cannot express. Reanalysis may expose new regions later.
+Program analysis supplies occurrence identities, binding and dependency facts,
+typing evidence, and validity inputs. Consumers build their own projections;
+scalar regions, frozen occurrences, and executable regions need not share a
+physical graph or have a one-to-one relationship.
 
-Scalar regions carry explicit dependencies and use multi-step population
-search. Frozen typed search varies inferred monomorphic occurrences, or
-occurrences under a rigid environment, with exact type matching. Lexical
-bindings and source dependencies remain explicit.
-
-The coordinator owns scheduling, population replacement, archives, and local
-proposal policy. These choices may change without changing source semantics,
-contextual scoring, or ordinary-AST ownership.
+The repeated coordinator keeps complete programs as scored and inherited
+individuals, gives bounded refinement opportunities to specialised views, and
+publishes returned material through ordinary program checks. General phases can
+introduce structure that local phases cannot express. Population replacement,
+archives, donor transfer, and scheduling remain replaceable policies.
