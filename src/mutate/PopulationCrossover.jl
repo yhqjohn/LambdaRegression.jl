@@ -15,7 +15,7 @@ using TestItems
 
 using ...Utils: Err
 using ...TypeSystem:
-    Ty, TyLike, TyRigid, TyScheme, _inst, collect_free_vars,
+    Ty, TyLike, TyRigid, TyScheme, _inst, collect_free_vars, generalize,
     iscompatible, isequal_mu, make_tyvar_factory, semantic_typekey
 using ...Primitives
 using ...Programs: Program, _publish_program

@@ -7982,7 +7982,7 @@ end
         global_consts=components.global_consts,
         make_eval_context=components.make_eval_context,
         const_symfactory_ctor=components.const_symfactory_ctor,
-        max_reduce_steps=20,
+        max_steps=20,
     ) == 2.5
 
     const_result = CG.generate_canonical(

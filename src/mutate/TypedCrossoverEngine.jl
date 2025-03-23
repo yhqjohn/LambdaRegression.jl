@@ -231,6 +231,24 @@ function _engine_closed_replay_offer(child_site)
     return offer
 end
 
+@testitem "directional engine generalizes closed replay offers" begin
+    using Test
+    using LambdaRegression.Mutations.Populations: _engine_closed_replay_offer
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyScheme, TyVar,
+        make_tyvar_factory
+
+    factory = make_tyvar_factory()
+    α = factory(0)
+    closed_offer = TyScheme(TyVar[], IntTy)
+    replay_offer = _engine_closed_replay_offer((
+        offer=closed_offer,
+        demand=TyFun(α, α),
+    ))
+    @test replay_offer isa TyScheme
+    @test length(replay_offer.vars) == 1
+    @test _engine_closed_replay_offer((offer=closed_offer, demand=IntTy)) === closed_offer
+end
+
 function _engine_replays_target(child_site, original_target_site)::Bool
     if isempty(getproperty(child_site, :external_occurrences))
         replay = closed_directed_match(

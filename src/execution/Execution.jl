@@ -4,15 +4,14 @@
     Execution support for AST reduction, host-value application, and evaluation
     of `FunctionDefNode` and complete `Program` values.
 `EvalContext` provides overlay/locals/globals lookup with writes confined to
-the overlay.  `beta_reduce!` keeps the existing normal-order one-step contract
-and delegates host application through the extensible `isapplicable` and
+the overlay. `beta_reduce!` retains its normal-order one-step transformation
+contract and delegates host application through extensible `isapplicable` and
 `apply_node!` methods. `prepare_native_evaluator` prepares a tree once for
 repeated call-by-need evaluation; `run_native_evaluator` creates a fresh shared
-step budget and runtime environment for each run. `prepare_default_evaluator`
-prepares a complete program for repeated core-reduction or native evaluation
-using explicit input, global, context-factory, and budget keywords. Each sample
-gets a fresh context; synchronous host callbacks and lifted closures share that
-sample's core budget. FunctionDef lowering remains the independent
+budget and runtime environment for each run. `prepare_default_evaluator` uses
+this route for complete programs with or without `FunctionDefNode`, taking
+explicit input, global, context-factory, and budget keywords. Each sample gets
+a fresh context. FunctionDef lowering remains the independent
 `Transforms.lower_functiondefs` operation.
 
 Quickstart for one complete program:
@@ -21,10 +20,8 @@ prepared = prepare_default_evaluator(program;
     input_slots=[:x], global_consts=globals)
 prediction = prepared(1.25)
 ```
-Task-specific roots and losses remain outside this module. Non-finite outputs,
-known native failures, and incomplete top-level core reductions are returned as
-`Err`; expected failures raised inside lifted-closure calls and unexpected host
-exceptions retain their existing thrown-error behavior.
+Task-specific roots and losses remain outside this module. Non-finite outputs
+and known native failures return `Err`; unexpected host exceptions propagate.
 """
 module Execution
 
@@ -46,9 +43,10 @@ export run_native_evaluator, evaluate_native
 export NativeEvaluationError, NativeStepLimitError, NativeNonValueError
 export NativeUnboundIndexError, NativeMissingConstantError
 export NativeEvaluationCycleError
+export NativeCallDepthLimitError
 export PreparedDefaultEvaluator, prepare_default_evaluator, evaluate_default
 export MaxReduceStepsErr, ClosureDepthLimitErr, NonConstOutputErr
-export MissingConstValueErr, NonClosedLambdaErr, NonFiniteOutputErr
+export MissingConstValueErr, NonFiniteOutputErr
 
 struct MaxReduceStepsErr
     steps::Int
@@ -60,9 +58,6 @@ end
 struct NonConstOutputErr end
 struct MissingConstValueErr
     name::Symbol
-end
-struct NonClosedLambdaErr
-    f::Symbol
 end
 struct NonFiniteOutputErr end
 
@@ -236,7 +231,7 @@ end
     using LambdaRegression.Execution: evaluate_native, prepare_native_evaluator,
         run_native_evaluator
     using LambdaRegression.ASTs.NodeASTs:
-        AstTree, AbsNode, AppNode, ConstNode, IndexNode
+        AstTree, AbsNode, AppNode, ConstNode, IndexNode, VarNode
 
     lazy = AstTree(AppNode(
         AbsNode(:unused, ConstNode(:answer)),
@@ -252,6 +247,47 @@ end
     @test evaluate_native(
         AstTree(AppNode(ConstNode(:return_ast), ConstNode(:unit))), context,
     ) == 17
+
+    forced_count = Ref(0)
+    sharing_context = Dict{Symbol,Any}(
+        :value => 5,
+        :counted => value -> (forced_count[] += 1; value),
+        :sum => x -> (y -> x + y),
+    )
+    shared_argument = AppNode(
+        AbsNode(
+            :x,
+            AppNode(AppNode(ConstNode(:sum), IndexNode(0)), IndexNode(0)),
+        ),
+        AppNode(ConstNode(:counted), ConstNode(:value)),
+    )
+    @test evaluate_native(shared_argument, sharing_context) == 10
+    @test forced_count[] == 1
+
+    scoped_context = Dict{Symbol,Any}(
+        :unit => nothing,
+        :inner_value => 2,
+        :outer_value => 3,
+        :pair => x -> (y -> (x, y)),
+        :return_scoped_ast => _ -> AppNode(
+            AppNode(ConstNode(:pair), VarNode(:x)),
+            IndexNode(1),
+        ),
+    )
+    shadowed_scope = AppNode(
+        AbsNode(
+            :x,
+            AppNode(
+                AbsNode(
+                    :x,
+                    AppNode(ConstNode(:return_scoped_ast), ConstNode(:unit)),
+                ),
+                ConstNode(:inner_value),
+            ),
+        ),
+        ConstNode(:outer_value),
+    )
+    @test evaluate_native(shadowed_scope, scoped_context) == (2, 3)
 
     source = AstTree(AbsNode(:x, IndexNode(0)))
     prepared = prepare_native_evaluator(source)

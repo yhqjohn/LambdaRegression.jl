@@ -56,7 +56,7 @@ using ..TypeSystem: make_tyvar_factory, get_type_ctx
 using ..Programs: ConstSymbolFactory
 using ..Execution:
     EvalContext, MaxReduceStepsErr, ClosureDepthLimitErr,
-    NonConstOutputErr, MissingConstValueErr, NonClosedLambdaErr,
+    NonConstOutputErr, MissingConstValueErr,
     NonFiniteOutputErr, _finite_prediction
 import ..Execution
 using ..Primitives
@@ -196,7 +196,6 @@ function _known_candidate_exception(issue)
     issue isa ClosureDepthLimitErr && return true
     issue isa NonConstOutputErr && return true
     issue isa MissingConstValueErr && return true
-    issue isa NonClosedLambdaErr && return true
     issue isa NonFiniteOutputErr && return true
     return issue isa DomainError || issue isa DivideError ||
            issue isa OverflowError || issue isa InexactError
@@ -245,11 +244,8 @@ function prepare_regression_evaluator(
         global_consts=components.global_consts,
         make_eval_context=components.make_eval_context,
         const_symfactory_ctor=components.const_symfactory_ctor,
-        max_reduce_steps=max_steps,
-        native_max_steps=get(config, :procedural_max_steps, max(256, 4 * max_steps)),
-        closure_max_reduce_steps=get(config, :closure_max_reduce_steps, max_steps),
-        closure_lift_max_per_pass=get(config, :closure_lift_max_per_pass, 64),
-        closure_max_depth=get(config, :closure_max_depth, 64),
+        max_steps=get(config, :procedural_max_steps, max(256, 4 * max_steps)),
+        max_call_depth=get(config, :closure_max_depth, 512),
         copy_tree,
     )
 end
@@ -530,9 +526,7 @@ function default_config(;
     population_size::Int=64,
     max_reduce_steps::Int=64,
     procedural_max_steps::Int=max(256, 4 * max_reduce_steps),
-    closure_max_reduce_steps::Int=max_reduce_steps,
-    closure_max_depth::Int=64,
-    closure_lift_max_per_pass::Int=64,
+    closure_max_depth::Int=512,
     tournament_size::Int=3,
     error_penalty::Float64=1e12,
     strict_errors::Bool=false,
@@ -543,9 +537,7 @@ function default_config(;
         population_size,
         max_reduce_steps,
         procedural_max_steps,
-        closure_max_reduce_steps,
         closure_max_depth,
-        closure_lift_max_per_pass,
         tournament_size,
         error_penalty,
         strict_errors,
@@ -1159,7 +1151,6 @@ include("typed_refinement.jl")
         MaxReduceStepsErr,
         ClosureDepthLimitErr,
         NonConstOutputErr,
-        NonClosedLambdaErr,
         MissingConstValueErr,
         NonFiniteOutputErr
 end
@@ -1392,7 +1383,7 @@ end
         global_consts=comps.global_consts,
         make_eval_context=comps.make_eval_context,
         const_symfactory_ctor=comps.const_symfactory_ctor,
-        native_max_steps=default_config().procedural_max_steps)
+        max_steps=default_config().procedural_max_steps)
     @test LambdaRegression.Execution.evaluate_default(
         program, 3.5; default_execution...,
     ) == 3.5
@@ -1417,7 +1408,7 @@ end
         local_consts=Dict{Symbol,Any}(),
         local_consts_ty=Dict{Symbol,TyLike}(),
     )
-    limited_execution = merge(default_execution, (; native_max_steps=8))
+    limited_execution = merge(default_execution, (; max_steps=8))
     limited = LambdaRegression.Execution.evaluate_default(
         looping_program, 3.5; limited_execution...,
     )
@@ -1514,7 +1505,7 @@ end
         input_slots=Symbol[:x],
         input_types=Dict{Symbol,TyLike}(:x => A),
     )
-    cfg = default_config(max_reduce_steps=200, closure_max_reduce_steps=200)
+    cfg = default_config(max_reduce_steps=200)
     program = Program(
         tree;
         local_consts=Dict{Symbol,Any}(),
@@ -1584,7 +1575,7 @@ end
         input_slots=Symbol[:x],
         input_types=Dict{Symbol,TyLike}(:x => A),
     )
-    cfg = default_config(max_reduce_steps=600, closure_max_reduce_steps=300)
+    cfg = default_config(max_reduce_steps=600)
     program = Program(
         tree;
         local_consts=Dict{Symbol,Any}(),
@@ -1595,74 +1586,7 @@ end
     @test y ≈ sum(v * v for v in x)
 end
 
-@testitem "Regression lifted closures share a sample budget without retaining it" setup=[RegBaseImports] begin
-    using LambdaRegression.Execution: LiftedClosure
-
-    components = default_components(
-        global_consts=Dict{Symbol,Any}(),
-        global_consts_ty=Dict{Symbol,TyLike}(),
-        input_slots=Symbol[:x],
-        input_types=Dict{Symbol,TyLike}(:x => FloatTy),
-    )
-    closure = LiftedClosure(
-        AstTree(AbsNode(:x, IndexNode(0))),
-        Dict{Symbol,Any}(),
-        components.make_eval_context,
-        components.const_symfactory_ctor,
-        100,
-        64,
-        64,
-    )
-
-    @test LambdaRegression.Execution._current_core_eval_state() === nothing
-    LambdaRegression.Execution._with_core_eval_state(
-        () -> begin
-            @test closure(1.0) == 1.0
-            @test_throws MaxReduceStepsErr closure(2.0)
-            @test LambdaRegression.Execution._current_core_eval_state() !== nothing
-        end,
-        2,
-        64,
-    )
-    @test LambdaRegression.Execution._current_core_eval_state() === nothing
-    @test closure(3.0) == 3.0
-
-    task_a = @async LambdaRegression.Execution._with_core_eval_state(
-        () -> begin
-            yield()
-            first = closure(1.0)
-            second = try
-                closure(2.0)
-            catch err
-                err
-            end
-            (first, second,
-                LambdaRegression.Execution._current_core_eval_state() !== nothing)
-        end,
-        2,
-        64,
-    )
-    task_b = @async LambdaRegression.Execution._with_core_eval_state(
-        () -> begin
-            yield()
-            first = closure(1.0)
-            second = closure(2.0)
-            (first, second,
-                LambdaRegression.Execution._current_core_eval_state() !== nothing)
-        end,
-        4,
-        64,
-    )
-    result_a = fetch(task_a)
-    result_b = fetch(task_b)
-    @test result_a[1] == 1.0
-    @test result_a[2] isa MaxReduceStepsErr
-    @test result_a[3]
-    @test result_b == (1.0, 2.0, true)
-    @test LambdaRegression.Execution._current_core_eval_state() === nothing
-end
-
-@testitem "Regression lifted closure depth limit is bounded and restores task state" setup=[RegBaseImports] begin
+@testitem "Regression native callback depth and shared budget are bounded" setup=[RegBaseImports] begin
     chain = f -> f(0.0)
     chain_type = TyFun(TyFun(FloatTy, FloatTy), FloatTy)
     globals = Dict{Symbol,Any}(:CHAIN => chain, :ZERO => 0.0)
@@ -1689,23 +1613,16 @@ end
     )
     cfg = default_config(
         max_reduce_steps=200,
-        closure_max_reduce_steps=200,
         closure_max_depth=4,
     )
 
-    issue = try
-        prepare_regression_evaluator(program, components, cfg)(0.0)
-        nothing
-    catch err
-        err
-    end
-    @test issue isa ClosureDepthLimitErr
-    @test issue.depth == 5
-    @test issue.limit == 4
+    issue = prepare_regression_evaluator(program, components, cfg)(0.0)
+    @test issue isa Err
+    @test issue.value isa ClosureDepthLimitErr
+    @test issue.value.limit == 4
 
     generous = default_config(
         max_reduce_steps=400,
-        closure_max_reduce_steps=200,
         closure_max_depth=64,
     )
     generous_evaluator = prepare_regression_evaluator(program, components, generous)
@@ -1721,20 +1638,16 @@ end
 
     low_budget = default_config(
         max_reduce_steps=8,
-        closure_max_reduce_steps=200,
+        procedural_max_steps=8,
         closure_max_depth=64,
     )
-    budget_issue = try
-        prepare_regression_evaluator(program, components, low_budget)(0.0)
-        nothing
-    catch err
-        err
-    end
-    @test budget_issue isa MaxReduceStepsErr
-    @test budget_issue.steps == 8
+    budget_issue = prepare_regression_evaluator(program, components, low_budget)(0.0)
+    @test budget_issue isa Err
+    @test budget_issue.value isa MaxReduceStepsErr
+    @test budget_issue.value.steps == 8
 end
 
-@testitem "Regression non-closed lambda lift is rejected by task evaluation" setup=[RegBaseImports] begin
+@testitem "Regression unbound callback reference is rejected by task evaluation" setup=[RegBaseImports] begin
     x = [1.0, 2.0]
     A = TyArray(TyNat(length(x)), FloatTy)
     bad_inner = AbsNode(:y, IndexNode(2))
@@ -1747,11 +1660,11 @@ end
         input_slots=Symbol[:x],
         input_types=Dict{Symbol,TyLike}(:x => A),
     )
-    config = default_config(max_reduce_steps=80, closure_max_reduce_steps=80)
+    config = default_config(max_reduce_steps=80)
 
-    @test_throws NonClosedLambdaErr prepare_regression_evaluator(
-        bad_program, components, config,
-    )(x)
+    result = prepare_regression_evaluator(bad_program, components, config)(x)
+    @test result isa Err
+    @test result.value isa NonConstOutputErr
 end
 
 
