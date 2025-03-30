@@ -28,17 +28,21 @@ This module models mutation as choosing a pair `(mutation, site)` and applying i
    - `WeightedPairChooser` implements a practical baseline: prefer high-success
      operators (constants) and only select from eligible sites.
    - Optional eligibility caching is scoped to *one* `mutate_tree` call.
+   - Provider preparation and chooser/eligibility/weight hooks borrow the
+     source tree and caller-owned constant dictionaries as deeply read-only
+     inputs; hooks may inspect identity but must not mutate them or reachable
+     values. Only `apply` receives a private candidate tree and copied local
+     dictionaries; shared global constants remain read-only there.
 
 3. **Mutation operator** (`AbstractMutation`):
    - Declares which kinds of sites it needs (`required_site_kinds`),
      filters sites (`is_site_eligible`), and performs the mutation (`apply`).
 
-The top-level entry `mutate_tree` runs a retry loop:
-- build sites (via provider),
-- choose `(mutation, site)` (via chooser),
-- apply mutation,
-- validate type invariant (`infer` + `iscompatible`),
-- optionally prune unreferenced local constants (`prune_local_consts!`).
+The top-level entry `mutate_tree` analyzes and selects against borrowed read-only
+inputs, then for each eligible choice copies a private candidate immediately
+before `apply`. It validates the type invariant (`infer` + `iscompatible`),
+optionally prunes unreferenced local constants (`prune_local_consts!`), and
+commits candidate dictionaries only after a successful validation.
 
 ## Invariants
 
@@ -54,9 +58,14 @@ The top-level entry `mutate_tree` runs a retry loop:
 - `local_consts::Dict{Symbol,Any}`: per-individual constant values (mutable).
 - `local_consts_ty::Dict{Symbol,TyLike}`: types for names in `local_consts`.
 
-By default, `copy_ctx=true` makes mutation transactional: we search using scratch
-copies and only commit to the caller dictionaries on success. This avoids the
-"shared constants all change together" pitfall in population-based runs.
+Provider and chooser hooks borrow the source tree and caller-owned constant
+dictionaries through analysis and selection. They may inspect object identity,
+but must not mutate those objects or anything reachable from them. `apply`
+receives one deep copy of the selected tree and shallow copies of both local
+dictionaries; shared global constants remain read-only. Failed attempts discard
+their copies, and validated success commits the copied local dictionaries to the
+caller. This keeps selection identity cheap without exposing shared constants to
+writes.
 
 Quickstart
 ```julia
@@ -129,8 +138,11 @@ mutation = SubtreeReplacementMutation(;
 endomorphism `H : T → T`. It is the low-cost direct move for forms such as
 `SQR(x)` or `TSCALE(head)`. `BinaryCompositionMutation()` preserves `S` as one
 argument of a compatible curried binary global and generates the other sibling.
-Use their site-selection policies and `WeightedPairChooser` weights to change
-routing without changing either rewrite.
+Their global-head directory is prepared once per `mutate_tree` call, and each
+admitted closed target type gets a reusable ordered option menu. Open global
+head types remain in the compatibility fallback. Use their site-selection
+policies and `WeightedPairChooser` weights to change routing without changing
+either rewrite.
 
 ## Constant mutation policies
 
@@ -405,11 +417,12 @@ using ..Utils: Err
 using ..TypeSystem
 using ..Primitives
 using ..TypeSystem: Ty, TyLike, TyConst, TyFun, TyList, TyVar, TyArray, TyNat,
-    instantiate, infer, iscompatible, newtyvar, BoolTy, IntTy, FloatTy,
+    instantiate, infer, iscompatible, _grounded_iscompatible, newtyvar, BoolTy, IntTy, FloatTy,
     _detached_type_ctx
 using ..ASTs.NodeASTs
 using ..ProgramAnalysis:
-    TypedAnalysis, SyntaxIndex, analyze_program, path,
+    TypedAnalysis, SyntaxIndex, analyze_program, analyze_syntax, path,
+    UnsupportedSyntaxError,
     visible_binder_ids
 using ..Transforms: eliminate_node!, occurrence_id, repeated_nodes
 using ..CanonicalGeneration: generate_canonical_scoped, GenerationResult
@@ -1894,27 +1907,6 @@ UnaryCompositionMutation(;
 required_site_kinds(::UnaryCompositionMutation) = Symbol[:any]
 base_weight(::UnaryCompositionMutation, ::NamedTuple) = 0.08
 
-function _unary_composition_options(site::Site, ctx::NamedTuple)
-    _generation_closed_type(site.ty) || return Symbol[]
-    haskey(ctx, :global_consts) || return Symbol[]
-    haskey(ctx, :global_consts_ty) || return Symbol[]
-    options = Symbol[]
-    for name in sort!(collect(keys(ctx.global_consts_ty)))
-        haskey(ctx.global_consts, name) || continue
-        raw = ctx.global_consts_ty[name]
-        raw isa Ty || continue
-        arrow = TypeSystem.prune(raw)
-        arrow isa TyFun || continue
-        argument_ty = TypeSystem.prune(arrow.arg)
-        result_ty = TypeSystem.prune(arrow.res)
-        argument_ty isa Ty && result_ty isa Ty || continue
-        _same_composition_type(argument_ty, site.ty) || continue
-        _same_composition_type(result_ty, site.ty) || continue
-        push!(options, name)
-    end
-    return options
-end
-
 function is_site_eligible(
     mutation::UnaryCompositionMutation,
     site::Site,
@@ -1987,37 +1979,146 @@ required_site_kinds(::BinaryCompositionMutation) = Symbol[:any]
 base_weight(::BinaryCompositionMutation, ::NamedTuple) = 0.08
 
 _same_composition_type(left::Ty, right::Ty) =
-    iscompatible(left, right) && iscompatible(right, left)
+    _grounded_iscompatible(left, right) && _grounded_iscompatible(right, left)
 
-function _binary_composition_options(site::Site, ctx::NamedTuple)
-    _generation_closed_type(site.ty) || return NamedTuple[]
-    haskey(ctx, :global_consts) || return NamedTuple[]
-    haskey(ctx, :global_consts_ty) || return NamedTuple[]
-    options = NamedTuple[]
-    for name in sort!(collect(keys(ctx.global_consts_ty)))
-        haskey(ctx.global_consts, name) || continue
-        raw = ctx.global_consts_ty[name]
+struct _CompositionHead
+    name::Symbol
+    ty::Ty
+end
+
+struct _BinaryCompositionOption
+    name::Symbol
+    sibling_ty::Ty
+    seed_first::Bool
+end
+
+mutable struct _CompositionMenus
+    unary::Union{Nothing,Vector{Symbol}}
+    binary::Union{Nothing,Vector{_BinaryCompositionOption}}
+end
+
+mutable struct _CompositionDirectory
+    heads::Vector{_CompositionHead}
+    menus::Dict{Ty,_CompositionMenus}
+end
+
+"""
+    _prepare_composition_directory(global_consts, global_consts_ty)
+
+Build the ordered global-head view for one mutation call. Both dictionaries and
+all reachable type values are borrowed read-only. Open monotypes are retained
+for compatibility fallback; only admitted closed site types index menus.
+"""
+function _prepare_composition_directory(
+    global_consts::AbstractDict,
+    global_consts_ty::AbstractDict,
+)
+    heads = _CompositionHead[]
+    for name in sort!(collect(keys(global_consts_ty)))
+        name isa Symbol || continue
+        haskey(global_consts, name) || continue
+        raw = global_consts_ty[name]
         raw isa Ty || continue
-        first_arrow = TypeSystem.prune(raw)
-        first_arrow isa TyFun || continue
-        second_arrow = TypeSystem.prune(first_arrow.res)
-        second_arrow isa TyFun || continue
-        result_ty = TypeSystem.prune(second_arrow.res)
-        result_ty isa Ty || continue
-        _same_composition_type(result_ty, site.ty) || continue
+        # Normalize each borrowed global descriptor once. The resulting view is
+        # read-only; unification still happens only in the detached predicate.
+        push!(heads, _CompositionHead(name, TypeSystem.prune(raw)))
+    end
+    return _CompositionDirectory(heads, Dict{Ty,_CompositionMenus}())
+end
 
-        left_ty = TypeSystem.prune(first_arrow.arg)
-        right_ty = TypeSystem.prune(second_arrow.arg)
-        if left_ty isa Ty && _generation_closed_type(right_ty) &&
-                _same_composition_type(left_ty, site.ty)
-            push!(options, (; name, sibling_ty=right_ty, seed_first=true))
+function _prepare_composition_directory(ctx::NamedTuple)
+    global_consts = get(ctx, :global_consts, nothing)
+    global_consts_ty = get(ctx, :global_consts_ty, nothing)
+    global_consts isa AbstractDict || return _CompositionDirectory(
+        _CompositionHead[], Dict{Ty,_CompositionMenus}(),
+    )
+    global_consts_ty isa AbstractDict || return _CompositionDirectory(
+        _CompositionHead[], Dict{Ty,_CompositionMenus}(),
+    )
+    return _prepare_composition_directory(global_consts, global_consts_ty)
+end
+
+function _composition_directory(ctx::NamedTuple)
+    prepared = get(ctx, :composition_directory, nothing)
+    prepared isa _CompositionDirectory && return prepared
+    # Standalone eligibility/apply calls use this same implementation as a
+    # one-shot preparation; mutate_tree passes a shared call-local owner.
+    return _prepare_composition_directory(ctx)
+end
+
+function _build_unary_composition_options(
+    directory::_CompositionDirectory,
+    target::Ty,
+)
+    options = Symbol[]
+    for head in directory.heads
+        arrow = head.ty
+        arrow isa TyFun || continue
+        argument_ty = arrow.arg
+        result_ty = arrow.res
+        _same_composition_type(argument_ty, target) || continue
+        _same_composition_type(result_ty, target) || continue
+        push!(options, head.name)
+    end
+    return options
+end
+
+function _build_binary_composition_options(
+    directory::_CompositionDirectory,
+    target::Ty,
+)
+    options = _BinaryCompositionOption[]
+    for head in directory.heads
+        first_arrow = head.ty
+        first_arrow isa TyFun || continue
+        second_arrow = first_arrow.res
+        second_arrow isa TyFun || continue
+        result_ty = second_arrow.res
+        _same_composition_type(result_ty, target) || continue
+
+        left_ty = first_arrow.arg
+        right_ty = second_arrow.arg
+        if _generation_closed_type(right_ty) &&
+                _same_composition_type(left_ty, target)
+            push!(options, _BinaryCompositionOption(head.name, right_ty, true))
         end
-        if right_ty isa Ty && _generation_closed_type(left_ty) &&
-                _same_composition_type(right_ty, site.ty)
-            push!(options, (; name, sibling_ty=left_ty, seed_first=false))
+        if _generation_closed_type(left_ty) &&
+                _same_composition_type(right_ty, target)
+            push!(options, _BinaryCompositionOption(head.name, left_ty, false))
         end
     end
     return options
+end
+
+function _composition_options(kind::Symbol, site::Site, ctx::NamedTuple)
+    _generation_closed_type(site.ty) || return nothing
+    directory = _composition_directory(ctx)
+    target = TypeSystem.prune(site.ty)
+    menus = get!(directory.menus, target) do
+        _CompositionMenus(nothing, nothing)
+    end
+    if kind === :unary
+        if menus.unary === nothing
+            menus.unary = _build_unary_composition_options(directory, target)
+        end
+        return menus.unary::Vector{Symbol}
+    elseif kind === :binary
+        if menus.binary === nothing
+            menus.binary = _build_binary_composition_options(directory, target)
+        end
+        return menus.binary::Vector{_BinaryCompositionOption}
+    end
+    error("unknown composition menu kind: $(repr(kind))")
+end
+
+_unary_composition_options(site::Site, ctx::NamedTuple) = begin
+    options = _composition_options(:unary, site, ctx)
+    options === nothing ? Symbol[] : options
+end
+
+_binary_composition_options(site::Site, ctx::NamedTuple) = begin
+    options = _composition_options(:binary, site, ctx)
+    options === nothing ? _BinaryCompositionOption[] : options
 end
 
 function is_site_eligible(
@@ -2876,8 +2977,9 @@ Returns `Err(MaxTryReachedErr())` if no valid mutation can be found within `max_
 - `mutations`: available mutation operators (default: MVP set)
 - `chooser`: how to pick `(mutation, site)` (default: `WeightedPairChooser()`)
 - `provider`: how to build sites (default: `IndexedProvider()`)
-- `copy_tree`: run mutation on a copy of the input tree (default: `true`)
-- `copy_ctx`: transactional mutation over constant dictionaries (default: `true`)
+- Selection and analysis borrow the input tree and constant dictionaries as
+  read-only; each eligible `apply` gets one private tree copy and local-dictionary
+  copies, committed only after successful type validation.
 - `prune_consts`: call `prune_local_consts!` after a successful mutation (default: `true`)
 - `global_consts_ty`, `local_consts`, `local_consts_ty`: constant/type containers
 - `global_consts`: optional runtime values for global constants used by generated replacements
@@ -2894,8 +2996,6 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     chooser::AbstractPairChooser=WeightedPairChooser(),
     provider::AbstractSiteProvider=IndexedProvider(),
     max_try::Int=20,
-    copy_tree::Bool=true,
-    copy_ctx::Bool=true,
     prune_consts::Bool=true,
     global_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
     global_consts_ty::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
@@ -2908,12 +3008,12 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     adaptive_policy::AdaptivePolicy=AdaptivePolicy(),
     recorder::Union{Nothing,MutationAttemptRecorder}=nothing,
 )
-    current_tree = copy_tree ? deepcopy(tree) : tree
-    # Transactional: always search with scratch dicts; on success, commit to caller dicts.
+    current_tree = tree
+    # Selection borrows caller dictionaries; only an eligible apply gets copies.
     caller_local_consts = local_consts
     caller_local_consts_ty = local_consts_ty
-    current_local_consts = copy(caller_local_consts)
-    current_local_consts_ty = copy(caller_local_consts_ty)
+    current_local_consts = caller_local_consts
+    current_local_consts_ty = caller_local_consts_ty
 
     # Prepare sites once (the retry loop works on copies of the same input).
     base_type_ctx = merge(global_consts_ty, current_local_consts_ty)
@@ -2933,6 +3033,13 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     else
         nothing
     end
+    uses_composition = any(
+        mutation -> mutation isa UnaryCompositionMutation ||
+                    mutation isa BinaryCompositionMutation,
+        mutations,
+    )
+    composition_directory = uses_composition ?
+        _prepare_composition_directory(global_consts, global_consts_ty) : nothing
     base_ctx = (;
         rng=rng,
         global_consts=global_consts,
@@ -2944,6 +3051,7 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         const_symfactory=const_symfactory,
         typed_analysis,
         cse_index,
+        composition_directory,
     )
     env = MutationEnv(
         rng,
@@ -2966,10 +3074,6 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     end
 
     for _ in 1:max_try
-        attempt_tree = deepcopy(current_tree)
-        attempt_local_consts = copy(current_local_consts)
-        attempt_local_consts_ty = copy(current_local_consts_ty)
-        attempt_type_ctx = merge(global_consts_ty, attempt_local_consts_ty)
         choice = choose_pair(chooser, mutations, provider, current_tree, base_type_ctx, env, base_ctx)
         if choice isa Err
             record!(recorder, nothing, :choose_err; err_type=typeof(choice.value))
@@ -2977,18 +3081,6 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         end
 
         m = choice.mutation::AbstractMutation
-        attempt_ctx = (;
-            rng=rng,
-            global_consts=global_consts,
-            global_consts_ty=global_consts_ty,
-            local_consts_ty=attempt_local_consts_ty,
-            local_consts=attempt_local_consts,
-            tyfactory=tyfactory,
-            symfactory=symfactory,
-            const_symfactory=const_symfactory,
-            cse_index=base_ctx.cse_index,
-            typed_analysis=base_ctx.typed_analysis,
-        )
         source_site = _authoritative_site(
             base_ctx.typed_analysis,
             choice.site,
@@ -3006,6 +3098,22 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
             record!(recorder, typeof(m), :no_eligible_site; err_type=NoEligibleSiteErr)
             continue
         end
+        attempt_tree = deepcopy(current_tree)
+        attempt_local_consts = copy(current_local_consts)
+        attempt_local_consts_ty = copy(current_local_consts_ty)
+        attempt_ctx = (;
+            rng=rng,
+            global_consts=global_consts,
+            global_consts_ty=global_consts_ty,
+            local_consts_ty=attempt_local_consts_ty,
+            local_consts=attempt_local_consts,
+            tyfactory=tyfactory,
+            symfactory=symfactory,
+            const_symfactory=const_symfactory,
+            cse_index=base_ctx.cse_index,
+            typed_analysis=base_ctx.typed_analysis,
+            composition_directory=base_ctx.composition_directory,
+        )
         attempt_site = _remap_authoritative_site(attempt_tree, source_site)
         mutated = apply(m, attempt_tree, attempt_site, env, attempt_ctx)
         if mutated isa Err
@@ -3059,19 +3167,10 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
         current_tree = attempt_tree
         current_local_consts = attempt_local_consts
         current_local_consts_ty = attempt_local_consts_ty
-        if copy_ctx
-            empty!(caller_local_consts)
-            empty!(caller_local_consts_ty)
-            merge!(caller_local_consts, current_local_consts)
-            merge!(caller_local_consts_ty, current_local_consts_ty)
-        else
-            # If the caller wants in-place updates during the search, they can pass mutable dicts
-            # that are already per-individual; commit at the end anyway for consistency.
-            empty!(caller_local_consts)
-            empty!(caller_local_consts_ty)
-            merge!(caller_local_consts, current_local_consts)
-            merge!(caller_local_consts_ty, current_local_consts_ty)
-        end
+        empty!(caller_local_consts)
+        empty!(caller_local_consts_ty)
+        merge!(caller_local_consts, current_local_consts)
+        merge!(caller_local_consts_ty, current_local_consts_ty)
         return current_tree
     end
     record!(recorder, nothing, :max_try_exhausted)
@@ -4342,6 +4441,245 @@ end
     @test provider.prepare_calls == 1
 end
 
+@testitem "Mutations selection borrows inputs and apply receives a remapped private candidate" setup=[MutBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, setroot!
+    using LambdaRegression.Mutations:
+        AbstractMutation, AbstractPairChooser, AbstractSiteProvider, PairChoice
+    using LambdaRegression.TypeSystem: TyFun
+
+    mutable struct CopyBoundaryObservation
+        selected_tree::Any
+        selected_local_consts::Any
+        selected_local_consts_ty::Any
+        selected_site::Any
+        attempt_tree::Any
+        attempt_local_consts::Any
+        attempt_local_consts_ty::Any
+        attempt_site::Any
+        site_matches_candidate::Bool
+    end
+
+    struct CopyBoundaryMutation <: AbstractMutation
+        observation::CopyBoundaryObservation
+    end
+    function LambdaRegression.Mutations.apply(
+        mutation::CopyBoundaryMutation,
+        tree::AstTree,
+        site::LambdaRegression.Mutations.Site,
+        ::Any,
+        ctx::NamedTuple,
+    )
+        observation = mutation.observation
+        observation.attempt_tree = tree
+        observation.attempt_local_consts = ctx.local_consts
+        observation.attempt_local_consts_ty = ctx.local_consts_ty
+        observation.attempt_site = site
+        observation.site_matches_candidate =
+            site.path == [1] && site.parent == tree.root && site.node == tree.root.body
+        setroot!(tree, AbsNode(:x, ConstNode(:m)))
+        ctx.local_consts[:k] = 5.0
+        return tree
+    end
+
+    struct CopyBoundaryChooser <: AbstractPairChooser
+        observation::CopyBoundaryObservation
+    end
+    function LambdaRegression.Mutations.choose_pair(
+        chooser::CopyBoundaryChooser,
+        mutations::Vector{<:AbstractMutation},
+        provider::AbstractSiteProvider,
+        tree::AstTree,
+        ::Dict{Symbol,<:TyLike},
+        ::LambdaRegression.Mutations.MutationEnv,
+        ctx::NamedTuple,
+    )
+        observation = chooser.observation
+        observation.selected_tree = tree
+        observation.selected_local_consts = ctx.local_consts
+        observation.selected_local_consts_ty = ctx.local_consts_ty
+        site = only(filter(
+            site -> site.node isa ConstNode && site.node.name === :k,
+            LambdaRegression.Mutations.sites(provider),
+        ))
+        observation.selected_site = site
+        return PairChoice(first(mutations), site)
+    end
+
+    observation = CopyBoundaryObservation(
+        nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, false,
+    )
+    mutation = CopyBoundaryMutation(observation)
+    chooser = CopyBoundaryChooser(observation)
+    tree = AstTree(AbsNode(:x, ConstNode(:k)))
+    local_consts = Dict{Symbol,Any}(:k => 1.0, :m => 2.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy, :m => FloatTy)
+
+    result = mutate_tree(
+        tree,
+        TyFun(FloatTy, FloatTy);
+        mutations=[mutation],
+        chooser=chooser,
+        provider=IndexedProvider(),
+        local_consts,
+        local_consts_ty,
+        prune_consts=false,
+    )
+
+    @test result isa AstTree
+    result isa AstTree || return
+    @test observation.selected_tree === tree
+    @test observation.selected_local_consts === local_consts
+    @test observation.selected_local_consts_ty === local_consts_ty
+    @test observation.attempt_tree !== observation.selected_tree
+    @test observation.attempt_tree !== tree
+    @test observation.attempt_local_consts !== local_consts
+    @test observation.attempt_local_consts_ty !== local_consts_ty
+    @test observation.attempt_site !== observation.selected_site
+    @test observation.attempt_site.path == observation.selected_site.path == [1]
+    @test observation.site_matches_candidate
+    @test (tree.root::AbsNode).body == ConstNode(:k)
+    @test (result.root::AbsNode).body == ConstNode(:m)
+    @test local_consts[:k] == 5.0
+    @test local_consts[:m] == 2.0
+end
+
+@testitem "Mutations retries discard ineligible and failed private candidates" setup=[MutBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, IndexNode, setroot!
+    using LambdaRegression.Mutations:
+        AbstractMutation, AbstractPairChooser, AbstractSiteProvider, PairChoice
+    using LambdaRegression.TypeSystem: TyFun
+
+    mutable struct RetryObservation
+        selected_trees::Vector{Any}
+        selected_local_consts::Vector{Any}
+        selected_local_consts_ty::Vector{Any}
+        retry_applies::Int
+        failed_candidate::Any
+        failed_local_consts::Any
+        successful_candidate::Any
+        success_initial_value::Any
+        site_matches_candidate::Bool
+    end
+
+    struct NeverEligibleMutation <: AbstractMutation
+        calls::Base.RefValue{Int}
+    end
+    function LambdaRegression.Mutations.is_site_eligible(
+        ::NeverEligibleMutation,
+        ::LambdaRegression.Mutations.Site,
+        ::LambdaRegression.Mutations.MutationEnv,
+        ::NamedTuple,
+    )
+        return false
+    end
+    function LambdaRegression.Mutations.apply(
+        mutation::NeverEligibleMutation,
+        ::AstTree,
+        ::LambdaRegression.Mutations.Site,
+        ::Any,
+        ::NamedTuple,
+    )
+        mutation.calls[] += 1
+        error("an ineligible mutation must not be applied")
+    end
+
+    struct RetryApplyMutation <: AbstractMutation
+        observation::RetryObservation
+    end
+    function LambdaRegression.Mutations.apply(
+        mutation::RetryApplyMutation,
+        tree::AstTree,
+        site::LambdaRegression.Mutations.Site,
+        ::Any,
+        ctx::NamedTuple,
+    )
+        observation = mutation.observation
+        observation.retry_applies += 1
+        observation.site_matches_candidate =
+            site.path == [1] && site.parent == tree.root && site.node == tree.root.body
+        if observation.retry_applies == 1
+            observation.failed_candidate = tree
+            observation.failed_local_consts = ctx.local_consts
+            setroot!(tree, AbsNode(:x, ConstNode(:m)))
+            ctx.local_consts[:k] = 99.0
+            return Err(LambdaRegression.Mutations.NoEligibleSiteErr())
+        end
+
+        observation.successful_candidate = tree
+        observation.success_initial_value = ctx.local_consts[:k]
+        setroot!(tree, AbsNode(:x, ConstNode(:m)))
+        return tree
+    end
+
+    struct RetryChooser <: AbstractPairChooser
+        observation::RetryObservation
+        skip::NeverEligibleMutation
+        retry::RetryApplyMutation
+    end
+    function LambdaRegression.Mutations.choose_pair(
+        chooser::RetryChooser,
+        ::Vector{<:AbstractMutation},
+        provider::AbstractSiteProvider,
+        tree::AstTree,
+        ::Dict{Symbol,<:TyLike},
+        ::LambdaRegression.Mutations.MutationEnv,
+        ctx::NamedTuple,
+    )
+        observation = chooser.observation
+        push!(observation.selected_trees, tree)
+        push!(observation.selected_local_consts, ctx.local_consts)
+        push!(observation.selected_local_consts_ty, ctx.local_consts_ty)
+        site = only(filter(
+            site -> site.node isa ConstNode && site.node.name === :k,
+            LambdaRegression.Mutations.sites(provider),
+        ))
+        mutation = length(observation.selected_trees) == 1 ? chooser.skip : chooser.retry
+        return PairChoice(mutation, site)
+    end
+
+    skip_calls = Ref(0)
+    observation = RetryObservation(Any[], Any[], Any[], 0, nothing, nothing, nothing, nothing, false)
+    skip = NeverEligibleMutation(skip_calls)
+    retry = RetryApplyMutation(observation)
+    chooser = RetryChooser(observation, skip, retry)
+    tree = AstTree(AbsNode(:x, ConstNode(:k)))
+    local_consts = Dict{Symbol,Any}(:k => 1.0, :m => 2.0)
+    local_consts_ty = Dict{Symbol,TyLike}(:k => FloatTy, :m => FloatTy)
+
+    result = mutate_tree(
+        tree,
+        TyFun(FloatTy, FloatTy);
+        mutations=AbstractMutation[skip, retry],
+        chooser,
+        provider=IndexedProvider(),
+        max_try=3,
+        local_consts,
+        local_consts_ty,
+        prune_consts=false,
+    )
+
+    @test result isa AstTree
+    result isa AstTree || return
+    @test length(observation.selected_trees) == 3
+    @test all(selected -> selected === tree, observation.selected_trees)
+    @test all(selected -> selected === local_consts, observation.selected_local_consts)
+    @test all(selected -> selected === local_consts_ty, observation.selected_local_consts_ty)
+    @test skip_calls[] == 0
+    @test observation.retry_applies == 2
+    @test observation.failed_candidate !== observation.successful_candidate
+    @test observation.failed_local_consts !== local_consts
+    @test observation.failed_candidate.root.body == ConstNode(:m)
+    @test observation.failed_local_consts[:k] == 99.0
+    @test observation.success_initial_value == 1.0
+    @test observation.site_matches_candidate
+    @test (tree.root::AbsNode).body == ConstNode(:k)
+    @test local_consts[:k] == 1.0
+    @test (result.root::AbsNode).body == ConstNode(:m)
+
+    setroot!(tree, AbsNode(:x, IndexNode(0)))
+    @test (result.root::AbsNode).body == ConstNode(:m)
+end
+
 @testitem "Mutations BetaReduceMutation reduces redex + preserves type" setup=[MutBaseImports] begin
     rng = MersenneTwister(8000)
     local_consts = Dict{Symbol,Any}(:k => 7)
@@ -4744,7 +5082,6 @@ end
         provider=IndexedProvider(),
         max_try=10,
         prune_consts=true,
-        copy_ctx=true,
     )
     inferred = infer(mutated, merge(Dict{Symbol,TyLike}(), local_consts_ty))
     @test iscompatible(inferred, target_ty)
@@ -4961,6 +5298,266 @@ end
             IndexNode(0),
         ),
     )
+end
+
+@testitem "Mutations composition compatibility preserves the original predicate" setup=[MutBaseImports] begin
+    using LambdaRegression: TypeSystem
+    using LambdaRegression.Mutations: _same_composition_type
+
+    open = TypeSystem.newtyvar(0)
+    types = TypeSystem.Ty[
+        FloatTy,
+        IntTy,
+        TypeSystem.TyFun(FloatTy, FloatTy),
+        TypeSystem.TyList(FloatTy),
+        TypeSystem.TyArray(TypeSystem.TyNat(2), FloatTy),
+        TypeSystem.TyProd(FloatTy, IntTy),
+        TypeSystem.TyRigid(17),
+        TypeSystem.TyFun(open, open),
+    ]
+    for left in types, right in types
+        old = iscompatible(left, right) && iscompatible(right, left)
+        @test _same_composition_type(left, right) == old
+    end
+end
+
+@testitem "Mutations composition menus preserve scans and call-local reuse" setup=[MutBaseImports] begin
+    using LambdaRegression: TypeSystem
+    using LambdaRegression.Mutations:
+        _prepare_composition_directory,
+        _unary_composition_options,
+        _binary_composition_options,
+        _composition_options,
+        UnaryCompositionMutation,
+        BinaryCompositionMutation,
+        AbstractReplacementGenerator,
+        is_site_eligible,
+        apply
+    using LambdaRegression.CanonicalGeneration: GenerationResult
+    using LambdaRegression.TypeSystem:
+        IntTy,
+        TyArray,
+        TyFun,
+        TyList,
+        TyMu,
+        TyNat,
+        TyScheme
+
+    function reference_unary_options(site, ctx)
+        LambdaRegression.Mutations._generation_closed_type(site.ty) &&
+            haskey(ctx, :global_consts) && haskey(ctx, :global_consts_ty) ||
+                return Symbol[]
+        options = Symbol[]
+        for name in sort!(collect(keys(ctx.global_consts_ty)))
+            haskey(ctx.global_consts, name) || continue
+            raw = ctx.global_consts_ty[name]
+            raw isa TypeSystem.Ty || continue
+            arrow = TypeSystem.prune(raw)
+            arrow isa TyFun || continue
+            argument_ty = TypeSystem.prune(arrow.arg)
+            result_ty = TypeSystem.prune(arrow.res)
+            argument_ty isa TypeSystem.Ty && result_ty isa TypeSystem.Ty || continue
+            TypeSystem._grounded_iscompatible(argument_ty, site.ty) &&
+                TypeSystem._grounded_iscompatible(site.ty, argument_ty) || continue
+            TypeSystem._grounded_iscompatible(result_ty, site.ty) &&
+                TypeSystem._grounded_iscompatible(site.ty, result_ty) || continue
+            push!(options, name)
+        end
+        return options
+    end
+
+    function reference_binary_options(site, ctx)
+        LambdaRegression.Mutations._generation_closed_type(site.ty) &&
+            haskey(ctx, :global_consts) && haskey(ctx, :global_consts_ty) ||
+                return NamedTuple[]
+        options = NamedTuple[]
+        for name in sort!(collect(keys(ctx.global_consts_ty)))
+            haskey(ctx.global_consts, name) || continue
+            raw = ctx.global_consts_ty[name]
+            raw isa TypeSystem.Ty || continue
+            first_arrow = TypeSystem.prune(raw)
+            first_arrow isa TyFun || continue
+            second_arrow = TypeSystem.prune(first_arrow.res)
+            second_arrow isa TyFun || continue
+            result_ty = TypeSystem.prune(second_arrow.res)
+            result_ty isa TypeSystem.Ty || continue
+            same(left, right) =
+                TypeSystem._grounded_iscompatible(left, right) &&
+                TypeSystem._grounded_iscompatible(right, left)
+            same(result_ty, site.ty) || continue
+            left_ty = TypeSystem.prune(first_arrow.arg)
+            right_ty = TypeSystem.prune(second_arrow.arg)
+            if left_ty isa TypeSystem.Ty &&
+                    LambdaRegression.Mutations._generation_closed_type(right_ty) &&
+                    same(left_ty, site.ty)
+                push!(options, (; name, sibling_ty=right_ty, seed_first=true))
+            end
+            if right_ty isa TypeSystem.Ty &&
+                    LambdaRegression.Mutations._generation_closed_type(left_ty) &&
+                    same(right_ty, site.ty)
+                push!(options, (; name, sibling_ty=left_ty, seed_first=false))
+            end
+        end
+        return options
+    end
+
+    list_ty = TyList(FloatTy)
+    array_ty = TyArray(TyNat(2), FloatTy)
+    function_ty = TyFun(FloatTy, FloatTy)
+    open_shared = TypeSystem.newtyvar(0)
+    open_result = TypeSystem.newtyvar(0)
+    scheme_var = TypeSystem.newtyvar(0)
+    global_consts_ty = Dict{Symbol,TyLike}(
+        :U_ARRAY => TyFun(array_ty, array_ty),
+        :U_FLOAT => TyFun(FloatTy, FloatTy),
+        :U_FUNCTION => TyFun(function_ty, function_ty),
+        :U_INT => TyFun(IntTy, IntTy),
+        :U_LIST => TyFun(list_ty, list_ty),
+        :U_OPEN_END => TyFun(open_shared, open_shared),
+        :B_ARRAY => TyFun(array_ty, TyFun(array_ty, array_ty)),
+        :B_BOTH => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
+        :B_FLOAT_LEFT => TyFun(FloatTy, TyFun(IntTy, FloatTy)),
+        :B_FLOAT_RIGHT => TyFun(IntTy, TyFun(FloatTy, FloatTy)),
+        :B_FUNCTION => TyFun(function_ty, TyFun(function_ty, function_ty)),
+        :B_INT => TyFun(IntTy, TyFun(IntTy, IntTy)),
+        :B_LIST => TyFun(list_ty, TyFun(list_ty, list_ty)),
+        :B_OPEN_RESULT => TyFun(IntTy, TyFun(FloatTy, open_result)),
+        :B_SHARED => TyFun(open_shared, TyFun(FloatTy, open_shared)),
+        :B_SHARED_SIBLING => TyFun(open_shared, TyFun(open_shared, FloatTy)),
+        :MISSING_RUNTIME => TyFun(FloatTy, FloatTy),
+        :POLYMORPHIC => TyScheme(
+            [scheme_var],
+            TyFun(scheme_var, scheme_var),
+        ),
+        :NOT_A_FUNCTION => FloatTy,
+    )
+    global_consts = Dict{Symbol,Any}(
+        name => name for name in keys(global_consts_ty)
+        if name !== :MISSING_RUNTIME
+    )
+    ctx = (; global_consts, global_consts_ty)
+    make_site(ty) = LambdaRegression.Mutations.Site(
+        Int[],
+        ConstNode(:seed),
+        nothing,
+        0,
+        0,
+        :const_global,
+        ty,
+        TyLike[],
+    )
+
+    original_type_refs = Dict(name => ty for (name, ty) in global_consts_ty)
+    for target in (FloatTy, IntTy, list_ty, array_ty, function_ty)
+        site = make_site(target)
+        actual_unary = _unary_composition_options(site, ctx)
+        legacy_unary = reference_unary_options(site, ctx)
+        @test actual_unary == legacy_unary
+
+        actual_binary = [
+            (; name=option.name, sibling_ty=option.sibling_ty, seed_first=option.seed_first)
+            for option in _binary_composition_options(site, ctx)
+        ]
+        @test actual_binary == reference_binary_options(site, ctx)
+    end
+
+    float_site = make_site(FloatTy)
+    float_binary = _binary_composition_options(float_site, ctx)
+    @test [(option.name, option.seed_first) for option in float_binary if option.name === :B_BOTH] ==
+          [(:B_BOTH, true), (:B_BOTH, false)]
+    @test [(option.name, option.seed_first) for option in float_binary if option.name === :B_SHARED] ==
+          [(:B_SHARED, true)]
+    @test isempty([option for option in float_binary if option.name === :B_SHARED_SIBLING])
+    @test :U_OPEN_END in _unary_composition_options(float_site, ctx)
+    @test :MISSING_RUNTIME ∉ _unary_composition_options(float_site, ctx)
+    @test :POLYMORPHIC ∉ _unary_composition_options(float_site, ctx)
+
+    recursive_var = TypeSystem.newtyvar(0)
+    recursive_ty = TyMu(recursive_var, TyFun(FloatTy, recursive_var))
+    @test _composition_options(:unary, make_site(recursive_ty), ctx) === nothing
+
+    directory = _prepare_composition_directory(global_consts, global_consts_ty)
+    prepared_ctx = (; global_consts, global_consts_ty, composition_directory=directory)
+    prepared_site = make_site(FloatTy)
+    initial_menu = _unary_composition_options(prepared_site, prepared_ctx)
+    @test initial_menu === _unary_composition_options(prepared_site, prepared_ctx)
+    for target in (list_ty, array_ty, function_ty)
+        original_menu = _unary_composition_options(make_site(target), prepared_ctx)
+        copied_menu = _unary_composition_options(make_site(deepcopy(target)), prepared_ctx)
+        @test !isempty(original_menu)
+        @test copied_menu === original_menu
+    end
+
+    tree = AstTree(ConstNode(:seed))
+    rng = MersenneTwister(2000)
+    env = LambdaRegression.Mutations.MutationEnv(
+        rng,
+        FloatTy,
+        Dict{Symbol,TyLike}(),
+        tree,
+        nothing,
+        false,
+        IdDict{Any,Any}(),
+        LambdaRegression.Mutations.AdaptivePolicy(),
+        IdDict{DataType,LambdaRegression.Mutations.MutationStat}(),
+        LambdaRegression.Mutations.BloatPolicy(),
+    )
+    mutation = UnaryCompositionMutation()
+    @test is_site_eligible(mutation, prepared_site, env, prepared_ctx)
+    @test initial_menu === _unary_composition_options(prepared_site, prepared_ctx)
+    attempt_ctx = (; global_consts, global_consts_ty, composition_directory=directory)
+    @test apply(mutation, tree, prepared_site, env, attempt_ctx) === tree
+    @test initial_menu === _unary_composition_options(prepared_site, attempt_ctx)
+
+    struct PreparedSiblingGenerator <: AbstractReplacementGenerator end
+    function LambdaRegression.Mutations.generate_replacement(
+        ::PreparedSiblingGenerator,
+        site::LambdaRegression.Mutations.Site,
+        ::LambdaRegression.Mutations.MutationEnv,
+        ::NamedTuple,
+        ::NamedTuple,
+    )
+        return GenerationResult(
+            AstTree(ConstNode(:SIBLING)),
+            site.ty,
+            Dict{Symbol,Any}(),
+            Dict{Symbol,TyLike}(),
+            Dict{Symbol,Any}(),
+        )
+    end
+
+    binary_mutation = BinaryCompositionMutation(
+        replacement_generator=PreparedSiblingGenerator(),
+    )
+    binary_site = make_site(FloatTy)
+    initial_binary_menu = _binary_composition_options(binary_site, prepared_ctx)
+    @test is_site_eligible(binary_mutation, binary_site, env, prepared_ctx)
+    @test initial_binary_menu === _binary_composition_options(binary_site, prepared_ctx)
+    binary_tree = AstTree(ConstNode(:seed))
+    binary_local_consts = Dict{Symbol,Any}()
+    binary_local_types = Dict{Symbol,TyLike}()
+    binary_attempt_ctx = (
+        ; global_consts,
+        global_consts_ty,
+        local_consts=binary_local_consts,
+        local_consts_ty=binary_local_types,
+        composition_directory=directory,
+    )
+    @test apply(binary_mutation, binary_tree, binary_site, env, binary_attempt_ctx) === binary_tree
+    @test initial_binary_menu === _binary_composition_options(binary_site, binary_attempt_ctx)
+
+    second_directory = _prepare_composition_directory(global_consts, global_consts_ty)
+    second_ctx = (; global_consts, global_consts_ty, composition_directory=second_directory)
+    second_menu = _unary_composition_options(prepared_site, second_ctx)
+    @test second_directory !== directory
+    @test second_menu !== initial_menu
+
+    @test Set(keys(global_consts_ty)) == Set(keys(global_consts)) ∪ Set([:MISSING_RUNTIME])
+    @test global_consts[:U_OPEN_END] === :U_OPEN_END
+    @test all(global_consts_ty[name] === ty for (name, ty) in original_type_refs)
+    @test open_shared.instance === nothing
+    @test open_result.instance === nothing
+    @test scheme_var.instance === nothing
 end
 
 @testitem "Mutations UnaryCompositionMutation wraps a typed endomorphism" setup=[MutBaseImports] begin

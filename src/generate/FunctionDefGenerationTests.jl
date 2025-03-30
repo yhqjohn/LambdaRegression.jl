@@ -894,8 +894,84 @@ end
         0,
         query,
     )
-    @test length(scope_plans) == 1
-    @test only(scope_plans).weight ≈ 5
+    # Descriptors are not a feasibility-filtered menu. The original f1 x
+    # forced route and a generic placement keep f1's total head weight; f2
+    # can also contain both obligations in its one child, as f2 (f1 x).
+    first_head_plans = [plan for plan in scope_plans if plan.rule.index == 1]
+    second_head_plans = [plan for plan in scope_plans if plan.rule.index == 2]
+    @test sum(plan.weight for plan in first_head_plans) ≈ 5
+    @test sum(plan.weight for plan in second_head_plans) ≈ 5
+    @test any(plan -> plan.forced == [0], first_head_plans)
+    @test any(plan -> plan.forced == [-1], first_head_plans)
+    @test !isempty(second_head_plans)
+    observed_joint_child = Ref(false)
+    for plan in second_head_plans, seed in 1:16
+        derivation = CG._materialize_fast_required_scope_application(
+            CG.DerivationSamplingState(Random.Xoshiro(seed), 32), weighted_relation,
+            plan, scope, 4, 0, 1, 0, false, query)
+        derivation === nothing && continue
+        @test CG.derivation_uses_scope_binder(derivation, 1)
+        @test CG._uses_scope_prefix(derivation, 1, 0)
+        @test CG._generation_requirements_satisfied(derivation, query)
+        observed_joint_child[] = true
+    end
+    @test observed_joint_child[]
+    @test CG._fast_required_scope_application_plans(
+        weighted_relation,
+        FloatTy,
+        scope,
+        5,
+        1,
+        0,
+        query,
+    ) === scope_plans
+
+    changed_depth_plans = CG._fast_required_scope_application_plans(
+        weighted_relation,
+        FloatTy,
+        scope,
+        4,
+        1,
+        0,
+        query,
+    )
+    @test changed_depth_plans !== scope_plans
+    changed_requirement_query = CG.GenerationQuery(
+        FloatTy;
+        scope_tys=scope,
+        depth_left=5,
+        provider_fuel=5,
+        node_budget=32,
+        requirements=(CG.UsesScopeBinder(2),),
+    )
+    changed_requirement_plans = CG._fast_required_scope_application_plans(
+        weighted_relation,
+        FloatTy,
+        scope,
+        5,
+        1,
+        0,
+        changed_requirement_query,
+    )
+    @test changed_requirement_plans !== scope_plans
+    changed_budget_query = CG.GenerationQuery(
+        FloatTy;
+        scope_tys=scope,
+        depth_left=5,
+        provider_fuel=5,
+        node_budget=31,
+        requirements=(CG.UsesScopeBinder(1),),
+    )
+    changed_budget_plans = CG._fast_required_scope_application_plans(
+        weighted_relation,
+        FloatTy,
+        scope,
+        5,
+        1,
+        0,
+        changed_budget_query,
+    )
+    @test changed_budget_plans !== scope_plans
 
     nested_scope = Ty[
         FloatTy,
@@ -1571,8 +1647,241 @@ end
         0,
     )
 
-    entry = only(CG.derivation_metadata(derivation)[:function_defs])
+    metadata = CG.derivation_metadata(derivation)
+    @test CG._derivation_metadata_tree_eligible(metadata)
+    copied = CG._copy_derivation_metadata(metadata)
+    copied_again = CG._copy_derivation_metadata(metadata)
+    @test isequal(metadata, copied)
+    @test isequal(metadata, copied_again)
+    @test copied !== metadata
+    @test copied[:function_defs] !== metadata[:function_defs]
+    @test copied[:function_defs] !== copied_again[:function_defs]
+
+    entry = only(metadata[:function_defs])
+    @test isequal(entry, Dict{Symbol,Any}(
+        :target => LambdaRegression.TypeSystem.typekey(F),
+        :self_index => 0,
+        :self_binder => :debruijn,
+        :base_signature => CG.derivation_signature(body),
+        :body_signature => CG.derivation_signature(body),
+        :provider_capabilities => derivation.capabilities,
+        :used_capabilities => CG._used_functiondef_capabilities(derivation),
+        :nesting_remaining => 0,
+    ))
+    attached = Dict{Symbol,Any}()
+    CG._attach_derivation_metadata!(attached, derivation)
+    @test isequal(attached[:derivation_metadata], metadata)
+
+    copied_entry = only(copied[:function_defs])
+    copied_entry[:self_index] = 7
+    @test entry[:self_index] == 0
+    @test only(copied_again[:function_defs])[:self_index] == 0
     @test :randomness in entry[:used_capabilities]
+end
+
+@testitem "FunctionDef metadata copy falls back for opaque and aliased values" begin
+    using Test
+    using LambdaRegression: CanonicalGeneration
+
+    CG = CanonicalGeneration
+
+    text = string("provider-metadata-", repeat("x", 128), "-string")
+    @test !CG._derivation_metadata_tree_eligible(text)
+    expected_text = deepcopy(text)
+    copied_text = CG._copy_derivation_metadata(text)
+    @test isequal(copied_text, expected_text)
+    @test pointer(copied_text) != pointer(text)
+
+    struct CustomIsbitsMetadataLeaf
+        value::Int
+    end
+    custom_isbits = CustomIsbitsMetadataLeaf(7)
+    @test isbitstype(typeof(custom_isbits))
+    @test !CG._derivation_metadata_tree_eligible(custom_isbits)
+    @test CG._copy_derivation_metadata(custom_isbits) === custom_isbits
+
+    shared = Any[:shared]
+    aliased = Dict{Symbol,Any}(:left => shared, :right => shared)
+    @test !CG._derivation_metadata_tree_eligible(aliased)
+    copied_aliases = CG._copy_derivation_metadata(aliased)
+    @test isequal(copied_aliases, aliased)
+    @test copied_aliases[:left] === copied_aliases[:right]
+    @test copied_aliases[:left] !== shared
+
+    cyclic = Dict{Symbol,Any}()
+    cyclic[:self] = cyclic
+    @test !CG._derivation_metadata_tree_eligible(cyclic)
+    copied_cycle = CG._copy_derivation_metadata(cyclic)
+    @test copied_cycle[:self] === copied_cycle
+
+    owner = Vector{Any}(undef, 4)
+    owner .= Any[:one, :two, :three, :four]
+    shared_view = view(owner, 2:3)
+    view_tree = Dict{Symbol,Any}(:owner => owner, :view => shared_view)
+    @test !CG._derivation_metadata_tree_eligible(view_tree)
+    copied_view_tree = CG._copy_derivation_metadata(view_tree)
+    @test parent(copied_view_tree[:view]) === copied_view_tree[:owner]
+
+    spare_capacity = Vector{Any}(undef, 8)
+    resize!(spare_capacity, 2)
+    spare_capacity .= Any[:one, :two]
+    @test !CG._derivation_metadata_tree_eligible(Dict{Symbol,Any}(:spare => spare_capacity))
+
+    partially_assigned = Vector{Any}(undef, 2)
+    partially_assigned[1] = :present
+    @test !CG._derivation_metadata_tree_eligible(Dict{Symbol,Any}(:partial => partially_assigned))
+    copied_partial = CG._copy_derivation_metadata(Dict{Symbol,Any}(:partial => partially_assigned))
+    @test copied_partial[:partial][1] === :present
+    @test !isassigned(copied_partial[:partial], 2)
+
+    mutable struct OpaqueMetadataLeaf
+        payload::Any
+    end
+    const OPAQUE_DEEPCOPY_CALLS = Ref(0)
+    function Base.deepcopy_internal(value::OpaqueMetadataLeaf, memo::IdDict)
+        OPAQUE_DEEPCOPY_CALLS[] += 1
+        haskey(memo, value) && return memo[value]
+        copied = OpaqueMetadataLeaf(nothing)
+        memo[value] = copied
+        copied.payload = Base.deepcopy_internal(value.payload, memo)
+        return copied
+    end
+
+    opaque_payload = Any[:opaque]
+    opaque = OpaqueMetadataLeaf(opaque_payload)
+    opaque_tree = Dict{Symbol,Any}(
+        :shared => opaque_payload,
+        :opaque => opaque,
+        :opaque_alias => opaque,
+    )
+    @test !CG._derivation_metadata_tree_eligible(opaque_tree)
+    OPAQUE_DEEPCOPY_CALLS[] = 0
+    copied_opaque = CG._copy_derivation_metadata(opaque_tree)
+    @test OPAQUE_DEEPCOPY_CALLS[] > 0
+    @test isequal(copied_opaque[:shared], opaque_payload)
+    @test copied_opaque[:opaque] === copied_opaque[:opaque_alias]
+    @test copied_opaque[:opaque].payload === copied_opaque[:shared]
+    @test copied_opaque[:shared] !== opaque_payload
+end
+
+@testitem "CanonicalGeneration metadata values copy independently per merge key" begin
+    using Test
+    using LambdaRegression: CanonicalGeneration
+
+    CG = CanonicalGeneration
+    struct SharedMetadataValueDerivation <: CG.CoreDerivation
+        key::Symbol
+        value::Vector{Any}
+    end
+    CG.derivation_metadata(derivation::SharedMetadataValueDerivation) =
+        Dict{Symbol,Any}(derivation.key => derivation.value)
+
+    shared = Any[:shared]
+    merged = CG._merge_derivation_metadata((
+        SharedMetadataValueDerivation(:left, shared),
+        SharedMetadataValueDerivation(:right, shared),
+    ))
+    @test isequal(merged[:left], shared)
+    @test isequal(merged[:right], shared)
+    @test merged[:left] !== shared
+    @test merged[:right] !== shared
+    @test merged[:left] !== merged[:right]
+end
+
+@testitem "Scoped generation material ownership and relation borrowing" begin
+    using Test
+    using LambdaRegression: CanonicalGeneration
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, TyLike
+
+    CG = CanonicalGeneration
+    config = CG.GenerationConfig(providers=(CG.ContextHeadProvider(),))
+    values = Dict{Symbol,Any}(:lifecycle_local => 2.0)
+    types = Dict{Symbol,TyLike}(:lifecycle_local => FloatTy)
+    inputs = (;
+        global_consts=Dict{Symbol,Any}(:lifecycle_global => true),
+        global_consts_ty=Dict{Symbol,TyLike}(:lifecycle_global => BoolTy),
+        presets=Dict{Symbol,Any}(), preset_types=Dict{Symbol,TyLike}(),
+    )
+    inspect = (relation, output_values, output_types) ->
+        (; relation, output_values, output_types)
+    @test CG._uses_lazy_sampling(config)
+    @test CG._scoped_lazy_relation_cache_key(
+        config.weights, inputs.global_consts, inputs.global_consts_ty,
+        values, types, inputs.presets, inputs.preset_types,
+        config.providers, config.argument_planner, config.guarded_expansion_depth,
+    ) !== nothing
+    first = CG._with_scoped_generation_materials(inspect, config;
+        inputs..., local_consts=values, local_consts_ty=types)
+    second = CG._with_scoped_generation_materials(inspect, config;
+        inputs..., local_consts=copy(values), local_consts_ty=copy(types))
+    @test first.relation === second.relation
+    @test first.output_values !== values
+    @test first.output_types !== types
+    @test first.output_values !== second.output_values
+    @test first.output_types !== second.output_types
+    @test second.relation.local_consts === second.output_values
+    @test second.relation.local_consts_ty === second.output_types
+    @test first.output_values == second.output_values == values
+
+    masked = CG._with_scoped_generation_materials(inspect, config;
+        inputs..., local_consts=values, local_consts_ty=types,
+        source_local_consts=false, capability_mask=(:function_def,))
+    @test isempty(masked.relation.local_consts)
+    @test isempty(masked.relation.local_consts_ty)
+    @test masked.output_values == values
+    @test masked.output_types == types
+    @test masked.relation.capability_mask == (:function_def,)
+
+    private = CG._with_scoped_generation_materials(inspect, config;
+        inputs..., local_consts=values, local_consts_ty=types, cache_relation=false)
+    @test private.relation !== first.relation
+    @test private.relation.local_consts !== private.output_values
+    @test private.relation.local_consts == private.output_values
+    private_masked = CG._with_scoped_generation_materials(inspect, config;
+        inputs..., local_consts=values, local_consts_ty=types,
+        source_local_consts=false, cache_relation=false)
+    @test isempty(private_masked.relation.local_consts)
+    @test isempty(private_masked.relation.local_consts_ty)
+    @test private_masked.output_values == values
+    @test private_masked.output_types == types
+
+    float_globals = merge(inputs, (;
+        global_consts=Dict{Symbol,Any}(:lifecycle_global => 1.0),
+        global_consts_ty=Dict{Symbol,TyLike}(:lifecycle_global => FloatTy),
+    ))
+    @test CG._scoped_lazy_relation_cache_key(
+        config.weights, float_globals.global_consts, float_globals.global_consts_ty,
+        values, types, inputs.presets, inputs.preset_types,
+        config.providers, config.argument_planner, config.guarded_expansion_depth,
+    ) === nothing
+    noncacheable = CG._with_scoped_generation_materials(inspect, config;
+        float_globals..., local_consts=values, local_consts_ty=types)
+    @test noncacheable.relation.local_consts !== noncacheable.output_values
+    @test noncacheable.output_values == values
+end
+
+@testitem "Scoped generation borrowing releases locks on constructor failure" begin
+    using Test
+    using LambdaRegression: CanonicalGeneration
+    using LambdaRegression.TypeSystem: BoolTy, TyLike
+
+    CG = CanonicalGeneration
+    config = CG.GenerationConfig(providers=(CG.ContextHeadProvider(),))
+    entry = Ref{Any}()
+    @test_throws ErrorException CG._with_scoped_generation_materials(config;
+        global_consts=Dict{Symbol,Any}(:lifecycle_failure => true),
+        global_consts_ty=Dict{Symbol,TyLike}(:lifecycle_failure => BoolTy),
+        local_consts=Dict{Symbol,Any}(), local_consts_ty=Dict{Symbol,TyLike}(),
+        presets=Dict{Symbol,Any}(), preset_types=Dict{Symbol,TyLike}(),
+    ) do relation, output_values, output_types
+        entry[] = only(filter(item -> item.relation === relation,
+            collect(values(CG._SCOPED_LAZY_RELATION_CACHE))))
+        @test islocked(entry[].lock)
+        @test relation.local_consts === output_values
+        @test relation.local_consts_ty === output_types
+        error("bounded constructor failure")
+    end
+    @test !islocked(entry[].lock)
 end
 
 @testitem "FunctionDef verification inspects actual FunctionDef nodes" begin
@@ -1898,4 +2207,715 @@ end
         requirements=inherited,
     )
     @test any(requirement -> requirement === inherited_budget, nested_query.requirements)
+end
+
+@testitem "FunctionDef signature predicates preserve ordered binder semantics" begin
+    using Test
+    using LambdaRegression: CanonicalGeneration
+
+    CG = CanonicalGeneration
+
+    struct OffsetSignatureArgs <: AbstractVector{Any}
+        values::Vector{Any}
+        visited::Vector{Int}
+    end
+    Base.size(values::OffsetSignatureArgs) = (length(values.values),)
+    Base.axes(values::OffsetSignatureArgs) = (0:(length(values.values) - 1),)
+    function Base.getindex(values::OffsetSignatureArgs, index::Int)
+        index in axes(values, 1) || throw(BoundsError(values, index))
+        push!(values.visited, index)
+        return values.values[index + 1]
+    end
+    function Base.iterate(values::OffsetSignatureArgs, state=first(axes(values, 1)))
+        state > last(axes(values, 1)) && return nothing
+        return (values[state], state + 1)
+    end
+
+    var(index) = (:var, index, :ty)
+    eta_one = (:lambda, :arg, (:scope_application, 1, :fun, (var(0),)))
+    eta_two = (
+        :lambda,
+        :first_arg,
+        (:lambda, :second_arg, (:scope_application, 2, :fun, (var(1), var(0)))),
+    )
+    @test CG._is_eta_forwarding_signature(eta_one, 0)
+    @test CG._is_eta_forwarding_signature(eta_two, 0)
+    @test !CG._is_eta_forwarding_signature((:function_def, :name, :type, eta_one), 0)
+    @test !CG._is_eta_forwarding_signature(
+        (:lambda, :arg, (:scope_application, 1, :fun, (var(1),))),
+        0,
+    )
+
+    unchanged = (:scope_application, 1, :fun, (var(0),))
+    changed = (:scope_application, 1, :fun, (var(1),))
+    @test CG._has_unchanged_self_call_signature(unchanged, 1, [0])
+    @test CG._has_unchanged_self_call_signature((:head, :global, :f, :type, (unchanged,)), 1, [0])
+    @test !CG._has_unchanged_self_call_signature(changed, 1, [0])
+    @test !CG._has_unchanged_self_call_signature((:function_def, :name, :type, unchanged), 1, [0])
+    @test !CG._has_unchanged_self_call_signature(
+        (:lambda, :arg, (:scope_application, 1, :fun, ())),
+        1,
+        [0],
+    )
+
+    offset_args = OffsetSignatureArgs(Any[var(0)], Int[])
+    offset_unchanged = (:scope_application, 1, :fun, offset_args)
+    @test CG._has_unchanged_self_call_signature(offset_unchanged, 1, [0])
+    @test offset_args.visited == [0]
+
+    safe_marker = (:safe_list_access, :UNCONS_CASE, :list, :result, :source, :body, :fallback)
+    early_arguments = OffsetSignatureArgs(Any[var(0), safe_marker, var(2)], Int[])
+    early_call = (:scope_application, 0, :fun, early_arguments)
+    @test CG._has_unguarded_safe_list_recursive_argument(early_call, 0)
+    @test early_arguments.visited == [0, 1]
+
+    safe_from_source = (
+        :safe_list_access, :UNCONS_CASE, :list, :result,
+        (:scope_application, 0, :fun, (safe_marker,)),
+        :body_not_visited,
+        :fallback_not_visited,
+    )
+    @test CG._has_unguarded_safe_list_recursive_argument(safe_from_source, 0)
+    guarded_body_call = (:scope_application, 2, :fun, (safe_marker,))
+    safe_in_guarded_body = (
+        :safe_list_access, :UNCONS_CASE, :list, :result,
+        :source,
+        guarded_body_call,
+        :fallback,
+    )
+    @test !CG._has_unguarded_safe_list_recursive_argument(safe_in_guarded_body, 0)
+    recursive_fallback = (:scope_application, 0, :fun, (var(0),))
+    safe_in_fallback = (
+        :safe_list_access, :UNCONS_CASE, :list, :result,
+        :source,
+        :body,
+        recursive_fallback,
+    )
+    @test CG._has_unguarded_safe_list_recursive_argument(safe_in_fallback, 0)
+
+    for malformed in (
+        (:lambda, :arg),
+        (:scope_application, 0, :fun),
+        (:unknown, eta_one),
+    )
+        @test !CG._is_eta_forwarding_signature(malformed, 0)
+        @test !CG._has_unchanged_self_call_signature(malformed, 0, [0])
+        @test !CG._has_unguarded_safe_list_recursive_argument(malformed, 0)
+    end
+end
+
+@testitem "Required-scope plan vectors preserve shape ownership and RNG" begin
+    using Test
+    using Random
+    using LambdaRegression: CanonicalGeneration
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, Ty, TyFun
+
+    CG = CanonicalGeneration
+
+    indices = Int[1, 2]
+    original_indices = copy(indices)
+    observed_placements = Set{Tuple{Int,Int}}()
+    for seed in 1:64
+        assigned = CG._distribute_scope_requirements(indices, 2, Random.Xoshiro(seed))
+        @test assigned isa Vector{Vector{Int}}
+        @test sort!(vcat(assigned...)) == original_indices
+        @test indices == original_indices
+
+        replayed = CG._distribute_scope_requirements(indices, 2, Random.Xoshiro(seed))
+        @test replayed == assigned
+        @test indices == original_indices
+
+        first_locations = findall(bucket -> 1 in bucket, assigned)
+        second_locations = findall(bucket -> 2 in bucket, assigned)
+        @test length(first_locations) == 1
+        @test length(second_locations) == 1
+        if length(first_locations) == 1 && length(second_locations) == 1
+            push!(observed_placements, (only(first_locations), only(second_locations)))
+        end
+    end
+    @test observed_placements == Set([(1, 1), (1, 2), (2, 1), (2, 2)])
+
+    empty_assignment = CG._distribute_scope_requirements(
+        Int[], 0, Random.Xoshiro(1))
+    @test empty_assignment isa Vector{Vector{Int}}
+    @test isempty(empty_assignment)
+    @test_throws ArgumentError CG._distribute_scope_requirements(
+        Int[1], 0, Random.Xoshiro(1))
+
+    app_relation = CG.CoreRelation(
+        providers=(CG.ContextHeadProvider(),),
+        weights=CG.GenerationWeights(default=0, variable=1, scope_application=1),
+    )
+    prefix_scope = Ty[FloatTy, TyFun(FloatTy, FloatTy), FloatTy]
+    prefix_query = CG.GenerationQuery(
+        FloatTy;
+        scope_tys=prefix_scope,
+        depth_left=5,
+        provider_fuel=5,
+        node_budget=64,
+        requirements=(CG.UsesScopeBinder(1), CG.UsesScopeBinder(2)),
+    )
+    prefix_plans = CG._fast_required_scope_application_plans(
+        app_relation,
+        FloatTy,
+        prefix_scope,
+        5,
+        1,
+        0,
+        prefix_query,
+    )
+    prefix_plan_index = findfirst(
+        plan -> !isempty(plan.exact_choices) && !isempty(plan.prefix_choices),
+        prefix_plans,
+    )
+    @test prefix_plan_index !== nothing
+    if prefix_plan_index !== nothing
+        prefix_plan = prefix_plans[prefix_plan_index]
+        @test prefix_plan.forced isa Vector{Int}
+        @test prefix_plan.exact_choices isa Vector{CG._RequiredScopeExactChoice}
+        @test prefix_plan.prefix_choices isa Vector{Int}
+        @test CG._fast_required_scope_application_plans(
+            app_relation, FloatTy, prefix_scope, 5, 1, 0, prefix_query,
+        ) === prefix_plans
+
+        saved_forced = copy(prefix_plan.forced)
+        saved_forced_vector = prefix_plan.forced
+        saved_exact_choices = prefix_plan.exact_choices
+        saved_indices = [choice.index for choice in prefix_plan.exact_choices]
+        saved_arguments = [copy(choice.arguments) for choice in prefix_plan.exact_choices]
+        saved_argument_vectors = [choice.arguments for choice in prefix_plan.exact_choices]
+        saved_prefix_choices = copy(prefix_plan.prefix_choices)
+        saved_prefix_vector = prefix_plan.prefix_choices
+        @test all(choice.arguments isa Vector{Int} for choice in prefix_plan.exact_choices)
+
+        CG._materialize_fast_required_scope_application(
+            CG.DerivationSamplingState(Random.Xoshiro(42), 64),
+            app_relation,
+            prefix_plan,
+            prefix_scope,
+            4,
+            0,
+            1,
+            0,
+            false,
+            prefix_query,
+        )
+
+        @test prefix_plan.forced === saved_forced_vector
+        @test prefix_plan.forced == saved_forced
+        @test prefix_plan.exact_choices === saved_exact_choices
+        @test [choice.index for choice in prefix_plan.exact_choices] == saved_indices
+        @test [choice.arguments for choice in prefix_plan.exact_choices] == saved_arguments
+        @test all(
+            prefix_plan.exact_choices[index].arguments === saved_argument_vectors[index]
+            for index in eachindex(saved_argument_vectors)
+        )
+        @test prefix_plan.prefix_choices === saved_prefix_vector
+        @test prefix_plan.prefix_choices == saved_prefix_choices
+    end
+end
+@testitem "SafeList plan caches use full structural keys" begin
+    using Test
+    using LambdaRegression: CanonicalGeneration
+    using LambdaRegression.TypeSystem: FloatTy, Ty, TyFun, typekey
+
+    CG = CanonicalGeneration
+    target = FloatTy
+    scope = Ty[FloatTy, FloatTy, FloatTy]
+    relation = CG.CoreRelation(
+        providers=(CG.ContextHeadProvider(),),
+        weights=CG.GenerationWeights(default=1, variable=1),
+    )
+    query(index, depth) = CG.GenerationQuery(
+        target;
+        scope_tys=scope,
+        depth_left=depth,
+        provider_fuel=depth,
+        node_budget=24,
+        requirements=(CG.UsesScopeBinder(index),),
+    )
+    known_key = CG._known_key(scope, target)
+
+    first_query = query(1, 5)
+    first_plans = CG._fast_required_productive_head_plans(
+        relation, target, scope, 5, first_query,
+    )
+    first_key = CG._StructuralKey((:fast_required_productive_head_plans, known_key, 5, (1,)))
+    @test get(relation.sampling_options, first_key, nothing) === first_plans
+    @test !haskey(relation.sampling_options, first_key.value)
+    @test CG._fast_required_productive_head_plans(relation, target, scope, 5, first_query) === first_plans
+
+    second_query = query(2, 5)
+    second_plans = CG._fast_required_productive_head_plans(
+        relation, target, scope, 5, second_query,
+    )
+    second_key = CG._StructuralKey((:fast_required_productive_head_plans, known_key, 5, (2,)))
+    @test second_plans !== first_plans
+    @test get(relation.sampling_options, second_key, nothing) === second_plans
+    deeper_plans = CG._fast_required_productive_head_plans(relation, target, scope, 6, query(1, 6))
+    deeper_key = CG._StructuralKey((:fast_required_productive_head_plans, known_key, 6, (1,)))
+    @test deeper_plans !== first_plans
+    @test get(relation.sampling_options, deeper_key, nothing) === deeper_plans
+
+    catalog = CG._relation_catalog(relation, target, scope)
+    rules_key = CG._StructuralKey((:productive_rules_for_target, known_key, typekey(target)))
+    rules = CG._productive_rules_for_target(relation, catalog, known_key, target)
+    @test get(relation.sampling_options, rules_key, nothing) === rules
+    @test CG._productive_rules_for_target(relation, catalog, known_key, target) === rules
+    higher_target = TyFun(FloatTy, FloatTy)
+    higher_catalog_key = CG._known_key(scope, higher_target)
+    higher_catalog = CG._relation_catalog(relation, higher_target, scope)
+    higher_rules_key = CG._StructuralKey((
+        :productive_rules_for_target,
+        higher_catalog_key,
+        typekey(higher_target),
+    ))
+    higher_rules = CG._productive_rules_for_target(
+        relation,
+        higher_catalog,
+        higher_catalog_key,
+        higher_target,
+    )
+    @test higher_rules !== rules
+    @test get(relation.sampling_options, higher_rules_key, nothing) === higher_rules
+
+    first_split = CG._fast_split_requirement_head_plans(
+        relation, target, scope, 5, 1, 0, first_query,
+    )
+    split_key = CG._StructuralKey((:fast_split_requirement_head_plans, known_key, 5, (0,), (1,)))
+    @test get(relation.sampling_options, split_key, nothing) === first_split
+    @test CG._fast_split_requirement_head_plans(
+        relation, target, scope, 5, 1, 0, first_query,
+    ) === first_split
+    second_split = CG._fast_split_requirement_head_plans(
+        relation, target, scope, 5, 1, 0, second_query,
+    )
+    second_split_key = CG._StructuralKey((:fast_split_requirement_head_plans, known_key, 5, (0,), (2,)))
+    @test second_split !== first_split
+    @test get(relation.sampling_options, second_split_key, nothing) === second_split
+end
+
+@testitem "CanonicalGeneration cache keys preserve ordered scope tuples" begin
+    using Test
+    using LambdaRegression: CanonicalGeneration
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, Ty, TyArray, TyFun, TyList, TyMu, TyNat,
+        make_tyvar_factory, typekey
+
+    CG = CanonicalGeneration
+    recursive_var = make_tyvar_factory()(0)
+    recursive = TyMu(
+        recursive_var,
+        TyFun(TyFun(FloatTy, BoolTy), TyFun(recursive_var, TyList(FloatTy))),
+    )
+    nested = TyFun(TyList(BoolTy), TyArray(TyNat(3), TyFun(FloatTy, recursive)))
+    vector_scope = Ty[FloatTy, BoolTy, nested, recursive]
+    long_vector_scope = Ty[vector_scope[mod1(index, length(vector_scope))] for index in 1:40]
+    scopes = (
+        Ty[],
+        (),
+        (FloatTy,),
+        vector_scope,
+        (FloatTy, nested, recursive),
+        long_vector_scope,
+        Tuple(long_vector_scope),
+    )
+
+    providers = (CG.ContextHeadProvider(),)
+    relation = CG.CoreRelation(
+        providers=providers,
+        weights=CG.GenerationWeights(default=1),
+    )
+    target = TyFun(FloatTy, recursive)
+
+    for scope in scopes
+        original_entries = collect(scope)
+        old_typekeys = Tuple(typekey.(scope))
+        old_cache_keys = Tuple(CG._cache_type_key.(scope))
+
+        typekeys = CG._scope_typekeys(scope)
+        cache_keys = CG._scope_typekeys(scope, CG._cache_type_key)
+
+        @test typekeys == old_typekeys
+        @test isequal(typekeys, old_typekeys)
+        @test hash(typekeys) == hash(old_typekeys)
+        @test cache_keys == old_cache_keys
+        @test isequal(cache_keys, old_cache_keys)
+        @test hash(cache_keys) == hash(old_cache_keys)
+        @test length(typekeys) == length(scope)
+        @test length(cache_keys) == length(scope)
+        @test all(scope[index] === original_entries[index] for index in eachindex(original_entries))
+
+        query = CG.GenerationQuery(
+            target;
+            scope_tys=scope,
+            depth_left=3,
+            guarded_left=1,
+            provider_fuel=2,
+            node_budget=16,
+        )
+        old_query_scope_key = Tuple(CG._cache_type_key.(query.scope_tys))
+        expected_query_key = (
+            :generation_query,
+            query.capability_mask,
+            CG._cacheable_providers_key(providers),
+            CG._cache_type_key(query.target_ty),
+            old_query_scope_key,
+            query.depth_left,
+            query.guarded_left,
+            query.provider_fuel,
+            query.node_budget,
+            CG._rigid_demand_key(query),
+            CG._cacheable_requirements_key(query.requirements),
+        )
+        @test CG._generation_query_cache_key(query, providers) == expected_query_key
+
+        effective = CG._effective_generation_query(relation, query)
+        expected_witness_key = (
+            :known_witness,
+            CG._cache_type_key(effective.target_ty),
+            Tuple(CG._cache_type_key.(effective.scope_tys)),
+            effective.depth_left,
+            effective.capability_mask,
+            CG._weights_key(relation.weights),
+            relation.guarded_expansion_depth,
+            CG._cacheable_global_consts_key(relation.global_consts, relation.global_consts_ty),
+            CG._cacheable_local_context_key(relation.local_consts, relation.local_consts_ty),
+            CG._cacheable_providers_key(CG._admitted_providers(relation.providers, effective.capability_mask)),
+            CG._forbidden_scope_binders(effective),
+        )
+        @test CG._known_witness_cache_key(relation, query) == expected_witness_key
+    end
+end
+@testitem "FunctionDef leading parameter identity survives later local binders" begin
+    using Test
+    using LambdaRegression.TypeSystem: TyFun, FloatTy, Ty
+    CG = LambdaRegression.CanonicalGeneration
+
+    function_ty = TyFun(FloatTy, FloatTy)
+    root = CG.GenerationQuery(function_ty; scope_tys=(function_ty,), depth_left=4,
+        node_budget=12, requirements=(CG.FunctionDefSelfBinder(0), CG.CallsScopeBinder(0)))
+    first = CG._derive_generation_query(root; target_ty=FloatTy,
+        added_scope_tys=(FloatTy,), depth_left=3)
+    leading = CG._advance_functiondef_prefix(first)
+    marker = only(r for r in leading.requirements if r isa CG.FunctionDefSelfBinder)
+    @test (marker.index, marker.leading_parameters, marker.prefix_open) == (1, 1, true)
+
+    closed = CG._close_functiondef_prefix(leading)
+    local_scope = CG._derive_generation_query(closed; added_scope_tys=(FloatTy, FloatTy),
+        depth_left=2)
+    marker = only(r for r in local_scope.requirements if r isa CG.FunctionDefSelfBinder)
+    @test (marker.index, marker.leading_parameters, marker.prefix_open) == (3, 1, false)
+    @test marker.index - 1 == 2 # original parameter, not either new local binder
+
+    later_lambda = CG._derive_generation_query(local_scope; added_scope_tys=(FloatTy,),
+        depth_left=1)
+    later_lambda = CG._advance_functiondef_prefix(later_lambda)
+    marker = only(r for r in later_lambda.requirements if r isa CG.FunctionDefSelfBinder)
+    @test (marker.index, marker.leading_parameters, marker.prefix_open) == (4, 1, false)
+    @test CG.generation_requirement_cache_key(marker) !=
+        CG.generation_requirement_cache_key(CG.FunctionDefSelfBinder(4))
+end
+
+@testitem "FunctionDef changed self argument uses a finite nonbare array root" begin
+    using Test, Random
+    using LambdaRegression.TypeSystem: Ty, TyArray, TyFun, TyList, TyNat, FloatTy
+    CG = LambdaRegression.CanonicalGeneration
+
+    array_ty = TyArray(TyNat(4), FloatTy)
+    self_ty = TyFun(array_ty, FloatTy)
+    scope = Ty[TyList(FloatTy), FloatTy, array_ty, self_ty] # tail, head, xs, self
+    marker = CG.FunctionDefSelfBinder(3, 1, false)
+    weights = CG.GenerationWeights(default=0, variable=1, constant=1,
+        array_source=1, amap=1, scope_application=1, constraint_evidence=1e12)
+    function relation()
+        CG.CoreRelation(
+            global_consts=Dict{Symbol,Any}(:SQR => LambdaRegression.Primitives.SQR),
+            global_consts_ty=Dict{Symbol,Any}(:SQR => TyFun(FloatTy, FloatTy)),
+            providers=(CG.ContextHeadProvider(), CG.AMapProvider()),
+            weights=weights,
+        )
+    end
+
+    query = CG.GenerationQuery(FloatTy; scope_tys=scope, depth_left=5,
+        provider_fuel=5, node_budget=16,
+        requirements=(CG.CallsScopeBinder(3), marker))
+    rule_relation = relation()
+    plans = CG._fast_required_scope_application_plans(
+        rule_relation, FloatTy, scope, 5, 0, 0, query)
+    self_plans = filter(plan -> plan.rule.index == 3, plans)
+    @test length(self_plans) == 1
+
+    if length(self_plans) == 1
+        state = CG.DerivationSamplingState(Random.Xoshiro(2000), 16)
+        @test state.completion.probability == 0.0
+        result = CG._materialize_fast_required_scope_application(
+            state, rule_relation, only(self_plans), scope, 4, 0, 0, 0, false, query)
+
+        @test result isa CG.ScopeApplicationDerivation
+        if result isa CG.ScopeApplicationDerivation
+            @test result.index == 3
+            @test CG.derivation_calls_scope_binder(result, 3)
+            argument = only(result.args)
+            @test !(argument isa CG.VariableDerivation && argument.index == 2)
+            @test argument isa CG.HeadApplicationDerivation
+            if argument isa CG.HeadApplicationDerivation
+                @test argument.head.name == :AMAP
+                @test argument.args[1] isa CG.ConstantDerivation
+                if argument.args[1] isa CG.ConstantDerivation
+                    @test argument.args[1].head.name == :SQR
+                end
+                @test argument.args[2] isa CG.VariableDerivation
+                if argument.args[2] isa CG.VariableDerivation
+                    @test argument.args[2].index == 2
+                end
+            end
+            @test CG.derivation_node_count(result) == 4
+            @test 16 - state.nodes_left == CG.derivation_node_count(result)
+        end
+        @test !state.completion.completing
+    end
+
+    # The nonbare AMAP certificate costs three nodes; with only one child
+    # node available, preparation reports :budget and the materializer keeps
+    # the ordinary self(xs) route instead of claiming a false certificate.
+    limited_relation = relation()
+    too_small = CG._prepare_finite_core_nonbare_certificate(
+        limited_relation, array_ty, scope, 4, 1, 2)
+    @test too_small.status == :budget
+    @test too_small.proven_cost == 3
+
+    limited_query = CG.GenerationQuery(FloatTy; scope_tys=scope, depth_left=5,
+        provider_fuel=5, node_budget=2,
+        requirements=(CG.CallsScopeBinder(3), marker))
+    limited_state = CG.DerivationSamplingState(Random.Xoshiro(2000), 2)
+    @test limited_state.completion.probability == 0.0
+    fallback = CG._sample_fast_required_scope_application_derivation(
+        limited_state, limited_relation, FloatTy, scope, 5, 0, 0, 0, false,
+        limited_query)
+    @test fallback isa CG.ScopeApplicationDerivation
+    if fallback isa CG.ScopeApplicationDerivation
+        @test fallback.index == 3
+        @test only(fallback.args) isa CG.VariableDerivation
+        if only(fallback.args) isa CG.VariableDerivation
+            @test only(fallback.args).index == 2
+        end
+        @test CG.derivation_node_count(fallback) == 2
+        @test 2 - limited_state.nodes_left == CG.derivation_node_count(fallback)
+    end
+    @test !limited_state.completion.completing
+
+    # The complete non-bare plan keeps both same-typed mapper constants legal;
+    # ordinary replay can explore either while preserving charges and duties.
+    diverse_relation = CG.CoreRelation(
+        global_consts=Dict{Symbol,Any}(
+            :SQR => LambdaRegression.Primitives.SQR,
+            :CUBE => (x -> x * x * x),
+        ),
+        global_consts_ty=Dict{Symbol,Any}(
+            :SQR => TyFun(FloatTy, FloatTy),
+            :CUBE => TyFun(FloatTy, FloatTy),
+        ),
+        providers=(CG.ContextHeadProvider(), CG.AMapProvider()),
+        weights=weights,
+    )
+    prepared = CG._prepare_finite_core_nonbare_certificate(
+        diverse_relation, array_ty, scope, 4, 14, 2)
+    @test prepared isa NamedTuple
+    if prepared isa NamedTuple
+        @test prepared.status == :ready
+        if prepared.status == :ready
+            amap_roots = filter(option -> option.plan.kind == :head &&
+                option.plan.value.name == :AMAP, prepared.options)
+            @test !isempty(amap_roots)
+            if !isempty(amap_roots)
+                root = first(amap_roots)
+                @test root.weight > 0
+                @test root.cost == CG._evidence_plan_cost(prepared.world, root.plan)
+                @test length(root.plan.children) == 2
+                if length(root.plan.children) == 2
+                    mapper_fact = root.plan.children[1]
+                    mapper_menu = CG._evidence_menu!(prepared.world,
+                        diverse_relation, mapper_fact)
+                    mapper_choices = filter(plan -> plan.kind == :constant &&
+                        plan.value.name in (:SQR, :CUBE), mapper_menu)
+                    @test Set(plan.value.name for plan in mapper_choices) ==
+                        Set((:SQR, :CUBE))
+                    @test all(plan -> plan.weight > 0 &&
+                        CG._evidence_plan_cost(prepared.world, plan) == 1,
+                        mapper_choices)
+                end
+            end
+        end
+    end
+
+    sampled_mappers = Set{Symbol}()
+    for seed in 1:12
+        sample_state = CG.DerivationSamplingState(Random.Xoshiro(seed), 16)
+        sampled = CG._sample_preplanned_functiondef_call!(
+            sample_state, diverse_relation, query)
+        @test sampled isa CG.ScopeApplicationDerivation
+        if sampled isa CG.ScopeApplicationDerivation
+            @test sampled.index == 3
+            @test CG.derivation_result_type(sampled) == FloatTy
+            @test CG._generation_requirements_satisfied(sampled, query)
+            @test CG.derivation_calls_scope_binder(sampled, 3)
+            sampled_argument = only(sampled.args)
+            @test !(sampled_argument isa CG.VariableDerivation && sampled_argument.index == 2)
+            @test sampled_argument isa CG.HeadApplicationDerivation
+            if sampled_argument isa CG.HeadApplicationDerivation
+                @test sampled_argument.head.name == :AMAP
+                mapper = sampled_argument.args[1]
+                @test mapper isa CG.ConstantDerivation
+                if mapper isa CG.ConstantDerivation
+                    push!(sampled_mappers, mapper.head.name)
+                    @test mapper.head.name in (:SQR, :CUBE)
+                end
+            end
+            @test CG.derivation_node_count(sampled) == 16 - sample_state.nodes_left
+            @test sample_state.nodes_left >= 0
+            @test !sample_state.completion.completing
+        end
+    end
+    @test sampled_mappers == Set((:SQR, :CUBE))
+end
+
+@testitem "FunctionDef preplanned self call is consumed by a mixed head packet" begin
+    using Test, Random
+    using LambdaRegression.TypeSystem: Ty, TyArray, TyFun, TyNat, FloatTy
+    CG = LambdaRegression.CanonicalGeneration
+
+    array_ty = TyArray(TyNat(4), FloatTy)
+    self_ty = TyFun(array_ty, FloatTy)
+    scope = Ty[FloatTy, array_ty, self_ty] # head, xs, self
+    marker = CG.FunctionDefSelfBinder(2, 1, false)
+    evidence_weight = 1e12
+    weights = CG.GenerationWeights(default=0, variable=1, constant=1,
+        array_source=1, amap=1, scope_application=1, safe_list_access=1,
+        constraint_evidence=evidence_weight)
+    function make_relation()
+        CG.CoreRelation(
+            global_consts=Dict{Symbol,Any}(
+                :ADD => (x -> y -> x + y),
+                :SQR => LambdaRegression.Primitives.SQR,
+            ),
+            global_consts_ty=Dict{Symbol,Any}(
+                :ADD => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
+                :SQR => TyFun(FloatTy, FloatTy),
+            ),
+            providers=(CG.ContextHeadProvider(), CG.AMapProvider(),
+                CG.SafeListAccessProvider()),
+            weights=weights,
+        )
+    end
+    function packet_query(node_budget)
+        CG.GenerationQuery(FloatTy; scope_tys=scope, depth_left=5,
+            guarded_left=0, provider_fuel=5, node_budget,
+            requirements=(CG.UsesScopeBinder(0), CG.CallsScopeBinder(2), marker))
+    end
+    function add_rule(relation, query)
+        only(filter(rule -> rule.head.name == :ADD,
+            CG._certified_mixed_head_rules(relation, query)))
+    end
+    gate_passes(seed, count) = begin
+        rng = Random.Xoshiro(seed)
+        all(rand(rng) * (1.0 + evidence_weight) < evidence_weight for _ in 1:count)
+    end
+
+    relation = make_relation()
+    query = packet_query(16)
+    rule = add_rule(relation, query)
+    # The fixed allocations put head's Use in ADD's first child and self's
+    # Call in its second; safe_child=0 imposes no unrelated safe-list demand.
+    assigned = [Int[0], Int[2]]
+    @test gate_passes(733, 2)
+    state = CG.DerivationSamplingState(Random.Xoshiro(2000), 16)
+    result = CG._materialize_selected_mixed_head_packet(
+        state, relation, rule, query, 4, true, assigned, 0)
+    @test result isa CG.HeadApplicationDerivation
+    if result isa CG.HeadApplicationDerivation
+        @test result.head.name == :ADD
+        @test CG.derivation_uses_scope_binder(result.args[1], 0)
+        @test CG.derivation_calls_scope_binder(result.args[2], 2)
+        @test CG._generation_requirements_satisfied(result, query)
+        self_call = result.args[2]
+        @test self_call isa CG.ScopeApplicationDerivation
+        if self_call isa CG.ScopeApplicationDerivation
+            @test self_call.index == 2
+            argument = only(self_call.args)
+            @test !(argument isa CG.VariableDerivation && argument.index == 1)
+            @test argument isa CG.HeadApplicationDerivation
+            if argument isa CG.HeadApplicationDerivation
+                @test argument.head.name == :AMAP
+                @test argument.args[1] isa CG.ConstantDerivation
+                if argument.args[1] isa CG.ConstantDerivation
+                    @test argument.args[1].head.name == :SQR
+                end
+                @test argument.args[2] isa CG.VariableDerivation
+                if argument.args[2] isa CG.VariableDerivation
+                    @test argument.args[2].index == 1
+                end
+            end
+            @test CG.derivation_node_count(self_call) == 4
+        end
+        @test 16 - state.nodes_left == CG.derivation_node_count(result)
+    end
+
+    # This packet needs at least the ADD node, head variable, complete self
+    # call and a three-node nonbare array argument. Failure refunds the caller.
+    limited_relation = make_relation()
+    limited_query = packet_query(3)
+    limited_rule = add_rule(limited_relation, limited_query)
+    limited_state = CG.DerivationSamplingState(Random.Xoshiro(2000), 12)
+    @test CG._materialize_selected_mixed_head_packet(
+        limited_state, limited_relation, limited_rule, limited_query, 4, true,
+        assigned, 0) === nothing
+    @test limited_state.nodes_left == 12
+    @test !limited_state.completion.completing
+
+    # The isolated pure-Calls consumer succeeds with the same finite evidence
+    # and charges precisely the replayed full self call.
+    call_relation = make_relation()
+    call_query = CG.GenerationQuery(FloatTy; scope_tys=scope, depth_left=5,
+        provider_fuel=5, node_budget=12,
+        requirements=(CG.CallsScopeBinder(2), marker))
+    @test gate_passes(947, 1)
+    call_state = CG.DerivationSamplingState(Random.Xoshiro(8000), 12)
+    call = CG._sample_preplanned_functiondef_call!(call_state, call_relation, call_query)
+    @test call isa CG.ScopeApplicationDerivation
+    if call isa CG.ScopeApplicationDerivation
+        @test call.index == 2
+        argument = only(call.args)
+        @test !(argument isa CG.VariableDerivation && argument.index == 1)
+        @test argument isa CG.HeadApplicationDerivation
+        if argument isa CG.HeadApplicationDerivation
+            @test argument.head.name == :AMAP
+            @test argument.args[1] isa CG.ConstantDerivation
+            if argument.args[1] isa CG.ConstantDerivation
+                @test argument.args[1].head.name == :SQR
+            end
+            @test argument.args[2] isa CG.VariableDerivation
+            if argument.args[2] isa CG.VariableDerivation
+                @test argument.args[2].index == 1
+            end
+        end
+        @test CG.derivation_node_count(call) == 4
+        @test 12 - call_state.nodes_left == CG.derivation_node_count(call)
+    end
+
+    # xs is the only finite source array. Forbidding it makes the nonbare
+    # argument certificate unavailable, and the pure consumer fails finitely.
+    negative_relation = make_relation()
+    forbidden = (1,)
+    unavailable = CG._prepare_finite_core_nonbare_certificate(
+        negative_relation, array_ty, scope, 4, 10, 1; forbidden)
+    @test unavailable.status == :unavailable
+    negative_query = CG.GenerationQuery(FloatTy; scope_tys=scope, depth_left=5,
+        provider_fuel=5, node_budget=12,
+        requirements=(CG.CallsScopeBinder(2), CG.ForbidsScopeBinder(1), marker))
+    @test gate_passes(1181, 1)
+    negative_state = CG.DerivationSamplingState(Random.Xoshiro(2000), 12)
+    @test CG._sample_preplanned_functiondef_call!(
+        negative_state, negative_relation, negative_query) === nothing
+    @test negative_state.nodes_left == 12
+    @test !negative_state.completion.completing
 end

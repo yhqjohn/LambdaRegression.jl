@@ -58,6 +58,10 @@ export mutate_tree
 
 include("typedsearch/TypedSearch.jl")
 export TypedSearch
+include("analysis/ScalarRegions.jl")
+export ScalarRegions
+include("analysis/StructureDiversity.jl")
+export StructureDiversity
 include("regression/Regression.jl")
 using .Regression
 export Regression

@@ -7,6 +7,8 @@ Factories answer three questions: whether they support a concrete closed type,
 which available universe types they can provide, and how to build a runtime value
 for one supported type. They are ordinary opt-in context/factory tools rather
 than privileged generation rules.
+Scalar support queries use closed recursive equality; canonical semantic keys
+are retained for deduplicating the types a factory provides.
 
 Quickstart:
 
@@ -47,7 +49,7 @@ module ValueFactories
 
 import Random
 
-using ..TypeSystem: Ty, TyConst, TyList, TyArray, TyNat, TyLike, BoolTy, FloatTy, IntTy, semantic_typekey, typekey
+using ..TypeSystem: Ty, TyConst, TyRigid, TyList, TyArray, TyNat, TyLike, BoolTy, FloatTy, IntTy, isequal_mu, semantic_typekey, typekey
 using TestItems
 
 export AbstractValueFactory
@@ -107,12 +109,19 @@ factory_name(::IntArrayFactory) = :INT_ARRAY
 factory_name(::BoolArrayFactory) = :BOOL_ARRAY
 
 supports(::NilFactory, ty::Ty) = ty isa TyList
-supports(::FloatScalarFactory, ty::Ty) = semantic_typekey(ty) == semantic_typekey(FloatTy)
-supports(::IntScalarFactory, ty::Ty) = semantic_typekey(ty) == semantic_typekey(IntTy)
+supports(::FloatScalarFactory, ty::Ty) = _matches_scalar_type(ty, FloatTy)
+supports(::IntScalarFactory, ty::Ty) = _matches_scalar_type(ty, IntTy)
 supports(::FloatArrayFactory, ty::Ty) = _array_ends_in(ty, FloatTy)
 supports(::IntArrayFactory, ty::Ty) = _array_ends_in(ty, IntTy)
 supports(::BoolArrayFactory, ty::Ty) = _array_ends_in(ty, BoolTy)
 supports(::AbstractValueFactory, ::Ty) = false
+
+# Only the Boolean equality result is needed here, not a canonical graph key.
+# Built-in leaves keep their existing zero-graph path. Other inputs still pass
+# the equality kernel's complete closed/contractive graph validation.
+_matches_scalar_type(ty::Ty, elem::TyConst) = isequal_mu(ty, elem)
+_matches_scalar_type(ty::Union{TyConst,TyRigid,TyNat}, elem::TyConst) =
+    semantic_typekey(ty) == semantic_typekey(elem)
 
 function _array_ends_in(ty::Ty, elem::TyConst)
     ty isa TyArray || return false
@@ -122,7 +131,7 @@ function _array_ends_in(ty::Ty, elem::TyConst)
         tail.len isa TyNat || return false
         tail = tail.elem
     end
-    return semantic_typekey(tail) == semantic_typekey(elem)
+    return _matches_scalar_type(tail, elem)
 end
 
 function provided_types(factory::AbstractValueFactory, universe_types)
@@ -236,6 +245,57 @@ function _fresh_context_name(consts_ty::Dict{Symbol,TyLike}, base::Symbol)
         name = Symbol(base, "_", i)
         haskey(consts_ty, name) || return name
         i += 1
+    end
+end
+
+@testitem "ValueFactories scalar support retains recursive semantic identity" begin
+    using Test
+    using Random
+    using LambdaRegression: TypeSystem, ValueFactories
+    using LambdaRegression.TypeSystem: Ty, TyArray, TyConst, TyFun, TyList, TyMu, TyNat, TyRigid, FloatTy, IntTy, BoolTy, semantic_typekey
+
+    struct HostAtom <: Ty
+        name::Symbol
+    end
+    TypeSystem.type_constructor_tag(::HostAtom) = :Atom
+    TypeSystem.type_static_parameters(atom::HostAtom) = (atom.name,)
+    TypeSystem.rebuild_type(atom::HostAtom, ::Tuple{}) = atom
+
+    fresh = TypeSystem.make_tyvar_factory()
+    linked = fresh(0)
+    linked.instance = FloatTy
+    wrapped = TyMu(fresh(0), FloatTy)
+    recursive_binder = fresh(0)
+    recursive = TyMu(recursive_binder, TyFun(FloatTy, recursive_binder))
+    candidates = (FloatTy, IntTy, BoolTy, TyConst(:UserScalar), TyRigid(1), TyNat(3),
+        linked, wrapped, recursive, TyFun(FloatTy, FloatTy), TyList(FloatTy),
+        TyArray(TyNat(3), FloatTy), HostAtom(:Float), HostAtom(:Other))
+    for (factory, scalar) in ((ValueFactories.FloatScalarFactory(), FloatTy),
+            (ValueFactories.IntScalarFactory(), IntTy))
+        for ty in candidates
+            @test ValueFactories.supports(factory, ty) ==
+                (semantic_typekey(ty) == semantic_typekey(scalar))
+        end
+    end
+
+    @test ValueFactories.supports(ValueFactories.FloatArrayFactory(), TyArray(TyNat(3), wrapped))
+    @test ValueFactories.supports(ValueFactories.FloatArrayFactory(), TyArray(TyNat(3), HostAtom(:Float)))
+    @test !ValueFactories.supports(ValueFactories.FloatArrayFactory(), TyArray(TyNat(3), recursive))
+    @test !ValueFactories.supports(ValueFactories.FloatArrayFactory(), TyMu(fresh(0), TyArray(TyNat(3), FloatTy)))
+    @test ValueFactories.supports(ValueFactories.BoolArrayFactory(), TyArray(TyNat(2), BoolTy))
+    @test ValueFactories.supports(ValueFactories.IntArrayFactory(), TyArray(TyNat(2), IntTy))
+    factory = ValueFactories.FloatScalarFactory(mean=2, std=0)
+    @test ValueFactories.provided_types(factory, (wrapped, FloatTy, HostAtom(:Float))) == [wrapped]
+    @test ValueFactories.make_value(factory, wrapped, Random.MersenneTwister(1)) == 2.0
+    @test ValueFactories.make_value(ValueFactories.FloatArrayFactory(mean=2, std=0),
+        TyArray(TyNat(2), wrapped), Random.MersenneTwister(1)) == [2.0, 2.0]
+
+    open_var = fresh(0)
+    naked = TyMu(open_var, open_var)
+    for invalid in (open_var, naked, TyFun(FloatTy, open_var))
+        @test_throws ArgumentError ValueFactories.supports(factory, invalid)
+        @test_throws ArgumentError ValueFactories.supports(
+            ValueFactories.FloatArrayFactory(), TyArray(TyNat(2), invalid))
     end
 end
 

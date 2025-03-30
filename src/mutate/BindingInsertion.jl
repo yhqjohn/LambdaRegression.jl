@@ -523,24 +523,13 @@ end
 
 function _visible_scoped_binders(
     scoped::_ScopedTree,
-    path::AbstractVector{<:Integer},
+    site::Site,
 )
-    visible = Int[]
-    node = scoped.root
-    normalized_path = collect(Int, path)
-    for (offset, index) in pairs(normalized_path)
-        if node isa _ScopedAbs && index == 1
-            push!(visible, node.binder_id)
-            node = node.body
-        elseif node isa _ScopedApp && index == 1
-            node = node.func
-        elseif node isa _ScopedApp && index == 2
-            node = node.arg
-        else
-            return Err(_ScopedPathErr(normalized_path, offset))
-        end
-    end
-    return visible
+    index = scoped.index
+    index === nothing && return Err(NoEligibleSiteErr())
+    occurrence = _scoped_occurrence(scoped, site)
+    occurrence == 0 && return Err(NoEligibleSiteErr())
+    return reverse(visible_binder_ids(index, occurrence))
 end
 
 function _analysis_binding_host(
@@ -843,27 +832,50 @@ function _infer_binding_rhs_scheme(
     return TypeSystem.TyScheme(generalized, inferred_rhs)
 end
 
+function _resolve_generated_scoped_node(
+    node::AstNode,
+    binders::Vector{Int},
+    next_binder_id::Base.RefValue{Int},
+)
+    if node isa ConstNode
+        return _ScopedConst(node.name)
+    elseif node isa VarNode
+        return _ScopedFree(node.name)
+    elseif node isa IndexNode
+        0 <= node.index < length(binders) ||
+            return Err(_UnresolvedScopedIndexErr(node.index, length(binders)))
+        return _ScopedBound(binders[end - node.index])
+    elseif node isa AbsNode
+        binder_id = next_binder_id[]
+        next_binder_id[] += 1
+        push!(binders, binder_id)
+        body = _resolve_generated_scoped_node(node.body, binders, next_binder_id)
+        pop!(binders)
+        body isa Err && return body
+        return _ScopedAbs(binder_id, node.name, body)
+    elseif node isa AppNode
+        func = _resolve_generated_scoped_node(node.func, binders, next_binder_id)
+        func isa Err && return func
+        arg = _resolve_generated_scoped_node(node.arg, binders, next_binder_id)
+        arg isa Err && return arg
+        return _ScopedApp(func, arg)
+    end
+    return Err(_UnsupportedScopedNodeErr(typeof(node)))
+end
+
 function _resolve_generated_scoped_fragment(
     tree::AstTree,
     visible_binders::Vector{Int},
     next_binder_id::Int,
 )
-    state = _ScopedResolver(
+    next_id = Ref(next_binder_id)
+    root = _resolve_generated_scoped_node(
+        tree.root,
         copy(visible_binders),
-        next_binder_id,
-        IdDict{AstNode,_ScopedTerm}(),
-        IdDict{AstNode,Tuple{Union{Nothing,AstNode},Int}}(),
-        AstNode[],
-        IdDict{AstNode,Int}(),
-        Int[],
-        Int[],
-        Int[],
-        Int[],
-        Dict{Int,Vector{Int}}(),
+        next_id,
     )
-    root = _resolve_scoped_node(tree.root, state, nothing, 0)
     root isa Err && return root
-    return root, state.next_binder_id
+    return root, next_id[]
 end
 
 required_site_kinds(::GeneratedBindingInsertionMutation) = Symbol[:any]
@@ -975,7 +987,7 @@ function apply(
         _GeneratedBindingRHSMismatchErr(inferred_scheme, rhs_ty),
     )
 
-    visible_binders = _visible_scoped_binders(scoped, authoritative_host.path)
+    visible_binders = _visible_scoped_binders(scoped, authoritative_host)
     visible_binders isa Err && return visible_binders
     next_binder_id = scoped.next_binder_id
     resolved_rhs = _resolve_generated_scoped_fragment(
@@ -1915,6 +1927,38 @@ end
             generation_kwargs,
         )
     end
+end
+
+@testitem "Generated scoped fragments retain visible outer binders" begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, IndexNode
+    using LambdaRegression.Mutations:
+        _ScopedAbs, _ScopedApp, _ScopedBound, _resolve_generated_scoped_fragment
+    using LambdaRegression.Utils: Err
+
+    fragment = AstTree(AbsNode(
+        :local,
+        AppNode(IndexNode(1), AppNode(IndexNode(2), IndexNode(0))),
+    ))
+    resolved, next_id = _resolve_generated_scoped_fragment(fragment, [41, 42], 7)
+    @test resolved == _ScopedAbs(
+        7,
+        :local,
+        _ScopedApp(
+            _ScopedBound(42),
+            _ScopedApp(_ScopedBound(41), _ScopedBound(7)),
+        ),
+    )
+    @test next_id == 8
+
+    unresolved = _resolve_generated_scoped_fragment(
+        AstTree(IndexNode(2)),
+        [41, 42],
+        7,
+    )
+    @test unresolved isa Err
+    @test unresolved.value isa LambdaRegression.Mutations._UnresolvedScopedIndexErr
+    @test unresolved.value.depth == 2
 end
 
 @testitem "GeneratedBindingInsertionMutation adapters use the selected demand and host scope" setup=[BindingInsertionTestSupport] begin

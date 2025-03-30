@@ -1,36 +1,33 @@
 # Canonical Generation
 
-The finite canonical core decides closed targets in:
+Canonical generation first establishes finite availability and then constructs
+a witness for:
 
 ```text
 T ::= κ | T → T | List T | Array[n, T]
 ```
 
-It uses a finite closed type and length universe. Generalized demands are
-rigidified with fresh query atoms; those atoms may be matched by scoped binders
-or polymorphic schemes, but cannot be supplied as monomorphic values.
+The type universe, length universe, and typed contexts are finite and closed.
+Generalized demands are rigidified with fresh query atoms; monomorphic sources
+cannot invent values of those atoms.
 
 `Known(G, T)` is saturated from variables, constants, lambda abstraction,
-closed array sources, fixed constructors, and finite applications of available
-scoped function binders. `TOLIST` and `AMAP` require grounded array sources.
-Folds, `CONS`, identity, and conditionals are guarded expansions rather than
-first availability rules.
+closed arrays, fixed constructors, and finite applications of scoped function
+binders. `TOLIST` and `AMAP` require grounded array sources. `CONS`, folds,
+and recursive functions are guarded expansions.
 
-## Recursive function provider
+Each availability fact carries finite evidence for its premises. Evidence may
+be reused to prepare one-step construction plans, but it does not authorize an
+ungrounded cycle or require a shortest witness. Decision completeness,
+sampling support, and construction termination are separate properties.
 
-`FunctionDef` is a guarded provider attached to the finite core. For target
-function type `F`, it first requires a finite acyclic base witness while
-recursive providers and fixed-point sources are disabled. It then introduces
-one anonymous monomorphic self binder `self : F` and constructs a body of type
-`F` under the typed context.
+`FunctionDef` first requires an acyclic base witness with recursive providers
+disabled, then adds one monomorphic self binder and constructs its body under a
+shared finite budget. `AFOLDL` likewise requires a known source and
+accumulator; nested folds need an explicit decreasing resource measure.
 
-The base witness prevents recursion from proving its own first availability.
-It does not require the final body to use self, terminate, or be productive.
-The provider emits one definition node rather than unfolding a runtime fixed
-point. Nested definitions share finite node, depth, provider, and nesting
-budgets.
-
-The core rejects impossible targets before guarded construction. Successful
-construction emits explicit-binder syntax and lowers it to De Bruijn indices.
-Typing and generation remain separate from termination: a well-typed recursive
-result may diverge.
+The workflow is: close the finite universe, saturate `Known`, reject unknown
+targets, select a plan with known premises, complete its children under the
+chosen bounded policy, and lower explicit binders to indices. A completion
+policy may bound nodes, depth, fuel, or provider use; these controls do not
+weaken the finite impossibility decision.

@@ -119,34 +119,7 @@ function _derivation_has_self_call(
 end
 
 _derivation_has_self_call(derivation::CG.CoreDerivation, self_index::Int) =
-    _signature_has_self_call(CG.derivation_signature(derivation), self_index)
-
-function _signature_has_self_call(signature, self_index::Int)
-    signature isa Tuple || return false
-    isempty(signature) && return false
-    tag = signature[1]
-    if tag === :lambda
-        return length(signature) >= 3 &&
-            _signature_has_self_call(signature[3], self_index + 1)
-    elseif tag === :scope_application
-        length(signature) >= 4 || return false
-        arguments = signature[4]
-        signature[2] == self_index && !isempty(arguments) && return true
-        return any(argument -> _signature_has_self_call(argument, self_index), arguments)
-    elseif tag === :head
-        length(signature) >= 5 || return false
-        return any(argument -> _signature_has_self_call(argument, self_index), signature[5])
-    elseif tag === :safe_list_access
-        length(signature) >= 7 || return false
-        return _signature_has_self_call(signature[5], self_index) ||
-            _signature_has_self_call(signature[6], self_index + 2) ||
-            _signature_has_self_call(signature[7], self_index)
-    elseif tag === :function_def
-        length(signature) >= 4 || return false
-        return _signature_has_self_call(signature[4], self_index + 1)
-    end
-    return false
-end
+    CG._signature_calls_scope_binder(CG.derivation_signature(derivation), self_index)
 
 _is_direct_self_derivation(derivation::CG.VariableDerivation, self_index::Int) =
     derivation.index == self_index
@@ -415,11 +388,12 @@ function _is_direct_self_signature(signature, self_index::Int)
         signature[1] === :var && signature[2] == self_index
 end
 
-function _has_unguarded_safe_list_recursive_argument(
+Base.@noinline Base.@nospecializeinfer function _has_unguarded_safe_list_recursive_argument(
     signature,
     self_index::Int,
     safe_list_depth::Int=0,
 )
+    Base.@nospecialize signature
     signature isa Tuple || return false
     isempty(signature) && return false
     tag = signature[1]
@@ -433,10 +407,10 @@ function _has_unguarded_safe_list_recursive_argument(
         length(signature) >= 4 || return false
         arguments = signature[4]
         if safe_list_depth == 0 && signature[2] == self_index &&
-           any(argument -> CG._signature_contains(argument, :safe_list_access), arguments)
+           CG._scope_any(argument -> CG._signature_contains(argument, :safe_list_access), arguments)
             return true
         end
-        return any(
+        return CG._scope_any(
             argument -> _has_unguarded_safe_list_recursive_argument(
                 argument,
                 self_index,
@@ -446,7 +420,7 @@ function _has_unguarded_safe_list_recursive_argument(
         )
     elseif tag === :head
         length(signature) >= 5 || return false
-        return any(
+        return CG._scope_any(
             argument -> _has_unguarded_safe_list_recursive_argument(
                 argument,
                 self_index,
@@ -464,7 +438,7 @@ function _has_unguarded_safe_list_recursive_argument(
             signature[6],
             self_index + 2,
             safe_list_depth + 1,
-        ) || _signature_has_self_call(
+        ) || CG._signature_calls_scope_binder(
             signature[7],
             self_index,
         ) || _has_unguarded_safe_list_recursive_argument(
@@ -483,11 +457,12 @@ function _has_unguarded_safe_list_recursive_argument(
     return false
 end
 
-function _has_unchanged_self_call_signature(
+Base.@noinline Base.@nospecializeinfer function _has_unchanged_self_call_signature(
     signature,
     self_index::Int,
     parameter_indices::Vector{Int},
 )
+    Base.@nospecialize signature
     signature isa Tuple || return false
     isempty(signature) && return false
     tag = signature[1]
@@ -497,14 +472,27 @@ function _has_unchanged_self_call_signature(
         length(signature) >= 4 || return false
         arguments = signature[4]
         if signature[2] == self_index &&
-           length(arguments) == length(parameter_indices) &&
-           all(zip(arguments, parameter_indices)) do (argument, expected)
-               argument isa Tuple && length(argument) >= 2 &&
-                   argument[1] === :var && argument[2] == expected
-           end
-            return true
+           length(arguments) == length(parameter_indices)
+            unchanged = if arguments isa Tuple
+                matches = true
+                for position in 1:length(arguments)
+                    argument = arguments[position]
+                    if !(argument isa Tuple && length(argument) >= 2 &&
+                         argument[1] === :var && argument[2] == parameter_indices[position])
+                        matches = false
+                        break
+                    end
+                end
+                matches
+            else
+                all(zip(arguments, parameter_indices)) do (argument, expected)
+                    argument isa Tuple && length(argument) >= 2 &&
+                        argument[1] === :var && argument[2] == expected
+                end
+            end
+            unchanged && return true
         end
-        return any(
+        return CG._scope_any(
             argument -> _has_unchanged_self_call_signature(
                 argument,
                 self_index,
@@ -514,7 +502,7 @@ function _has_unchanged_self_call_signature(
         )
     elseif tag === :head
         length(signature) >= 5 || return false
-        return any(
+        return CG._scope_any(
             argument -> _has_unchanged_self_call_signature(
                 argument,
                 self_index,
@@ -543,7 +531,8 @@ function _has_unchanged_self_call_signature(
     return false
 end
 
-function _is_eta_forwarding_signature(signature, self_index::Int)
+Base.@noinline Base.@nospecializeinfer function _is_eta_forwarding_signature(signature, self_index::Int)
+    Base.@nospecialize signature
     current = signature
     lambda_count = 0
     while current isa Tuple && length(current) >= 3 && current[1] === :lambda
@@ -556,14 +545,20 @@ function _is_eta_forwarding_signature(signature, self_index::Int)
     current[2] == self_index + lambda_count || return false
     arguments = current[4]
     arguments isa Tuple && length(arguments) == lambda_count || return false
-    return all(enumerate(arguments)) do (position, argument)
+    for position in 1:lambda_count
+        argument = arguments[position]
         expected = lambda_count - position
         argument isa Tuple && length(argument) >= 2 &&
-            argument[1] === :var && argument[2] == expected
+            argument[1] === :var && argument[2] == expected || return false
     end
+    return true
 end
 
-function _is_unconditional_self_call_signature(signature, self_index::Int)
+Base.@noinline Base.@nospecializeinfer function _is_unconditional_self_call_signature(
+    signature,
+    self_index::Int,
+)
+    Base.@nospecialize signature
     current = signature
     lambda_count = 0
     while current isa Tuple && length(current) >= 3 && current[1] === :lambda
@@ -587,9 +582,16 @@ end
 
 struct FunctionDefSelfBinder <: CG.AbstractGenerationRequirement
     index::Int
-    function FunctionDefSelfBinder(index::Integer)
+    leading_parameters::Int
+    prefix_open::Bool
+    function FunctionDefSelfBinder(index::Integer, leading_parameters::Integer=0,
+        prefix_open::Bool=true)
         index >= 0 || throw(ArgumentError("FunctionDef self binder index must be nonnegative"))
-        return new(Int(index))
+        leading_parameters >= 0 || throw(ArgumentError(
+            "FunctionDef leading parameter count must be nonnegative"))
+        leading_parameters <= index || throw(ArgumentError(
+            "FunctionDef leading parameters cannot exceed self index"))
+        return new(Int(index), Int(leading_parameters), prefix_open)
     end
 end
 
@@ -610,16 +612,176 @@ end
 CG.rebase_generation_requirement(fuel::FunctionDefFuel, ::Integer) = fuel
 CG.rebase_generation_requirement(budget::FunctionDefAttemptBudget, ::Integer) = budget
 CG.rebase_generation_requirement(marker::FunctionDefSelfBinder, added::Integer) =
-    FunctionDefSelfBinder(marker.index + CG._checked_nonnegative_int(:added_binders, added))
+    FunctionDefSelfBinder(marker.index + CG._checked_nonnegative_int(:added_binders, added),
+        marker.leading_parameters, marker.prefix_open)
 CG.generation_requirement_affects_core_search(::FunctionDefFuel) = false
 CG.generation_requirement_affects_core_search(::FunctionDefAttemptBudget) = false
 CG.generation_requirement_affects_core_search(::FunctionDefSelfBinder) = false
 CG.generation_requirement_cache_key(fuel::FunctionDefFuel) =
     (:function_def_fuel, fuel.remaining)
 CG.generation_requirement_cache_key(budget::FunctionDefAttemptBudget) =
-    (:function_def_attempt_budget, budget.route_token.id)
+    # Menus include extension admission, which depends on mutable attempt
+    # balances. Cache the current immutable snapshot, never the ledger itself.
+    (:function_def_attempt_budget, budget.route_token.id, Tuple(budget.remaining_by_level))
 CG.generation_requirement_cache_key(marker::FunctionDefSelfBinder) =
-    (:function_def_self_binder, marker.index)
+    (:function_def_self_binder, marker.index, marker.leading_parameters, marker.prefix_open)
+
+"""Record one confirmed *leading* lambda parameter of the marked FunctionDef.
+
+Only a constructor which actually chooses a lambda in the still-open prefix may
+call this. A lambda nested later in an argument is not an original parameter.
+"""
+function _advance_functiondef_prefix(query::CG.GenerationQuery)
+    return _map_functiondef_markers(query) do marker
+        marker.prefix_open || return marker
+        FunctionDefSelfBinder(marker.index, marker.leading_parameters + 1, true)
+    end
+end
+
+"""Close the leading-lambda prefix before entering a non-lambda constructor."""
+function _close_functiondef_prefix(query::CG.GenerationQuery)
+    return _map_functiondef_markers(query) do marker
+        marker.prefix_open || return marker
+        FunctionDefSelfBinder(marker.index, marker.leading_parameters, false)
+    end
+end
+
+function _map_functiondef_markers(transform, query::CG.GenerationQuery)
+    any(r -> r isa FunctionDefSelfBinder, query.requirements) || return query
+    mapped = map(query.requirements) do requirement
+        requirement isa FunctionDefSelfBinder ? transform(requirement) : requirement
+    end
+    all(isequal(old, new) for (old, new) in zip(query.requirements, mapped)) && return query
+    return CG.GenerationQuery(query.target_ty, query.scope_tys, query.depth_left,
+        query.guarded_left, query.provider_fuel, query.node_budget,
+        query.capability_mask, mapped)
+end
+
+function _required_full_self_marker(query::CG.GenerationQuery,
+    head_index::Int, arity::Int)
+    marker = findfirst(query.requirements) do requirement
+        requirement isa FunctionDefSelfBinder && !requirement.prefix_open &&
+            requirement.index == head_index &&
+            requirement.leading_parameters == arity
+    end
+    marker === nothing && return nothing
+    self = query.requirements[marker]::FunctionDefSelfBinder
+    any(r -> r isa CG.CallsScopeBinder && r.index == self.index,
+        query.requirements) || return nothing
+    return self
+end
+
+"""Sample one complete, proof-backed progress call for a pure Call child.
+
+The chosen scoped head and every child have finite evidence before the shared
+node balance is charged. One argument root excludes its original leading
+parameter; other child facts keep their true cheaper costs. Certified minima
+reserve the entire packet, while ordinary child sampling explores proven steps
+within each leased budget; the minimum certificate is not forced as output.
+The old joint obligation route remains selectable outside this finite core.
+This is deliberately not a negative result for queries with additional use or
+call obligations, custom argument policies, or mixed-only children.
+"""
+function _sample_preplanned_functiondef_call!(state::CG.DerivationSamplingState,
+    relation::CG.CoreRelation, query::CG.GenerationQuery)
+    state.completion.probability == 0 && !state.completion.completing || return nothing
+    scope = CG._scope_type_vector(query.scope_tys)
+    positive = CG._required_scope_binder_indices(query, length(scope))
+    length(positive) == 1 || return nothing
+    self_index = only(positive)
+    forbidden = CG._forbidden_scope_binders(query)
+    self_index in forbidden && return nothing
+    CG._finite_evidence_request_supported(relation, query) || return nothing
+    relation.argument_planner isa CG.DefaultArgumentPlanner || return nothing
+    evidence_weight = get(relation.weights.overrides, :constraint_evidence, 1.0)
+    evidence_weight > 0 &&
+        rand(state.rng) * (1.0 + evidence_weight) < evidence_weight || return nothing
+
+    options = NamedTuple[]
+    for rule in CG._scope_application_rules(query.target_ty, scope, query.depth_left)
+        rule.index == self_index || continue
+        CG._known_type_admitted(relation, rule.head_ty) || continue
+        self = _required_full_self_marker(query, rule.index, length(rule.argument_tys))
+        self === nothing && continue
+        weight = CG._scope_application_option_weight(relation, rule)
+        weight > 0 && push!(options, (; rule, self, weight))
+    end
+    pool, total = CG._positive_option_pool(options)
+    isempty(pool) && return nothing
+    chosen = pool[CG._weighted_option_index(state.rng, pool, total)]
+    rule, self = chosen.rule, chosen.self
+    isempty(rule.argument_tys) && return nothing # progress needs a changed argument
+    changed = rand(state.rng, eachindex(rule.argument_tys))
+    available = min(state.nodes_left, query.node_budget)
+    available > 1 || return nothing
+    child_depth = query.depth_left - 1
+    # Prepare every child before construction, so their proven minimum costs
+    # reserve a complete packet. A certificate is a completion guarantee, not
+    # the ordinary exploration distribution of its descendants.
+    children = Any[]
+    lower_bounds = Int[]
+    max_child_budget = available - length(rule.argument_tys)
+    max_child_budget >= 1 || return nothing
+    for i in eachindex(rule.argument_tys)
+        if i == changed
+            prepared = CG._prepare_finite_core_nonbare_certificate(relation,
+                rule.argument_tys[i], scope, child_depth, max_child_budget,
+                self.index - i; forbidden)
+            prepared isa CG._UnsupportedEvidenceSampling && return nothing
+            prepared.status === :ready || return nothing
+            push!(children, prepared)
+            push!(lower_bounds, minimum(option.cost for option in prepared.options))
+        else
+            prepared = CG._prepare_finite_core_certificate(relation,
+                rule.argument_tys[i], scope, child_depth, max_child_budget; forbidden)
+            prepared isa CG._UnsupportedEvidenceSampling && return nothing
+            prepared === nothing && return nothing
+            child_cost = prepared.world.costs[prepared.fact]
+            child_cost <= max_child_budget || return nothing
+            push!(children, prepared)
+            push!(lower_bounds, child_cost)
+        end
+    end
+    1 + sum(lower_bounds) <= available || return nothing
+    changed_budget = available - 1 - sum(lower_bounds) + lower_bounds[changed]
+    selection_state = CG.DerivationSamplingState(state.rng, changed_budget,
+        state.completion)
+    selected = CG._select_finite_core_nonbare_root(selection_state, children[changed])
+    selected === nothing && return nothing
+    lower_bounds[changed] = selected.cost
+    args = CG.CoreDerivation[]
+    cost = 1
+    for (i, prepared) in enumerate(children)
+        reserved = sum(lower_bounds[j] for j in (i + 1):length(children); init=0)
+        child_budget = available - cost - reserved
+        child_budget >= lower_bounds[i] || return nothing
+        child_state = CG.DerivationSamplingState(state.rng, child_budget,
+            state.completion)
+        argument = if i == changed
+            CG._sample_evidence_plan!(child_state, prepared.world, relation,
+                selected.plan, selected.binder, prepared.scope,
+                prepared.forbidden)
+        else
+            CG._sample_evidence_fact!(child_state, prepared.world, relation,
+                prepared.fact, scope, forbidden; certificate_ready=true)
+        end
+        argument isa CG._UnsupportedEvidenceSampling && return nothing
+        argument === nothing && return nothing
+        CG._required_source_argument_admitted(rule, i, argument) || return nothing
+        push!(args, argument)
+        charged = child_budget - child_state.nodes_left
+        CG.derivation_node_count(argument) == charged ||
+            error("finite self-call child charge does not match its derivation")
+        cost += charged
+    end
+    result = CG.ScopeApplicationDerivation(rule.index, rule.head_ty, args)
+    CG.derivation_node_count(result) == cost ||
+        error("preplanned self-call certificate cost does not match its derivation")
+    CG._generation_requirements_satisfied(result, query) ||
+        error("preplanned self call lost its occurrence obligation")
+    CG._consume_sampling_nodes!(state, cost) || return nothing
+    return CG._record_required_scope_route!(result, :preplanned_self_call)
+end
 
 """
     FunctionDefProvider(; weight_bucket=:function_def,
@@ -645,6 +807,13 @@ struct FunctionDefProvider{W,B,A} <: CG.AbstractHeadProvider
     body_attempts::Int
     route_token::FunctionDefRouteToken
 end
+
+# This provider contributes query options, not target/scope-sensitive core heads.
+CG.generation_catalog_scope_invariant(::FunctionDefProvider) = true
+CG._evidence_catalog_domain_sharing(::FunctionDefProvider) = true
+CG._evidence_heads_policy_free(::FunctionDefProvider) = true
+CG._evidence_early_certificate_supported(::FunctionDefProvider) = true
+CG._may_supply_guarded_heads(::FunctionDefProvider) = false
 
 function FunctionDefProvider(;
     weight_bucket=:function_def,
@@ -913,13 +1082,14 @@ function CG.sample_generation_extension(
     wrapper_nodes_left = state.nodes_left
     nested_fuel = FunctionDefFuel(option.remaining - 1)
     self_binder = FunctionDefSelfBinder(0)
+    body_parent = _close_functiondef_prefix(query)
 
     if !(provider.admissibility isa GenuineSelfCallFilter)
         _consume_functiondef_attempt!(query, provider) || return nothing
         body = CG.sample_generation_extension(
             state,
             relation,
-            query;
+            body_parent;
             target_ty=query.target_ty,
             added_scope_tys=(query.target_ty,),
             node_budget=min(query.node_budget, state.nodes_left),
@@ -959,7 +1129,7 @@ function CG.sample_generation_extension(
         body = CG.sample_generation_derivation_using_scope_binder(
             state,
             relation,
-            query,
+            body_parent,
             query.target_ty;
             target_ty=query.target_ty,
             node_budget=min(query.node_budget, state.nodes_left),
@@ -1006,15 +1176,15 @@ CG.rigid_safe_derivation(derivation::FunctionDefDerivation) =
     CG.rigid_safe_derivation(derivation.base_witness)
 
 function CG.derivation_metadata(derivation::FunctionDefDerivation)
-    metadata = deepcopy(CG.derivation_metadata(derivation.body))
+    metadata = CG._copy_derivation_metadata(CG.derivation_metadata(derivation.body))
     nested = get(metadata, :function_defs, Any[])
     nested isa AbstractVector || (nested = Any[nested])
     entry = Dict{Symbol,Any}(
-        :target => TypeSystem.typekey(derivation.target_ty),
+        Pair{Symbol,Any}(:target, TypeSystem.typekey(derivation.target_ty)),
         :self_index => derivation.self_index,
         :self_binder => :debruijn,
-        :base_signature => CG.derivation_signature(derivation.base_witness),
-        :body_signature => CG.derivation_signature(derivation.body),
+        Pair{Symbol,Any}(:base_signature, CG.derivation_signature(derivation.base_witness)),
+        Pair{Symbol,Any}(:body_signature, CG.derivation_signature(derivation.body)),
         :provider_capabilities => derivation.capabilities,
         :used_capabilities => _used_functiondef_capabilities(derivation),
         :nesting_remaining => derivation.remaining,
@@ -1264,7 +1434,7 @@ function generate_finite_canonical_scoped(
     base_config = config === nothing ? _generation_config_from_kwargs(kwargs) : config
     base_config isa CG.GenerationConfig || throw(ArgumentError("config must be GenerationConfig"))
     effective = with_functiondef_provider(base_config, nothing)
-    scope = Ty[scope_tys...]
+    scope = CG._scope_type_vector(scope_tys)
 
     local_consts = get(kwargs, :local_consts, Dict{Symbol,Any}())
     local_consts_ty = get(kwargs, :local_consts_ty, Dict{Symbol,Any}())
@@ -1318,8 +1488,8 @@ function generate_finite_canonical_scoped(
             :generator => :canonical_finite_witness,
             :rng_type => typeof(effective.rng),
             :sampling_nodes_used => CG.derivation_node_count(witness),
-            :scope_tys => Tuple(TypeSystem.typekey.(scope)),
-            :derivation => CG.derivation_signature(witness),
+            Pair{Symbol,Any}(:scope_tys, CG._scope_typekeys(scope)),
+            Pair{Symbol,Any}(:derivation, CG.derivation_signature(witness)),
             :forced_finite_witness => true,
         ),
     )
@@ -1346,104 +1516,80 @@ witness, nesting fuel, shared attempt budget, and admissibility check.
 
 `scope_tys` remains inner → outer. The provider and all ordinary body-generation
 configuration are injectable; caller-owned RNG and constant containers are
-forwarded unchanged.
+forwarded unchanged. `completion_probability=0` retains the existing bounded
+provider route. A positive probability enables an incremental certified root
+frontier with one irreversible completion switch and optional finite
+`completion_grace_steps`. This route currently covers ordinary/joint core and
+positive safe-list evidence, not all mixed extensions. The original provider
+filter still runs once after construction and may reject; there is no promise
+of successful sampling for an arbitrary filter.
+Omitted completion keywords inherit `WeightedDerivationSampler` settings from
+`config`; explicit keywords override them independently. The default sampler
+still supplies probability zero and no grace.
 """
 function generate_functiondef_root_scoped(
     target_ty::Ty;
     scope_tys::AbstractVector{<:Ty}=Ty[],
     functiondef_provider::FunctionDefProvider=FunctionDefProvider(),
     config=nothing,
+    completion_probability::Union{Nothing,Real}=nothing,
+    completion_grace_steps::Union{Nothing,Integer}=nothing,
     kwargs...,
 )
     functiondef_provider = _require_genuine_self_call(functiondef_provider)
     base_config = config === nothing ? _generation_config_from_kwargs(kwargs) : config
     base_config isa CG.GenerationConfig || throw(ArgumentError("config must be GenerationConfig"))
+    sampler = base_config.sampler
+    probability = completion_probability === nothing ?
+        (sampler isa WeightedDerivationSampler ? sampler.completion_probability : 0.0) :
+        completion_probability
+    grace = completion_grace_steps === nothing ?
+        (sampler isa WeightedDerivationSampler ? sampler.completion_grace_steps : 0) :
+        completion_grace_steps
+    completion = GenerationCompletionState(; probability, grace_steps=grace)
     effective = with_functiondef_provider(base_config, functiondef_provider)
     _validate_functiondef_sampling_config(effective)
     CG._generation_target_supported(target_ty, effective) ||
         return Err(CG.UnsupportedCanonicalGenerationTarget(target_ty))
 
-    scope = Ty[scope_tys...]
+    scope = CG._scope_type_vector(scope_tys)
     CG._generation_scope_supported(scope, effective) ||
         return Err(CG.UnsupportedCanonicalGenerationTarget(target_ty))
 
-    local_consts = get(kwargs, :local_consts, Dict{Symbol,Any}())
-    local_consts_ty = get(kwargs, :local_consts_ty, Dict{Symbol,Any}())
-    result_local_consts = CG._anydict(local_consts)
-    result_local_const_types = CG._typed_context(local_consts, local_consts_ty)
-    source_local_consts = get(kwargs, :source_local_consts, true)
-    relation_local_consts = source_local_consts ? result_local_consts : Dict{Symbol,Any}()
-    relation_local_const_types = source_local_consts ?
-        result_local_const_types : Dict{Symbol,TyLike}()
-    global_consts = get(kwargs, :global_consts, Dict{Symbol,Any}())
-    global_consts_ty = get(kwargs, :global_consts_ty, Dict{Symbol,Any}())
-    presets = get(kwargs, :presets, Dict{Symbol,Any}())
-    preset_types = get(kwargs, :preset_types, Dict{Symbol,Any}())
-    cache_key = CG._uses_lazy_sampling(effective) ? CG._scoped_lazy_relation_cache_key(
-        effective.weights,
-        global_consts,
-        global_consts_ty,
-        relation_local_consts,
-        relation_local_const_types,
-        presets,
-        preset_types,
-        effective.providers,
-        effective.argument_planner,
-        effective.guarded_expansion_depth,
-    ) : nothing
-    if cache_key !== nothing
-        entry = CG._get_scoped_lazy_relation_cache_entry(
-            cache_key,
-            effective.weights,
-            effective.providers,
-            effective.argument_planner,
-            effective.guarded_expansion_depth,
-            global_consts,
-            global_consts_ty,
-            relation_local_consts,
-            relation_local_const_types,
+    return CG._with_scoped_generation_materials(
+        effective;
+        global_consts=get(kwargs, :global_consts, Dict{Symbol,Any}()),
+        global_consts_ty=get(kwargs, :global_consts_ty, Dict{Symbol,Any}()),
+        local_consts=get(kwargs, :local_consts, Dict{Symbol,Any}()),
+        local_consts_ty=get(kwargs, :local_consts_ty, Dict{Symbol,Any}()),
+        presets=get(kwargs, :presets, Dict{Symbol,Any}()),
+        preset_types=get(kwargs, :preset_types, Dict{Symbol,Any}()),
+        source_local_consts=get(kwargs, :source_local_consts, true),
+    ) do relation, result_local_consts, result_local_const_types
+        owned_provider = _owned_forced_functiondef_provider(relation, functiondef_provider)
+        _generate_forced_functiondef_result(
+            relation, effective, owned_provider, target_ty, scope,
+            result_local_consts, result_local_const_types, kwargs, completion,
         )
-        lock(entry.lock)
-        try
-            entry.relation.local_consts = relation_local_consts
-            entry.relation.local_consts_ty = relation_local_const_types
-            return _generate_forced_functiondef_result(
-                entry.relation,
-                effective,
-                functiondef_provider,
-                target_ty,
-                scope,
-                result_local_consts,
-                result_local_const_types,
-                kwargs,
-            )
-        finally
-            unlock(entry.lock)
-        end
     end
+end
 
-    relation = CG.CoreRelation(
-        global_consts=global_consts,
-        global_consts_ty=global_consts_ty,
-        local_consts=relation_local_consts,
-        local_consts_ty=relation_local_const_types,
-        presets=presets,
-        preset_types=preset_types,
-        weights=effective.weights,
-        providers=effective.providers,
-        argument_planner=effective.argument_planner,
-        guarded_expansion_depth=effective.guarded_expansion_depth,
-    )
-    return _generate_forced_functiondef_result(
-        relation,
-        effective,
-        functiondef_provider,
-        target_ty,
-        scope,
-        result_local_consts,
-        result_local_const_types,
-        kwargs,
-    )
+"""Select the cache-owned instance of a semantically cacheable root provider.
+
+Scoped relation caching interns singleton-policy providers by their declared
+cache key. A fresh equivalent caller instance must not fail the extension's
+identity admission or use a different route token from the root attempt ledger.
+Noncacheable policies take the uncached public path and keep caller identity.
+"""
+function _owned_forced_functiondef_provider(relation, requested::FunctionDefProvider)
+    any(p -> p === requested, relation.providers) && return requested
+    key = generation_provider_cache_key(requested)
+    key === nothing && throw(ArgumentError("a noncacheable FunctionDef provider cannot use a shared relation"))
+    slot = findfirst(relation.providers) do provider
+        provider isa FunctionDefProvider && isequal(generation_provider_cache_key(provider), key)
+    end
+    slot === nothing && throw(ArgumentError("cached relation has no matching FunctionDef provider"))
+    return relation.providers[slot]
 end
 
 function _generate_forced_functiondef_result(
@@ -1455,8 +1601,9 @@ function _generate_forced_functiondef_result(
     result_local_consts,
     result_local_const_types,
     kwargs,
+    completion::GenerationCompletionState=GenerationCompletionState(),
 )
-    state = CG.DerivationSamplingState(effective.rng, effective.sampling_node_budget)
+    state = CG.DerivationSamplingState(effective.rng, effective.sampling_node_budget, completion)
     query = CG.GenerationQuery(
         target_ty;
         scope_tys=scope,
@@ -1484,16 +1631,13 @@ function _generate_forced_functiondef_result(
             weight=1.0,
         ) for option in provider_options
     ]
-    derivation = CG._sample_from_options(
-        state,
-        relation,
-        wrapped_options,
-        scope,
-        query.depth_left,
-        query.guarded_left,
-        true,
-        query,
-    )
+    derivation = if completion.probability > 0
+        _sample_certified_functiondef_root(state, relation, functiondef_provider,
+            provider_options, query)
+    else
+        CG._sample_from_options(state, relation, wrapped_options, scope,
+            query.depth_left, query.guarded_left, true, query)
+    end
     derivation === nothing && return Err(CG.UnsupportedCanonicalGenerationTarget(target_ty))
     derivation isa FunctionDefDerivation || throw(ArgumentError(
         "FunctionDefProvider must materialize FunctionDefDerivation at the forced root",
@@ -1511,10 +1655,18 @@ function _generate_forced_functiondef_result(
         :generator => :canonical_finite_core,
         :rng_type => typeof(effective.rng),
         :sampling_nodes_used => effective.sampling_node_budget - state.nodes_left,
-        :scope_tys => Tuple(TypeSystem.typekey.(scope)),
-        :derivation => CG.derivation_signature(derivation),
+        Pair{Symbol,Any}(:scope_tys, CG._scope_typekeys(scope)),
+        Pair{Symbol,Any}(:derivation, CG.derivation_signature(derivation)),
         :forced_functiondef_root => true,
     )
+    if completion.probability > 0
+        metadata[:certified_completion] = (
+            probability=completion.probability,
+            switched=completion.completing,
+            boundaries=completion.boundaries,
+            coverage=:incremental_mixed_frontier,
+        )
+    end
     merge!(metadata, CG.derivation_metadata(derivation))
     result = CG.GenerationResult(
         AstTree(node),
@@ -1529,6 +1681,64 @@ function _generate_forced_functiondef_result(
         kwargs,
         scope_tys=scope,
     )
+end
+
+"""Prepare one complete forced-root certificate, then run its owned frontier.
+
+The provider anchors a finite base and the query supplies exact outer scope,
+capabilities and a shared FunctionDef attempt ledger. Preparation consumes one
+attempt, never emitted node fuel; body evidence adds the exact self Call.
+Initial preparation chooses among the finite core and positive mixed routes;
+core forwarding does not make the mixed route unreachable. Missing evidence
+or a final provider-filter rejection
+returns `nothing`; neither reopens the root mode nor proves mixed absence.
+"""
+function _sample_certified_functiondef_root(state, relation, provider, options, query)
+    state.completion.completing && return nothing # no initial search in inherited completion
+    query.depth_left > 0 && query.provider_fuel > 0 || return nothing
+    # The legacy forced root passes through :generation_extension before the
+    # provider is entered. Certification must pay that same dispatch depth and
+    # fuel, not silently give the body an extra construction layer.
+    query = _derive_generation_query(query; depth_left=query.depth_left - 1,
+        provider_fuel=query.provider_fuel - 1,
+        node_budget=min(state.nodes_left, query.node_budget))
+    relation, query = _relation_for_query(relation, query)
+    any(p -> p === provider, relation.providers) || return nothing
+    isempty(options) && return nothing
+    option = first(options)
+    option.remaining > 0 || return nothing
+    _functiondef_attempts_remaining(query, provider) > 0 || return nothing
+    base = _functiondef_base_witness(provider, relation, option, query)
+    base === nothing && return nothing
+    query.node_budget > 1 || return nothing
+    _consume_functiondef_attempt!(query, provider) || return nothing
+    childq = _derive_generation_query(_close_functiondef_prefix(query);
+        added_scope_tys=(query.target_ty,),
+        node_budget=query.node_budget - 1,
+        requirements=(FunctionDefFuel(option.remaining - 1),
+            _functiondef_attempt_budget(query, provider), FunctionDefSelfBinder(0), CallsScopeBinder(0)))
+    _frontier_prepare_supported(relation, childq) || return nothing
+    # A cheap core forwarding certificate may be rejected by the unchanged
+    # recursion filter. Give the already admitted finite mixed preparer a
+    # positive initial route, rather than reaching it only on core absence.
+    body = _prepare_frontier_candidate(relation, childq, state.rng)
+    body === nothing && return nothing
+    certificate = FunctionDefDerivation(query.target_ty, body, base, 0,
+        provider_capabilities(provider), option.remaining - 1)
+    nodes_before = state.nodes_left
+    result = _sample_certified_frontier!(state, relation, query, certificate; functiondef_root=true)
+    result === nothing && return nothing
+    candidate = FunctionDefCandidate(query.target_ty, result.body, base, 0)
+    _functiondef_admissible(provider, candidate, relation, query) || return nothing
+    derivation_node_count(result) <= nodes_before - state.nodes_left || return nothing
+    result_ty = derivation_result_type(result)
+    (result_ty === query.target_ty || TypeSystem.iscompatible(result_ty, query.target_ty)) || return nothing
+    if _contains_rigid_dummy(query.target_ty) || _scope_any(_contains_rigid_dummy, query.scope_tys)
+        safe = rigid_safe_derivation(result)
+        safe isa Bool || throw(ArgumentError("rigid_safe_derivation must return Bool"))
+        safe || return nothing
+    end
+    return result
 end
 
 function _validate_functiondef_sampling_config(config::CG.GenerationConfig)

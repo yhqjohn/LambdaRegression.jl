@@ -1,5 +1,30 @@
 using TestItems
 
+@testitem "TypeSystem built-in leaf semantic keys retain graph encoding" begin
+    using Test
+    using LambdaRegression: TypeSystem
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, IntTy, TyConst, TyMu, TyNat, TyRigid, semantic_typekey
+
+    fresh = TypeSystem.make_tyvar_factory()
+    leaves = (FloatTy, IntTy, BoolTy, TyConst(:UserScalar), TyRigid(1), TyRigid(2), TyNat(0), TyNat(3))
+    for leaf in leaves
+        reference = TypeSystem._semantic_mu_graph_key(TypeSystem._mu_eq_graph(leaf))
+        @test semantic_typekey(leaf) == reference
+        linked = fresh(0)
+        linked.instance = leaf
+        @test semantic_typekey(linked) == reference
+        wrapped = TyMu(fresh(0), leaf)
+        @test semantic_typekey(wrapped) == reference
+        @test haskey(Dict(reference => true), semantic_typekey(leaf))
+    end
+    @test length(Set(semantic_typekey(leaf) for leaf in leaves)) == length(leaves)
+    @test semantic_typekey(TyRigid(1)) != semantic_typekey(TyNat(1))
+    @test semantic_typekey(TyConst(:Rigid)) != semantic_typekey(TyRigid(1))
+    @test_throws ArgumentError semantic_typekey(fresh(0))
+    binder = fresh(0)
+    @test_throws ArgumentError semantic_typekey(TyMu(binder, binder))
+end
+
 @testitem "TypeSystem closed μ equality correctness fixtures" begin
     using Test
     using LambdaRegression: TypeSystem

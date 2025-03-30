@@ -460,8 +460,23 @@ function _contextual_subtree_key(
     return (template, _contextual_type_keys(types), values)
 end
 
-function _same_contextual_subtree(a, b)::Bool
-    return a[1] == b[1] && a[2] == b[2] && isequal(a[3], b[3])
+Base.@noinline function _contextual_structural_equal(a, b)::Bool
+    Base.@nospecialize a b
+    if a isa Tuple && b isa Tuple
+        length(a) == length(b) || return false
+        for index in eachindex(a)
+            _contextual_structural_equal(a[index], b[index]) || return false
+        end
+        return true
+    end
+    return a == b
+end
+
+Base.@noinline function _same_contextual_subtree(a, b)::Bool
+    Base.@nospecialize a b
+    return _contextual_structural_equal(a[1], b[1]) &&
+           _contextual_structural_equal(a[2], b[2]) &&
+           isequal(a[3], b[3])
 end
 
 function _crossover_application_roles_stable(
@@ -860,84 +875,6 @@ function crossover(op::TypedSubtreeSwapCrossover,
 
     attempts == length(pair_pool) && return Err(CrossoverPairPoolExhaustedErr(attempts))
     return Err(CrossoverMaxTryReachedErr(op.max_try))
-end
-
-"""
-    IndependentCrossover(operator)
-
-Compose the two directed recombination calls used by the default regression
-path.  The first child is produced from `(recipient=a, donor=b)` and the
-second from `(recipient=b, donor=a)`; each direction keeps its own target and
-selection role.  This is deliberately separate from `crossover` on
-`TypedSubtreeSwapCrossover`, whose contract is one reciprocal site-pair swap
-with atomic two-child validation.
-"""
-struct IndependentCrossover <: AbstractCrossover
-    operator::TypedSubtreeSwapCrossover
-end
-
-IndependentCrossover(; kwargs...) =
-    IndependentCrossover(TypedSubtreeSwapCrossover(; kwargs...))
-
-function crossover(
-    op::IndependentCrossover,
-    a::Program,
-    b::Program;
-    target_a::Ty,
-    target_b::Ty,
-    rng::AbstractRNG=MersenneTwister(2000),
-    global_consts_ty::Union{Nothing,Dict{Symbol,TyLike}}=nothing,
-    tyfactory_ctor=make_tyvar_factory,
-    kwargs...,
-)
-    global_consts_ty === nothing && return Err(MissingGlobalTypeCtxErr())
-    prepared_a = _prepare_crossover_parent(
-        a,
-        target_a,
-        global_consts_ty;
-        tyfactory_ctor,
-    )
-    prepared_a isa Err && return prepared_a
-    prepared_b = _prepare_crossover_parent(
-        b,
-        target_b,
-        global_consts_ty;
-        tyfactory_ctor,
-    )
-    prepared_b isa Err && return prepared_b
-
-    child_a = recombine(
-        op.operator,
-        a,
-        b;
-        recipient_target=target_a,
-        donor_target=target_b,
-        rng,
-        global_consts_ty,
-        tyfactory_ctor,
-        selection_roles=(:left, :right),
-        _prepared_recipient=prepared_a,
-        _prepared_donor=prepared_b,
-        kwargs...,
-    )
-    child_a isa Err && return child_a
-
-    child_b = recombine(
-        op.operator,
-        b,
-        a;
-        recipient_target=target_b,
-        donor_target=target_a,
-        rng,
-        global_consts_ty,
-        tyfactory_ctor,
-        selection_roles=(:right, :left),
-        _prepared_recipient=prepared_b,
-        _prepared_donor=prepared_a,
-        kwargs...,
-    )
-    child_b isa Err && return child_b
-    return (child_a, child_b)
 end
 
 @testsnippet PopCrossBaseImports begin
@@ -1572,6 +1509,38 @@ end
         mono_key,
         scheme_key,
     )
+end
+
+@testitem "Populations contextual key comparison handles variable tuple shapes" setup=[PopCrossBaseImports] begin
+    using LambdaRegression.TypeSystem: IntTy
+    populations = LambdaRegression.Mutations.Populations
+
+    @test populations._contextual_structural_equal(
+        (:app, (:index, 1), (:abs, (:var, :x))),
+        (:app, (:index, 1), (:abs, (:var, :x))),
+    )
+    @test !populations._contextual_structural_equal(
+        (:app, (:index, 1), (:abs, (:var, :x))),
+        (:app, (:index, 1), (:abs, (:var, :x), :extra)),
+    )
+    @test populations._contextual_structural_equal((:tag, 0.0), (:tag, -0.0))
+    @test !populations._contextual_structural_equal((:tag, NaN), (:tag, NaN))
+
+    local_types = Dict{Symbol,TyLike}(:a => IntTy)
+    nan_left = populations._contextual_subtree_key(
+        ConstNode(:a), Dict{Symbol,Any}(:a => NaN), local_types,
+    )
+    nan_right = populations._contextual_subtree_key(
+        ConstNode(:a), Dict{Symbol,Any}(:a => NaN), local_types,
+    )
+    negative_zero = populations._contextual_subtree_key(
+        ConstNode(:a), Dict{Symbol,Any}(:a => -0.0), local_types,
+    )
+    positive_zero = populations._contextual_subtree_key(
+        ConstNode(:a), Dict{Symbol,Any}(:a => 0.0), local_types,
+    )
+    @test populations._same_contextual_subtree(nan_left, nan_right)
+    @test !populations._same_contextual_subtree(negative_zero, positive_zero)
 end
 
 @testitem "Populations TypedSubtreeSwapCrossover handles open equirecursive targets" setup=[PopCrossBaseImports] begin
@@ -2424,42 +2393,5 @@ end
                 op, ordinary_site, self_site,
             )
         end
-    end
-end
-
-@testitem "Populations IndependentCrossover returns both directed children" begin
-    using Test
-    using Random
-    using LambdaRegression.ASTs.NodeASTs: AstTree, ConstNode
-    using LambdaRegression.Mutations.Populations:
-        Program, IndependentCrossover, PathCrossoverSelectionPolicy,
-        TypedSubtreeSwapCrossover, crossover
-    using LambdaRegression.TypeSystem: IntTy, TyLike
-    using LambdaRegression.Utils: Err
-
-    left = Program(AstTree(ConstNode(:left)))
-    right = Program(AstTree(ConstNode(:right)))
-    op = IndependentCrossover(TypedSubtreeSwapCrossover(
-        max_try=1,
-        min_sites=1,
-        allow_root=true,
-        selection=PathCrossoverSelectionPolicy(Int[], Int[]),
-    ))
-    result = crossover(
-        op,
-        left,
-        right;
-        rng=MersenneTwister(42),
-        global_consts_ty=Dict{Symbol,TyLike}(:left => IntTy, :right => IntTy),
-        target_a=IntTy,
-        target_b=IntTy,
-    )
-    @test !(result isa Err)
-    if !(result isa Err)
-        child_left, child_right = result
-        @test child_left.tree == right.tree
-        @test child_right.tree == left.tree
-        @test left.tree == AstTree(ConstNode(:left))
-        @test right.tree == AstTree(ConstNode(:right))
     end
 end

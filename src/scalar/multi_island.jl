@@ -410,6 +410,20 @@ function search_multi_scalar(
         final_population_size=sum(report.variation.final_population_size
             for report in reports),
     )
+    # A bounded real-member projection for downstream material publication.
+    # Reports already own these scalar expressions; selection adds no score
+    # calls or RNG draws. It does not expose complete live populations.
+    leaders = NamedTuple[]
+    seen_leaders = Set{_ScalarSignature}()
+    for report in reports, member in report.leaders
+        isfinite(member.loss) || continue
+        signature = _expression_signature(member.expr)
+        signature in seen_leaders && continue
+        push!(seen_leaders, signature)
+        push!(leaders, (; expr=deepcopy(member.expr), loss=member.loss,
+            complexity=member.complexity))
+        length(leaders) >= 8 && break
+    end
     return (
         best=deepcopy(best_report.best),
         best_loss=Float64(best_report.best_loss),
@@ -420,6 +434,7 @@ function search_multi_scalar(
         generations,
         termination,
         complexity_archive,
+        leaders,
         variation,
         diagnostics,
     )

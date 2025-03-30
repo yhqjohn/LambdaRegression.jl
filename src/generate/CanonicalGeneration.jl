@@ -28,6 +28,12 @@ inference. `ValueFactories.factory_context` can pre-materialize typed constants
 for selected closed types, while `TypedValueFactoryProvider(factories)` can add
 the same factory family as lazy instance-factory heads.
 
+Relation-backed catalogues may reuse the input collection just completed for
+their exact type contexts and scope. This preparation shortcut requires complete
+explicit value types and known catalogue providers; generic universe inputs and
+unknown callbacks retain full preparation. Provider extensions and head order
+are unchanged, and the copied universe is still owned by the new catalogue.
+
 Generation is configured by replacement points rather than by editing the core
 recursion:
 
@@ -108,7 +114,17 @@ still consume query budget.
 
 `GenerationConfig` also accepts callable `argument_planner`, `sampler`, and
 `materializer` fields plus `guarded_expansion_depth` for the bounded expansion
-layer. Replacing them changes local proof-tree pruning, derivation selection,
+layer. `WeightedDerivationSampler(completion_probability=p,
+completion_grace_steps=K)` explicitly enables a shared root frontier when
+`p > 0`; the default `p=0` retains bounded sampling. Finite complete-packet
+preparation may fail before a certificate exists. Once one is retained,
+completion replays it without reopening proof search or provider attempts.
+The public mixed adapter opens lambda/scoped-call positions with known mixed
+policies, keeping ordinary heads, safe proxy bodies and filtered definitions
+atomic. This is not full independent exploration of every interior. Unknown
+callbacks, unsupported source policies and recursive target worlds are not
+silently certified; use bounded mode for them. Replacing these components
+changes local proof-tree pruning, derivation selection,
 AST lowering, or guarded depth without adding new branches to the core. Provider
 and global argument planners are sampling policy; they do not redefine
 `known_generation_witness`, which applies the finite type rules and anchored
@@ -178,6 +194,7 @@ using ..ASTs.NodeASTs: AstNode, AstTree, ConstNode, IndexNode, AbsNode, AppNode
 using ..ASTs.NodeASTs: VarNode, FunctionDefNode, children
 using ..TypeSystem: Ty, TyConst, TyVar, TyFun, TyProd, TySum, TyList, TyArray, TyNat, TyMu, TyScheme, TyLike
 using ..TypeSystem: BoolTy, FloatTy, get_ast_type_ctx, get_type_ctx, get_type, iscompatible, typekey, →
+using ..TypeSystem: _grounded_closed_fragment_fuel, _grounded_iscompatible
 using ..Utils
 using ..ProgramAnalysis: functiondef_recursion_observations
 using TestItems
@@ -201,6 +218,7 @@ export derivation_result_type
 export derivation_uses_scope_binder, derivation_calls_scope_binder, rigid_safe_derivation
 export materialize_generation_derivation, generation_function_view
 export known_generation_witness
+export generation_catalog_scope_invariant
 export HeadEntry, CoreProductive, Decoration, Excluded
 export test_catalog_consts, test_catalog_providers, test_catalog_weight_tags, test_catalog_weights, test_catalog_generation_kwargs, WeightBucket
 export ContextHeadProvider, NilFactoryProvider, ToListProvider, AMapProvider, GuardedExpansionProvider, TypedValueFactoryProvider, WeightTagProvider
@@ -248,7 +266,11 @@ const _LAMBDA_WEIGHT = WeightBucket(:lambda)
 
 Finite set of closed type-fragment members used by the canonical core catalog.
 `scope_source_tys` closes over binder/source types that are available in the
-current `Known(G, T)` scope but are not global heads.
+current `Known(G, T)` scope but are not global heads. `types` is the ordered
+closed-type catalog for deterministic iteration. `typekeys` is an internal
+structural membership index; query membership with `ty in universe`, and
+providers should extend the catalog through `add_universe_type!` rather than
+depending on the index representation.
 """
 struct CoreUniverse
     types::Vector{Ty}
@@ -342,10 +364,10 @@ abstract type AbstractGenerationRequirement end
 """
     UsesScopeBinder(index)
 
-Require an extension result to use the zero-based De Bruijn binder at `index`.
-The requirement is an anchoring constraint for extension providers; the core
-does not inspect derivations to enforce it. Negative indices throw
-`ArgumentError`.
+Require the result to use the exact zero-based De Bruijn binder at `index`.
+Supported constrained core requests use joint occurrence evidence; extension
+consumers must preserve the same identity. Ordinary type-only evidence does
+not discharge this requirement. Negative indices throw `ArgumentError`.
 """
 struct UsesScopeBinder <: AbstractGenerationRequirement
     index::Int
@@ -427,6 +449,29 @@ struct GenerationQuery
     node_budget::Int
     capability_mask::Tuple{Vararg{Symbol}}
     requirements::Tuple
+
+    Base.@noinline Base.@nospecializeinfer function GenerationQuery(
+        target_ty,
+        scope_tys,
+        depth_left,
+        guarded_left,
+        provider_fuel,
+        node_budget,
+        capability_mask,
+        requirements,
+    )
+        Base.@nospecialize scope_tys capability_mask requirements
+        return new(
+            target_ty,
+            scope_tys,
+            depth_left,
+            guarded_left,
+            provider_fuel,
+            node_budget,
+            capability_mask,
+            requirements,
+        )
+    end
 end
 
 function GenerationQuery(
@@ -439,6 +484,30 @@ function GenerationQuery(
     capability_mask=(),
     requirements=(),
 )
+    return _checked_generation_query(
+        target_ty,
+        scope_tys,
+        depth_left,
+        guarded_left,
+        provider_fuel,
+        node_budget,
+        capability_mask,
+        requirements,
+    )
+end
+
+"""Validate query fields in public-constructor order, then call the raw inner constructor."""
+Base.@noinline Base.@nospecializeinfer function _checked_generation_query(
+    target_ty::Ty,
+    scope_tys,
+    depth_left::Integer,
+    guarded_left::Integer,
+    provider_fuel::Integer,
+    node_budget::Integer,
+    capability_mask,
+    requirements,
+)
+    Base.@nospecialize scope_tys capability_mask requirements
     depth = _checked_nonnegative_int(:depth_left, depth_left)
     guarded = _checked_nonnegative_int(:guarded_left, guarded_left)
     fuel = _checked_nonnegative_int(:provider_fuel, provider_fuel)
@@ -467,9 +536,317 @@ function _scope_type_tuple(scope_tys)
 end
 
 function _scope_type_tuple(scope_tys::Tuple)
-    all(ty -> ty isa Ty, scope_tys) ||
+    _scope_all(ty -> ty isa Ty, scope_tys) ||
         throw(ArgumentError("generation scope entries must subtype Ty"))
     return scope_tys
+end
+
+"""Check Boolean type predicates in scope order without specialising on tuple shape.
+
+Internal callers supply `Bool`-valued predicates; this is not the three-valued
+`all` interface for predicates returning `missing`. Other sequence kinds retain
+their native iteration path.
+"""
+Base.@noinline Base.@nospecializeinfer function _scope_all(predicate, scope)
+    Base.@nospecialize scope
+    if scope isa Tuple || scope isa Vector
+        for index in 1:length(scope)
+            predicate(scope[index]) || return false
+        end
+        return true
+    end
+    return all(predicate, scope)
+end
+
+"""Check a Boolean predicate over an ordered scope without specialising on tuple shape.
+
+Internal callers provide `Bool` predicates; other sequence kinds retain their
+native `any` iteration path and predicate failures propagate.
+"""
+Base.@noinline Base.@nospecializeinfer function _scope_any(predicate, scope)
+    Base.@nospecialize scope
+    if scope isa Tuple || scope isa Vector
+        for index in 1:length(scope)
+            predicate(scope[index]) && return true
+        end
+        return false
+    end
+    return any(predicate, scope)
+end
+
+Base.@noinline Base.@nospecializeinfer function _scope_type_vector(scope_tys)
+    Base.@nospecialize scope_tys
+    scope_tys isa Vector{Ty} && return copy(scope_tys)
+
+    if scope_tys isa Tuple
+        scope = Vector{Ty}(undef, length(scope_tys))
+        for index in 1:length(scope_tys)
+            @inbounds scope[index] = scope_tys[index]
+        end
+        return scope
+    end
+
+    scope = Ty[]
+    if applicable(length, scope_tys)
+        sizehint!(scope, length(scope_tys))
+    end
+    for ty in scope_tys
+        push!(scope, ty)
+    end
+    return scope
+end
+
+@testitem "CanonicalGeneration positional query constructor preserves field semantics" begin
+    using Test
+    using LambdaRegression.TypeSystem: FloatTy, Ty, TyFun, TyMu, make_tyvar_factory
+
+    CG = LambdaRegression.CanonicalGeneration
+
+    struct ReferenceGenerationQuery
+        target_ty::Ty
+        scope_tys::Tuple{Vararg{Ty}}
+        depth_left::Int
+        guarded_left::Int
+        provider_fuel::Int
+        node_budget::Int
+        capability_mask::Tuple{Vararg{Symbol}}
+        requirements::Tuple
+    end
+
+    struct LoggedConversion{T}
+        field::Symbol
+        value::T
+        events::Vector{Symbol}
+        fail::Bool
+    end
+    function record_conversion(input::LoggedConversion)
+        push!(input.events, input.field)
+        input.fail && throw(ArgumentError("conversion failed at $(input.field)"))
+        return input.value
+    end
+    Base.convert(::Type{Ty}, input::LoggedConversion) = record_conversion(input)
+    Base.convert(::Type{Tuple{Vararg{Ty}}}, input::LoggedConversion) = record_conversion(input)
+    Base.convert(::Type{Int}, input::LoggedConversion) = Int(record_conversion(input))
+    Base.convert(::Type{Tuple{Vararg{Symbol}}}, input::LoggedConversion) = record_conversion(input)
+    Base.convert(::Type{Tuple}, input::LoggedConversion) = record_conversion(input)
+
+    function conversion_attempt(constructor, fail_at, target, scope, mask, requirements)
+        events = Symbol[]
+        logged(field, value) = LoggedConversion(field, value, events, field === fail_at)
+        try
+            value = constructor(
+                logged(:target, target),
+                logged(:scope, scope),
+                logged(:depth, Int16(7)),
+                2,
+                3,
+                11,
+                logged(:capabilities, mask),
+                logged(:requirements, requirements),
+            )
+            return value, nothing, events
+        catch err
+            return nothing, typeof(err), events
+        end
+    end
+
+    recursive_var = make_tyvar_factory()(0)
+    recursive_ty = TyMu(recursive_var, TyFun(FloatTy, recursive_var))
+    target = TyFun(recursive_ty, FloatTy)
+    scope = (recursive_ty, TyFun(FloatTy, recursive_ty))
+    duplicate_mask = (:opaque, :opaque)
+    invalid_raw_requirements = (:not_a_requirement,)
+
+    raw = CG.GenerationQuery(
+        target, scope, -1, -2, -3, -4, duplicate_mask, invalid_raw_requirements,
+    )
+    reference = ReferenceGenerationQuery(
+        target, scope, -1, -2, -3, -4, duplicate_mask, invalid_raw_requirements,
+    )
+    for field in fieldnames(ReferenceGenerationQuery)
+        @test getfield(raw, field) === getfield(reference, field)
+    end
+    @test raw.scope_tys[1] === recursive_ty
+    @test raw.scope_tys[2] === scope[2]
+    @test raw.capability_mask === duplicate_mask
+    @test raw.requirements === invalid_raw_requirements
+    @test raw.depth_left == -1 && raw.guarded_left == -2
+    @test raw.provider_fuel == -3 && raw.node_budget == -4
+
+    converted = CG.GenerationQuery(
+        target, scope, Int16(1), Int16(2), Int16(3), Int16(4), duplicate_mask,
+        invalid_raw_requirements,
+    )
+    @test (converted.depth_left, converted.guarded_left, converted.provider_fuel, converted.node_budget) ==
+        (1, 2, 3, 4)
+    @test converted.scope_tys === scope
+    @test converted.capability_mask === duplicate_mask
+    @test converted.requirements === invalid_raw_requirements
+
+    success_new, error_new, events_new = conversion_attempt(
+        CG.GenerationQuery, :none, target, scope, duplicate_mask, invalid_raw_requirements,
+    )
+    success_old, error_old, events_old = conversion_attempt(
+        ReferenceGenerationQuery, :none, target, scope, duplicate_mask, invalid_raw_requirements,
+    )
+    @test error_new === nothing && error_old === nothing
+    @test events_new == events_old == [:target, :scope, :depth, :capabilities, :requirements]
+    @test success_new.target_ty === success_old.target_ty === target
+    @test success_new.scope_tys === success_old.scope_tys === scope
+    @test success_new.capability_mask === success_old.capability_mask === duplicate_mask
+    @test success_new.requirements === success_old.requirements === invalid_raw_requirements
+    @test success_new.depth_left == success_old.depth_left == 7
+
+    expected_prefixes = (
+        (:scope, [:target, :scope]),
+        (:depth, [:target, :scope, :depth]),
+        (:capabilities, [:target, :scope, :depth, :capabilities]),
+        (:requirements, [:target, :scope, :depth, :capabilities, :requirements]),
+    )
+    for (failure, expected_events) in expected_prefixes
+        _, new_error, new_events = conversion_attempt(
+            CG.GenerationQuery, failure, target, scope, duplicate_mask, invalid_raw_requirements,
+        )
+        _, old_error, old_events = conversion_attempt(
+            ReferenceGenerationQuery, failure, target, scope, duplicate_mask, invalid_raw_requirements,
+        )
+        @test new_error === old_error === ArgumentError
+        @test new_events == old_events == expected_events
+    end
+
+    @test_throws ArgumentError CG.GenerationQuery(target; depth_left=-1)
+end
+
+@testitem "CanonicalGeneration checked query boundary preserves keyword validation order" begin
+    using Test
+    using LambdaRegression.TypeSystem: FloatTy, Ty, TyConst
+
+    CG = LambdaRegression.CanonicalGeneration
+    requirement = CG.UsesScopeBinder(0)
+    requirements = (requirement,)
+    scope = (FloatTy,)
+    duplicate_mask = (:opaque, :opaque)
+
+    public_query = CG.GenerationQuery(
+        FloatTy;
+        scope_tys=scope,
+        depth_left=Int16(2),
+        guarded_left=Int16(3),
+        provider_fuel=Int16(4),
+        node_budget=Int16(19),
+        capability_mask=duplicate_mask,
+        requirements,
+    )
+    checked_query = CG._checked_generation_query(
+        FloatTy, scope, Int16(2), Int16(3), Int16(4), Int16(19), duplicate_mask, requirements,
+    )
+    for field in fieldnames(typeof(public_query))
+        @test getfield(public_query, field) === getfield(checked_query, field)
+    end
+    @test public_query.target_ty === FloatTy
+    @test public_query.scope_tys === scope
+    @test public_query.capability_mask == (:opaque,)
+    @test checked_query.capability_mask == (:opaque,)
+    @test public_query.requirements === requirements
+    @test (public_query.depth_left, public_query.guarded_left, public_query.provider_fuel, public_query.node_budget) == (2, 3, 4, 19)
+    @test (public_query.depth_left, public_query.guarded_left, public_query.provider_fuel, public_query.node_budget) isa NTuple{4,Int}
+
+    function checked_error(args...)
+        try
+            CG._checked_generation_query(args...)
+        catch err
+            return err
+        end
+        return nothing
+    end
+    function public_error(; kwargs...)
+        try
+            CG.GenerationQuery(FloatTy; kwargs...)
+        catch err
+            return err
+        end
+        return nothing
+    end
+
+    bad_scope = (FloatTy, :not_a_type)
+    bad_mask = (:opaque, 1)
+    bad_requirements = (:not_a_requirement,)
+    args(scope_arg, depth, guarded, fuel, nodes, mask, reqs) =
+        (FloatTy, scope_arg, depth, guarded, fuel, nodes, mask, reqs)
+    for (arguments, expected) in (
+        (args(bad_scope, -1, -2, -3, -4, bad_mask, bad_requirements), "depth_left"),
+        (args(bad_scope, 0, -2, -3, -4, bad_mask, bad_requirements), "guarded_left"),
+        (args(bad_scope, 0, 0, -3, -4, bad_mask, bad_requirements), "provider_fuel"),
+        (args(bad_scope, 0, 0, 0, -4, bad_mask, bad_requirements), "node_budget"),
+        (args(bad_scope, 0, 0, 0, 0, bad_mask, bad_requirements), "capabilities"),
+        (args(bad_scope, 0, 0, 0, 0, (:opaque,), bad_requirements), "requirements"),
+        (args(bad_scope, 0, 0, 0, 0, (:opaque,), requirements), "scope entries"),
+    )
+        err = checked_error(arguments...)
+        @test err isa ArgumentError
+        @test occursin(expected, sprint(showerror, err))
+    end
+
+    too_large = BigInt(typemax(Int)) + 1
+    @test checked_error(args(scope, too_large, 0, 0, 0, (), requirements)...) isa InexactError
+    @test public_error(depth_left=too_large) isa InexactError
+end
+
+@testitem "CanonicalGeneration rigid demand keys retain scope order and hooks" begin
+    using Test
+    using LambdaRegression.TypeSystem: FloatTy, Ty, TyConst
+
+    CG = LambdaRegression.CanonicalGeneration
+    struct RigidKeyHookTy <: Ty
+        label::Symbol
+    end
+    hook_events = Any[]
+    function CG._contains_rigid_dummy(ty::RigidKeyHookTy)
+        push!(hook_events, (:contains, ty.label))
+        return true
+    end
+    function CG._cache_type_key(ty::RigidKeyHookTy)
+        push!(hook_events, (:key, ty.label))
+        return (:hook, ty.label)
+    end
+
+    rigid_target = TyConst(Symbol(CG._RIGID_DUMMY_PREFIX, "scope-order"))
+    first = RigidKeyHookTy(:first)
+    last = RigidKeyHookTy(:last)
+    query = CG.GenerationQuery(rigid_target; scope_tys=(first, FloatTy, last))
+    @test CG._rigid_demand_key(query) == (
+        (:target, (:const, rigid_target.name)),
+        (:scope, 0, (:hook, :first)),
+        (:scope, 2, (:hook, :last)),
+    )
+    @test hook_events == [(:contains, :first), (:key, :first), (:contains, :last), (:key, :last)]
+
+    empty!(hook_events)
+    @test CG._rigid_demand_key(CG.GenerationQuery(FloatTy; scope_tys=())) == ()
+    @test isempty(hook_events)
+end
+
+"""Build an ordered type-key tuple through a fixed `Vector{Any}` intermediate.
+Ordinary `Vector`/`Tuple` inputs use one-based sequence order; other inputs use
+native iteration. `typekey` errors propagate. This private sequence contract
+does not emulate arbitrary custom broadcast styles.
+"""
+Base.@noinline Base.@nospecializeinfer function _scope_typekeys(scope, key_fn=typekey)
+    Base.@nospecialize scope
+    Base.@nospecialize key_fn
+    if scope isa Tuple || scope isa Vector
+        keys = Vector{Any}(undef, length(scope))
+        for index in 1:length(scope)
+            @inbounds keys[index] = key_fn(scope[index])
+        end
+        return Tuple(keys)
+    end
+
+    keys = Any[]
+    for ty in scope
+        push!(keys, key_fn(ty))
+    end
+    return Tuple(keys)
 end
 
 _capability_tuple(capabilities::Symbol) = (capabilities,)
@@ -767,6 +1144,15 @@ function add_heads!(provider::AbstractHeadProvider, heads, universe; kwargs...)
     error("canonical head provider $(typeof(provider)) does not implement add_heads!")
 end
 
+"""
+    add_universe_types!(provider, types, keys, universe; kwargs...)
+
+Extend the provider's finite type catalog. `types` is ordered for iteration;
+`keys` is an internal structural index shared with `universe.typekeys` during
+the callback. Add types with `add_universe_type!(types, keys, ty)`, query with
+`ty in universe`, and iterate over `universe.types` rather than inspecting the
+index directly.
+"""
 function add_universe_types!(
     provider::AbstractHeadProvider,
     types,
@@ -1117,11 +1503,12 @@ end
 function _collect_closed_types!(types::Vector{Ty}, keys::Set{Any}, ty::TyLike)
     ty isa Ty || return types
     _in_closed_fragment(ty) || return types
-    key = typekey(ty)
-    if key ∉ keys
-        push!(keys, key)
-        push!(types, ty)
-    end
+    key = _StructuralKey(typekey(ty))
+    # In this internal index, a registered parent key implies its closed
+    # descendants were already registered by this preorder/add_universe_type! path.
+    key in keys && return types
+    push!(keys, key)
+    push!(types, ty)
     if ty isa TyFun
         _collect_closed_types!(types, keys, ty.arg)
         _collect_closed_types!(types, keys, ty.res)
@@ -1161,7 +1548,9 @@ function _collect_lengths!(lengths::Set{Int}, ty::Ty)
     return lengths
 end
 
-_type_in_universe(universe::CoreUniverse, ty::Ty) = typekey(ty) in universe.typekeys
+Base.in(ty::Ty, universe::CoreUniverse) = _StructuralKey(typekey(ty)) in universe.typekeys
+
+_type_in_universe(universe::CoreUniverse, ty::Ty) = ty in universe
 
 function _tyctx_from(ctxs::AbstractDict{Symbol,<:Any}...)
     out = Dict{Symbol,TyLike}()
@@ -1200,7 +1589,14 @@ function _typed_context(
     return tyctx
 end
 
-function _build_core_catalog(
+function _build_core_catalog(universe::CoreUniverse; kwargs...)
+    prepared, heads = _build_core_heads(universe; kwargs...)
+    return CoreCatalog(prepared, heads, _core_rules(heads, prepared))
+end
+
+# Head preparation is also consumed by target-local evidence indexes, which
+# build their own rules. Do not build an unused all-target rule vector there.
+function _build_core_heads(
     universe::CoreUniverse;
     global_consts::AbstractDict{Symbol,<:Any}=Dict{Symbol,Any}(),
     global_consts_ty::AbstractDict{Symbol,<:Any}=Dict{Symbol,Any}(),
@@ -1211,8 +1607,17 @@ function _build_core_catalog(
     scope_source_tys::AbstractVector{<:Ty}=Ty[],
     providers::Tuple=default_head_providers(),
     catalog_target_ty=nothing,
+    _precollected_inputs::Bool=false,
 )
     providers = _provider_tuple(providers)
+    # Only adjacent internal callers establish this provenance: their universe
+    # has just collected these exact type contexts and scope. Complete explicit
+    # types prevent value inference from adding another type. Unknown callbacks
+    # retain the original preparation path; no flag is passed to providers.
+    precollected = _precollected_inputs &&
+        all(_evidence_catalog_domain_sharing, providers) &&
+        _context_values_typed(global_consts, global_consts_ty) &&
+        _context_values_typed(local_consts, local_consts_ty)
     universe = _extend_core_universe(
         universe,
         providers;
@@ -1224,6 +1629,7 @@ function _build_core_catalog(
         preset_types,
         scope_source_tys,
         catalog_target_ty,
+        _precollected_inputs=precollected,
     )
     heads = HeadEntry[]
     for provider in providers
@@ -1242,9 +1648,11 @@ function _build_core_catalog(
         )
     end
     _filter_rigid_heads!(heads)
-    rules = _core_rules(heads, universe)
-    return CoreCatalog(universe, heads, rules)
+    return universe, heads
 end
+
+_context_values_typed(values::AbstractDict, types::AbstractDict) =
+    all(name -> get(types, name, nothing) isa TyLike, keys(values))
 
 function _extend_core_universe(
     universe::CoreUniverse,
@@ -1257,13 +1665,16 @@ function _extend_core_universe(
     preset_types::AbstractDict{Symbol,<:Any}=Dict{Symbol,Any}(),
     scope_source_tys::AbstractVector{<:Ty}=Ty[],
     catalog_target_ty=nothing,
+    _precollected_inputs::Bool=false,
 )
     types = copy(universe.types)
     keys = copy(universe.typekeys)
-    _collect_ctx_types!(types, keys, _typed_context(global_consts, global_consts_ty))
-    _collect_ctx_types!(types, keys, _typed_context(local_consts, local_consts_ty))
-    for ty in scope_source_tys
-        _collect_closed_types!(types, keys, ty)
+    if !_precollected_inputs
+        _collect_ctx_types!(types, keys, _typed_context(global_consts, global_consts_ty))
+        _collect_ctx_types!(types, keys, _typed_context(local_consts, local_consts_ty))
+        for ty in scope_source_tys
+            _collect_closed_types!(types, keys, ty)
+        end
     end
     for provider in providers
         add_universe_types!(
@@ -1449,7 +1860,7 @@ function _finite_scheme_instances(scheme::TyScheme, universe::CoreUniverse)
         assignment = Dict{TyVar,Ty}(var => value for (var, value) in zip(scheme.vars, assignment_values))
         ty = _subst_scheme_ty(scheme.ty, assignment)
         _in_closed_fragment(ty) || continue
-        key = typekey(ty)
+        key = _StructuralKey(typekey(ty))
         key in seen && continue
         push!(seen, key)
         push!(instances, ty)
@@ -1732,7 +2143,11 @@ function _scope_application_rules(
                     scope_ty,
                     rest,
                     argument_tys,
-                    [_argument_class(arg) for arg in argument_tys],
+                    # A scoped function is an ordinary core application.
+                    # Its array operands have Known premises; the anchored
+                    # source policy belongs to primitive constructor rules.
+                    [arg isa TyArray ? :closed_recursive : _argument_class(arg)
+                     for arg in argument_tys],
                 ),
             )
         end
@@ -1868,7 +2283,28 @@ default sampler builds one derivation with bounded recursive depth and node
 fuel instead of materializing the whole proof frontier first.
 """
 struct DefaultArgumentPlanner end
-struct WeightedDerivationSampler end
+"""Weighted bounded sampling, optionally followed by one root-owned frontier.
+
+`completion_probability=0` retains the original bounded route and RNG usage.
+A positive probability uses finite complete-packet preparation, then shared
+irreversible completion; `completion_grace_steps` exempts that many root
+boundaries. Initial preparation may fail. Only reviewed finite built-in policies
+support this explicit mode; unsupported policies raise `ArgumentError` before
+preparation. Existing depth/node bounds still apply, and this is not a promise
+that every interior policy is independently explorable.
+"""
+struct WeightedDerivationSampler
+    completion_probability::Float64
+    completion_grace_steps::Int
+    function WeightedDerivationSampler(; completion_probability::Real=0,
+        completion_grace_steps::Integer=0)
+        probability = Float64(completion_probability)
+        isfinite(probability) && 0 <= probability <= 1 ||
+            throw(ArgumentError("completion_probability must be finite and in [0, 1]"))
+        return new(probability,
+            _checked_nonnegative_int(:completion_grace_steps, completion_grace_steps))
+    end
+end
 struct DefaultAstMaterializer end
 
 struct GenerationConfig{R<:Random.AbstractRNG,P,A,S,M}
@@ -2000,10 +2436,28 @@ struct DerivationSampleSet
     total_weight::Float64
 end
 
+"""Root-owned, irreversible completion state, independent of refundable node fuel."""
+mutable struct GenerationCompletionState
+    probability::Float64
+    grace_left::Int
+    completing::Bool
+    boundaries::Int
+end
+
+function GenerationCompletionState(; probability::Real=0.0, grace_steps::Integer=0)
+    p = Float64(probability)
+    isfinite(p) && 0 <= p <= 1 || throw(ArgumentError("completion probability must be in [0, 1]"))
+    return GenerationCompletionState(p, _checked_nonnegative_int(:grace_steps, grace_steps), false, 0)
+end
+
 mutable struct DerivationSamplingState{R<:Random.AbstractRNG}
     rng::R
     nodes_left::Int
+    completion::GenerationCompletionState
 end
+
+DerivationSamplingState(rng::Random.AbstractRNG, nodes_left::Int) =
+    DerivationSamplingState(rng, nodes_left, GenerationCompletionState())
 
 struct KnownWitnessCacheEntry
     witness::CoreDerivation
@@ -2021,6 +2475,7 @@ mutable struct CoreRelation{A}
     list_access_sources::Dict{Any,Any}
     known_witnesses::Dict{Any,Union{Nothing,KnownWitnessCacheEntry}}
     restricted_relations::Dict{Any,Any}
+    evidence_worlds::Dict{Any,Any}
     global_consts::Dict{Symbol,Any}
     local_consts::Dict{Symbol,Any}
     global_consts_ty::Dict{Symbol,TyLike}
@@ -2061,6 +2516,7 @@ function CoreRelation(;
         Dict{Any,Vector{CoreDerivation}}(),
         Dict{Any,Any}(),
         Dict{Any,Union{Nothing,KnownWitnessCacheEntry}}(),
+        Dict{Any,Any}(),
         Dict{Any,Any}(),
         _anydict(global_consts),
         _anydict(local_consts),
@@ -2195,13 +2651,141 @@ function _merge_derivation_capabilities(initial, derivations)
     return Tuple(out)
 end
 
-function _merge_derivation_metadata(derivations)
+const _DERIVATION_METADATA_SAFE_LEAF = Union{
+    Symbol, Nothing, Bool, Char,
+    Int8, Int16, Int32, Int64, Int128,
+    UInt8, UInt16, UInt32, UInt64, UInt128,
+    Float16, Float32, Float64, DataType,
+}
+
+_derivation_metadata_safe_leaf(value) = value isa _DERIVATION_METADATA_SAFE_LEAF
+
+# This conservative fast path is for provider metadata trees only. Its Vector
+# storage probe checks the Julia 1.12 Array/GenericMemory layout; any absent or
+# incompatible internal API/layout fails closed to Base.deepcopy.
+function _derivation_metadata_vector_storage_ok!(value, storage_owners)
+    isdefined(Core, :memoryrefoffset) || return false
+    isdefined(Base, :dataids) || return false
+    hasfield(typeof(value), :ref) || return false
+
+    local offset, memory_length, dataids
+    try
+        ref = getfield(value, :ref)
+        hasfield(typeof(ref), :mem) || return false
+        memory = getfield(ref, :mem)
+        memoryrefoffset = getfield(Core, :memoryrefoffset)
+        array_dataids = getfield(Base, :dataids)
+        applicable(memoryrefoffset, ref) || return false
+        applicable(length, memory) || return false
+        applicable(array_dataids, value) || return false
+        offset = memoryrefoffset(ref)
+        memory_length = length(memory)
+        dataids = array_dataids(value)
+    catch
+        return false
+    end
+
+    offset == 1 || return false
+    memory_length == length(value) || return false
+    isempty(dataids) && return false
+    for dataid in dataids
+        dataid isa UInt || return false
+        if haskey(storage_owners, dataid) && storage_owners[dataid] !== value
+            return false
+        end
+        storage_owners[dataid] = value
+    end
+    return true
+end
+
+Base.@noinline Base.@nospecializeinfer function _derivation_metadata_preflight!(
+    value,
+    mutable_seen,
+    storage_owners,
+)
+    Base.@nospecialize value mutable_seen storage_owners
+
+    _derivation_metadata_safe_leaf(value) && return true
+    if value isa Tuple
+        for child in value
+            _derivation_metadata_preflight!(child, mutable_seen, storage_owners) || return false
+        end
+        return true
+    elseif typeof(value) === Dict{Symbol,Any}
+        haskey(mutable_seen, value) && return false
+        mutable_seen[value] = nothing
+        for child in values(value)
+            _derivation_metadata_preflight!(child, mutable_seen, storage_owners) || return false
+        end
+        return true
+    elseif typeof(value) === Vector{Any}
+        haskey(mutable_seen, value) && return false
+        mutable_seen[value] = nothing
+        _derivation_metadata_vector_storage_ok!(value, storage_owners) || return false
+        for index in eachindex(value)
+            isassigned(value, index) || return false
+            _derivation_metadata_preflight!(value[index], mutable_seen, storage_owners) || return false
+        end
+        return true
+    end
+    return false
+end
+
+Base.@noinline Base.@nospecializeinfer function _derivation_metadata_tree_eligible(value)
+    Base.@nospecialize value
+    return _derivation_metadata_preflight!(value, IdDict{Any,Nothing}(), Dict{UInt,Any}())
+end
+
+Base.@noinline Base.@nospecializeinfer function _copy_derivation_metadata_tree(value)
+    Base.@nospecialize value
+    _derivation_metadata_safe_leaf(value) && return value
+
+    if value isa Tuple
+        fields = Vector{Any}(undef, length(value))
+        for index in eachindex(value)
+            fields[index] = _copy_derivation_metadata_tree(value[index])
+        end
+        return Tuple(fields)
+    elseif typeof(value) === Dict{Symbol,Any}
+        copied = Dict{Symbol,Any}()
+        for (key, child) in value
+            copied[key] = _copy_derivation_metadata_tree(child)
+        end
+        return copied
+    elseif typeof(value) === Vector{Any}
+        copied = Vector{Any}(undef, length(value))
+        for index in eachindex(value)
+            copied[index] = _copy_derivation_metadata_tree(value[index])
+        end
+        return copied
+    end
+    error("derivation metadata tree copy called without successful preflight")
+end
+
+"""
+    _copy_derivation_metadata(value)
+
+Copy one opaque derivation-metadata value. A conservative tree fast path handles
+Tuple, exact Dict{Symbol,Any}, compact exact Vector{Any}, and listed atomic
+leaves. Strings, custom values, mutable aliases/cycles, and unsupported vector
+storage use one whole-value `deepcopy` fallback. Each call owns its own
+preflight state; metadata keys never share a copy memo.
+"""
+Base.@noinline Base.@nospecializeinfer function _copy_derivation_metadata(value)
+    Base.@nospecialize value
+    return _derivation_metadata_tree_eligible(value) ?
+        _copy_derivation_metadata_tree(value) : deepcopy(value)
+end
+
+Base.@noinline Base.@nospecializeinfer function _merge_derivation_metadata(derivations)
+    Base.@nospecialize derivations
+    derivation_values = collect(CoreDerivation, derivations)
     out = Dict{Symbol,Any}()
-    for derivation in derivations
+    for derivation in derivation_values
         for (key, value) in pairs(derivation_metadata(derivation))
             symbol = Symbol(key)
             if !haskey(out, symbol)
-                out[symbol] = deepcopy(value)
+                out[symbol] = _copy_derivation_metadata(value)
             elseif out[symbol] isa AbstractVector && value isa AbstractVector
                 append!(out[symbol], value)
             elseif !isequal(out[symbol], value)
@@ -2251,7 +2835,8 @@ function derivation_calls_scope_binder(
         derivation_calls_scope_binder(d.fallback, index, offset)
 end
 
-function _signature_calls_scope_binder(signature, index::Int)
+Base.@noinline Base.@nospecializeinfer function _signature_calls_scope_binder(signature, index::Int)
+    Base.@nospecialize signature
     signature isa Tuple || return false
     isempty(signature) && return false
     tag = signature[1]
@@ -2261,10 +2846,10 @@ function _signature_calls_scope_binder(signature, index::Int)
         length(signature) >= 4 || return false
         arguments = signature[4]
         signature[2] == index && !isempty(arguments) && return true
-        return any(argument -> _signature_calls_scope_binder(argument, index), arguments)
+        return _scope_any(argument -> _signature_calls_scope_binder(argument, index), arguments)
     elseif tag === :head
         length(signature) >= 5 || return false
-        return any(argument -> _signature_calls_scope_binder(argument, index), signature[5])
+        return _scope_any(argument -> _signature_calls_scope_binder(argument, index), signature[5])
     elseif tag === :safe_list_access
         length(signature) >= 7 || return false
         return _signature_calls_scope_binder(signature[5], index) ||
@@ -2289,7 +2874,9 @@ end
 function _attach_derivation_metadata!(metadata::Dict{Symbol,Any}, derivation::CoreDerivation)
     extra = derivation_metadata(derivation)
     isempty(extra) && return metadata
-    metadata[:derivation_metadata] = Dict{Symbol,Any}(Symbol(key) => value for (key, value) in pairs(extra))
+    metadata[:derivation_metadata] = Dict{Symbol,Any}(
+        Pair{Symbol,Any}(Symbol(key), value) for (key, value) in pairs(extra)
+    )
     return metadata
 end
 
@@ -2492,12 +3079,75 @@ function generate_canonical(
         :rng_type => typeof(config.rng),
         :known_count => known_count,
         :scope_count => scope_count,
-        :derivation => _derivation_signature(derivation),
+        Pair{Symbol,Any}(:derivation, _derivation_signature(derivation)),
     )
     _attach_derivation_metadata!(metadata, derivation)
     return finalize_result(GenerationResult(
         AstTree(node), target_ty, result_local_consts, result_local_const_types, metadata,
     ))
+end
+
+"""Run one scoped constructor with owned output constants and a borrowed relation.
+
+Output dictionaries always belong to this call. `source_local_consts` controls
+only their admission to the relation; masking them never drops output material.
+Cache identity and provider admission retain the existing scoped policy. A
+cached relation's local inputs are refreshed under its lock, held until the
+constructor returns or throws. Target/scope checks and result verification
+remain the public entry's responsibility.
+"""
+function _with_scoped_generation_materials(
+    construct,
+    config::GenerationConfig;
+    global_consts,
+    global_consts_ty,
+    local_consts,
+    local_consts_ty,
+    presets,
+    preset_types,
+    source_local_consts::Bool=true,
+    capability_mask=(),
+    cache_relation::Bool=true,
+)
+    result_local_consts = _anydict(local_consts)
+    result_local_const_types = _typed_context(local_consts, local_consts_ty)
+    relation_local_consts = source_local_consts ? result_local_consts : Dict{Symbol,Any}()
+    relation_local_const_types = source_local_consts ? result_local_const_types : Dict{Symbol,TyLike}()
+    mask = _capability_tuple(capability_mask)
+    cache_key = (cache_relation && _uses_lazy_sampling(config)) ? _scoped_lazy_relation_cache_key(
+        config.weights, global_consts, global_consts_ty,
+        relation_local_consts, relation_local_const_types, presets, preset_types,
+        config.providers, config.argument_planner, config.guarded_expansion_depth, mask,
+    ) : nothing
+    if cache_key !== nothing
+        entry = _get_scoped_lazy_relation_cache_entry(
+            cache_key, config.weights, config.providers, config.argument_planner,
+            config.guarded_expansion_depth, global_consts, global_consts_ty,
+            relation_local_consts, relation_local_const_types, mask,
+        )
+        lock(entry.lock)
+        try
+            entry.relation.local_consts = relation_local_consts
+            entry.relation.local_consts_ty = relation_local_const_types
+            return construct(entry.relation, result_local_consts, result_local_const_types)
+        finally
+            unlock(entry.lock)
+        end
+    end
+    relation = CoreRelation(
+        global_consts=global_consts,
+        global_consts_ty=global_consts_ty,
+        local_consts=relation_local_consts,
+        local_consts_ty=relation_local_const_types,
+        presets=presets,
+        preset_types=preset_types,
+        weights=config.weights,
+        providers=config.providers,
+        argument_planner=config.argument_planner,
+        guarded_expansion_depth=config.guarded_expansion_depth,
+        capability_mask=mask,
+    )
+    return construct(relation, result_local_consts, result_local_const_types)
 end
 
 """
@@ -2584,71 +3234,21 @@ function generate_canonical_scoped(
     target_ty isa Ty || return Err(UnsupportedCanonicalGenerationTarget(target_ty))
     _generation_target_supported(target_ty, config) ||
         return Err(UnsupportedCanonicalGenerationTarget(target_ty))
-    scope = Ty[scope_tys...]
+    scope = _scope_type_vector(scope_tys)
     _generation_scope_supported(scope, config) ||
         return Err(UnsupportedCanonicalGenerationTarget(target_ty))
 
-    result_local_consts = _anydict(local_consts)
-    result_local_const_types = _typed_context(local_consts, local_consts_ty)
-    relation_local_consts = source_local_consts ? result_local_consts : Dict{Symbol,Any}()
-    relation_local_const_types = source_local_consts ? result_local_const_types : Dict{Symbol,TyLike}()
-    mask = _capability_tuple(capability_mask)
-    cache_key = (_cache_relation && _uses_lazy_sampling(config)) ? _scoped_lazy_relation_cache_key(
-        config.weights,
-        global_consts,
-        global_consts_ty,
-        relation_local_consts,
-        relation_local_const_types,
-        presets,
-        preset_types,
-        config.providers,
-        config.argument_planner,
-        config.guarded_expansion_depth,
-        mask,
-    ) : nothing
-    if cache_key !== nothing
-        entry = _get_scoped_lazy_relation_cache_entry(
-            cache_key,
-            config.weights,
-            config.providers,
-            config.argument_planner,
-            config.guarded_expansion_depth,
-            global_consts,
-            global_consts_ty,
-            relation_local_consts,
-            relation_local_const_types,
-            mask,
+    result = _with_scoped_generation_materials(
+        config;
+        global_consts, global_consts_ty, local_consts, local_consts_ty,
+        presets, preset_types, source_local_consts, capability_mask,
+        cache_relation=_cache_relation,
+    ) do relation, result_local_consts, result_local_const_types
+        _generate_scoped_result(
+            relation, config, target_ty, scope, result_local_consts, result_local_const_types,
         )
-        lock(entry.lock)
-        result = try
-            entry.relation.local_consts = relation_local_consts
-            entry.relation.local_consts_ty = relation_local_const_types
-            _generate_scoped_result(
-                entry.relation, config, target_ty, scope,
-                result_local_consts, result_local_const_types,
-            )
-        finally
-            unlock(entry.lock)
-        end
-        return finalize_result(result)
     end
-
-    relation = CoreRelation(
-        global_consts=global_consts,
-        global_consts_ty=global_consts_ty,
-        local_consts=relation_local_consts,
-        local_consts_ty=relation_local_const_types,
-        presets=presets,
-        preset_types=preset_types,
-        weights=config.weights,
-        providers=config.providers,
-        argument_planner=config.argument_planner,
-        guarded_expansion_depth=config.guarded_expansion_depth,
-        capability_mask=mask,
-    )
-    return finalize_result(_generate_scoped_result(
-        relation, config, target_ty, scope, result_local_consts, result_local_const_types,
-    ))
+    return finalize_result(result)
 end
 
 function _generate_lazy_result(
@@ -2658,7 +3258,7 @@ function _generate_lazy_result(
     result_local_consts::Dict{Symbol,Any},
     result_local_const_types::Dict{Symbol,TyLike},
 )
-    state = DerivationSamplingState(config.rng, config.sampling_node_budget)
+    state = _configured_sampling_state(config)
     derivation = _sample_root_generation_derivation(
         state,
         relation,
@@ -2676,9 +3276,10 @@ function _generate_lazy_result(
         :known_count => known_count,
         :scope_count => scope_count,
         :sampling_nodes_used => config.sampling_node_budget - state.nodes_left,
-        :derivation => _derivation_signature(derivation),
+        Pair{Symbol,Any}(:derivation, _derivation_signature(derivation)),
     )
     _attach_derivation_metadata!(metadata, derivation)
+    _attach_root_completion_metadata!(metadata, state)
     return GenerationResult(AstTree(node), target_ty, result_local_consts, result_local_const_types, metadata)
 end
 
@@ -2691,7 +3292,7 @@ function _generate_scoped_result(
     result_local_const_types::Dict{Symbol,TyLike},
 )
     if _uses_lazy_sampling(config)
-        state = DerivationSamplingState(config.rng, config.sampling_node_budget)
+        state = _configured_sampling_state(config)
         derivation = _sample_root_generation_derivation(
             state,
             relation,
@@ -2709,10 +3310,11 @@ function _generate_scoped_result(
             :known_count => known_count,
             :scope_count => scope_count,
             :sampling_nodes_used => config.sampling_node_budget - state.nodes_left,
-            :scope_tys => Tuple(typekey.(scope_tys)),
-            :derivation => _derivation_signature(derivation),
+            Pair{Symbol,Any}(:scope_tys, _scope_typekeys(scope_tys)),
+            Pair{Symbol,Any}(:derivation, _derivation_signature(derivation)),
         )
         _attach_derivation_metadata!(metadata, derivation)
+        _attach_root_completion_metadata!(metadata, state)
         return GenerationResult(AstTree(node), target_ty, result_local_consts, result_local_const_types, metadata)
     end
 
@@ -2734,8 +3336,8 @@ function _generate_scoped_result(
         :rng_type => typeof(config.rng),
         :known_count => known_count,
         :scope_count => scope_count,
-        :scope_tys => Tuple(typekey.(scope_tys)),
-        :derivation => _derivation_signature(derivation),
+        Pair{Symbol,Any}(:scope_tys, _scope_typekeys(scope_tys)),
+        Pair{Symbol,Any}(:derivation, _derivation_signature(derivation)),
     )
     _attach_derivation_metadata!(metadata, derivation)
     return GenerationResult(AstTree(node), target_ty, result_local_consts, result_local_const_types, metadata)
@@ -2746,6 +3348,25 @@ function _relation_counts(relation::CoreRelation)
         sum(length, values(relation.derivations); init=0),
         length(Set(first(key) for key in keys(relation.derivations))),
     )
+end
+
+function _configured_sampling_state(config::GenerationConfig)
+    sampler = config.sampler::WeightedDerivationSampler
+    return DerivationSamplingState(config.rng, config.sampling_node_budget,
+        GenerationCompletionState(probability=sampler.completion_probability,
+            grace_steps=sampler.completion_grace_steps))
+end
+
+function _attach_root_completion_metadata!(metadata, state::DerivationSamplingState)
+    state.completion.probability > 0 || return metadata
+    metadata[:certified_completion] = (
+        protocol=:shared_root_bounded_packets,
+        probability=state.completion.probability,
+        boundaries=state.completion.boundaries,
+        switched=state.completion.completing,
+        initial_preparation=:bounded_candidate,
+    )
+    return metadata
 end
 
 function _default_relation_cache_key(
@@ -2905,8 +3526,9 @@ function _weights_key(weights::GenerationWeights)
 end
 
 # Core relation keys are intentionally structural inside the closed fragment.
-# Context-level `TyLike` keys use semantic μ identity because they decide cache
-# interchangeability across schemes and recursive representations.
+# Context-level keys need a sound interchangeability test, not the coarsest
+# semantic quotient. Small exact closed trees can use a finer cheap identity;
+# schemes and recursive/unknown representations retain semantic μ identity.
 _cache_type_key(ty::TyConst) = (:const, ty.name)
 _cache_type_key(ty::TyVar) =
     ty.instance === nothing ?
@@ -2919,7 +3541,15 @@ _cache_type_key(ty::TyFun) = (:fun, _cache_type_key(ty.arg), _cache_type_key(ty.
 _cache_type_key(ty::TyProd) = (:prod, _cache_type_key(ty.left), _cache_type_key(ty.right))
 _cache_type_key(ty::TySum) = (:sum, _cache_type_key(ty.left), _cache_type_key(ty.right))
 _cache_type_key(ty::TyMu) = (:mu, _cache_type_key(ty.var), _cache_type_key(ty.body))
-_cache_tylike_key(ty::TyLike) = TypeSystem.semantic_typekey(ty)
+function _cache_tylike_key(ty::TyLike)
+    # This is the existing total fast-path classifier, not an admission limit.
+    # Cyclic or large graphs exhaust it before structural recursion;
+    # no result is memoised by object identity across a possible mutation.
+    if ty isa Ty && _grounded_closed_fragment_fuel(ty, 64) >= 0
+        return (:exact_closed_tree, _cache_type_key(ty))
+    end
+    return (:semantic_type, TypeSystem.semantic_typekey(ty))
+end
 _closed_type_key(ty::Ty) = _cache_type_key(ty)
 
 function _merge_capabilities(inherited::Tuple{Vararg{Symbol}}, requested)
@@ -2993,10 +3623,11 @@ end
 
 function _rebase_inherited_requirements(parent::GenerationQuery, added::Int)
     isempty(parent.requirements) && return ()
-    return Tuple(
-        rebase_generation_requirement(requirement, added)
-        for requirement in parent.requirements
-    )
+    rebased = Vector{Any}(undef, length(parent.requirements))
+    for index in 1:length(parent.requirements)
+        @inbounds rebased[index] = rebase_generation_requirement(parent.requirements[index], added)
+    end
+    return Tuple(rebased)
 end
 
 function _effective_generation_query(relation::CoreRelation, query::GenerationQuery)
@@ -3049,7 +3680,8 @@ end
 function _rigid_demand_key(query::GenerationQuery)
     rigid_types = Any[]
     _contains_rigid_dummy(query.target_ty) && push!(rigid_types, (:target, _cache_type_key(query.target_ty)))
-    for (index, ty) in enumerate(query.scope_tys)
+    for index in 1:length(query.scope_tys)
+        ty = query.scope_tys[index]
         _contains_rigid_dummy(ty) || continue
         push!(rigid_types, (:scope, index - 1, _cache_type_key(ty)))
     end
@@ -3066,7 +3698,7 @@ function _generation_query_cache_key(query::GenerationQuery, admitted_providers:
         query.capability_mask,
         provider_key,
         _cache_type_key(query.target_ty),
-        Tuple(_cache_type_key.(query.scope_tys)),
+        _scope_typekeys(query.scope_tys, _cache_type_key),
         query.depth_left,
         query.guarded_left,
         query.provider_fuel,
@@ -3197,17 +3829,18 @@ function _known_generation_witness(
         entry.nodes <= query.node_budget || return nothing
         return borrow_cached ? entry.witness : _copy_generation_witness(entry.witness)
     end
-    restricted, effective = _fresh_known_relation(relation, query)
+    restricted, effective = _relation_for_query(relation, query)
     forbidden = _forbidden_scope_binders(effective)
-    memo = Dict{Any,Union{Nothing,CoreDerivation}}()
-    witness = _known_generation_witness!(
-        restricted,
-        effective.target_ty,
-        Ty[effective.scope_tys...],
-        effective.depth_left,
-        memo,
-        forbidden,
-    )
+    witness = if _finite_evidence_request_supported(restricted, effective)
+        _finite_evidence_witness(restricted, effective; reuse=cache_key !== nothing)
+    else
+        # Recursive/custom catalogue boundaries are migrated separately. This
+        # explicit bounded path does not claim the closed-core evidence theorem.
+        restricted, effective = _fresh_known_relation(relation, query)
+        _known_generation_witness!(restricted, effective.target_ty,
+            _scope_type_vector(effective.scope_tys), effective.depth_left,
+            Dict{Any,Union{Nothing,CoreDerivation}}(), forbidden)
+    end
     nodes = witness === nothing ? 0 : derivation_node_count(witness)
     if cache_key !== nothing
         relation.known_witnesses[cache_key] = if witness === nothing
@@ -3241,7 +3874,7 @@ function _known_witness_cache_key(relation::CoreRelation, query::GenerationQuery
     return (
         :known_witness,
         _cache_type_key(effective.target_ty),
-        Tuple(_cache_type_key.(effective.scope_tys)),
+        _scope_typekeys(effective.scope_tys, _cache_type_key),
         effective.depth_left,
         effective.capability_mask,
         _weights_key(relation.weights),
@@ -3495,26 +4128,14 @@ function _known_scope_generation_arguments(
     depth_left >= 0 || return nothing
     args = CoreDerivation[]
     for argument_ty in argument_tys
-        argument = if _argument_class(argument_ty) == :source_array
-            _known_source_array_witness(
-                relation,
-                argument_ty,
-                scope_tys,
-                depth_left,
-                0,
-                memo,
-                forbidden,
-            )
-        else
-            _known_generation_witness!(
-                relation,
-                argument_ty,
-                scope_tys,
-                depth_left,
-                memo,
-                forbidden,
-            )
-        end
+        argument = _known_generation_witness!(
+            relation,
+            argument_ty,
+            scope_tys,
+            depth_left,
+            memo,
+            forbidden,
+        )
         argument === nothing && return nothing
         push!(args, argument)
     end
@@ -3633,7 +4254,12 @@ function _known_generation_rules(
     for rule in rules
         push!(
             signatures,
-            (rule.head.source, rule.head.name, typekey(rule.head.type), Tuple(typekey.(rule.argument_tys))),
+            _StructuralKey((
+                rule.head.source,
+                rule.head.name,
+                typekey(rule.head.type),
+                _scope_typekeys(rule.argument_tys),
+            )),
         )
     end
     for head in (catalog.heads..., _extension_context_heads(relation)...)
@@ -3644,7 +4270,12 @@ function _known_generation_rules(
         isempty(args) && continue
         iscompatible(result, target_ty) || continue
         all(_in_generation_extension_fragment, args) || continue
-        signature = (head.source, head.name, typekey(head.type), Tuple(typekey.(args)))
+        signature = _StructuralKey((
+            head.source,
+            head.name,
+            typekey(head.type),
+            _scope_typekeys(args),
+        ))
         signature in signatures && continue
         push!(signatures, signature)
         push!(rules, CoreRule(head, result, args, [_argument_class(arg) for arg in args]))
@@ -3697,7 +4328,7 @@ function _generation_extension_options(relation::CoreRelation, query::Generation
     query.depth_left > 0 && query.provider_fuel > 0 || return NamedTuple[]
     admitted = _admitted_providers(relation.generation_providers, query.capability_mask)
     recursive_query = !_in_closed_fragment(query.target_ty) ||
-        !all(_in_closed_fragment, query.scope_tys)
+        !_scope_all(_in_closed_fragment, query.scope_tys)
     if recursive_query
         admitted = Tuple(
             provider for provider in admitted
@@ -3710,7 +4341,7 @@ function _generation_extension_options(relation::CoreRelation, query::Generation
     )
     isempty(admitted) && return NamedTuple[]
     query_key = _generation_query_cache_key(query, admitted)
-    cache_key = query_key === nothing ? nothing : (:generation_extensions, query_key)
+    cache_key = query_key === nothing ? nothing : (:generation_extensions, _StructuralKey(query_key))
     if cache_key !== nothing
         cached = get(relation.sampling_options, cache_key, nothing)
         cached === nothing || return cached
@@ -3852,7 +4483,7 @@ function sample_generation_derivation_using_scope_binder(
             state,
             query_relation,
             effective.target_ty,
-            Ty[effective.scope_tys...],
+            _scope_type_vector(effective.scope_tys),
             effective.depth_left,
             effective.guarded_left,
             allow_safe_list_access,
@@ -3869,7 +4500,7 @@ function sample_generation_derivation_using_scope_binder(
         state,
         query_relation,
         effective.target_ty,
-        Ty[effective.scope_tys...],
+        _scope_type_vector(effective.scope_tys),
         effective.depth_left,
         effective.guarded_left,
         1,
@@ -3897,7 +4528,7 @@ end
 
 @testitem "CanonicalGeneration structural runtime keys erase tuple shape" begin
     using Test
-    using LambdaRegression.TypeSystem: FloatTy, Ty, TyList, typekey
+    using LambdaRegression.TypeSystem: FloatTy, Ty, TyFun, TyList, typekey
 
     CG = LambdaRegression.CanonicalGeneration
 
@@ -3931,6 +4562,222 @@ end
     push!(signature_set, CG._StructuralKey(public_signature))
     push!(signature_set, CG._StructuralKey((:var, 0, typekey(FloatTy))))
     @test length(signature_set) == 1
+
+    scope_first = TyList(FloatTy)
+    scope_second = TyFun(FloatTy, FloatTy)
+    scope_input = Ty[scope_first, scope_second]
+    scope_before = copy(scope_input)
+    scope_copy = CG._scope_type_vector(scope_input)
+    single_scope = CG._scope_type_vector((scope_second,))
+    empty_scope = CG._scope_type_vector(())
+    long_tuple = ntuple(i -> isodd(i) ? scope_first : scope_second, 64)
+    long_tuple_copy = CG._scope_type_vector(long_tuple)
+    generator_copy = CG._scope_type_vector((ty for ty in scope_input))
+
+    @test scope_copy isa Vector{Ty}
+    @test scope_copy !== scope_input
+    @test scope_copy == scope_before
+    @test all(scope_copy[i] === scope_input[i] for i in eachindex(scope_input))
+    @test scope_input == scope_before
+    @test single_scope == Ty[scope_second]
+    @test only(single_scope) === scope_second
+    @test isempty(empty_scope)
+    @test long_tuple_copy isa Vector{Ty}
+    @test length(long_tuple_copy) == length(long_tuple) == 64
+    @test all(long_tuple_copy[i] === long_tuple[i] for i in eachindex(long_tuple))
+    @test generator_copy isa Vector{Ty}
+    @test all(generator_copy[i] === scope_input[i] for i in eachindex(scope_input))
+    @test scope_input == scope_before
+    scope_input[1] = FloatTy
+    @test scope_copy[1] === scope_first
+    @test generator_copy[1] === scope_first
+end
+
+@testitem "CanonicalGeneration scope predicates preserve ordered short-circuit semantics" begin
+    using Test
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, Ty, TyFun, TyList
+
+    CG = LambdaRegression.CanonicalGeneration
+    ordered_scope = (FloatTy, TyList(FloatTy), TyFun(FloatTy, BoolTy), BoolTy)
+
+    @test CG._scope_all(_ -> error("empty scope predicate ran"), ())
+    @test CG._scope_all(_ -> error("empty scope predicate ran"), Any[])
+    @test !CG._scope_any(_ -> error("empty scope predicate ran"), ())
+    @test !CG._scope_any(_ -> error("empty scope predicate ran"), Any[])
+    long_scope = ntuple(index -> ordered_scope[mod1(index, length(ordered_scope))], 40)
+    @test length(long_scope) == 40
+    @test CG._scope_all(ty -> ty isa Ty, long_scope)
+    @test CG._scope_all(ty -> ty isa Ty, collect(long_scope))
+    @test !CG._scope_any(_ -> false, long_scope)
+    @test !CG._scope_any(_ -> false, collect(long_scope))
+
+    for scope in (long_scope, collect(long_scope))
+        visited = Any[]
+        @test CG._scope_any(
+            ty -> (push!(visited, ty); isequal(ty, ordered_scope[3])),
+            scope,
+        )
+        @test visited == Any[ordered_scope[1], ordered_scope[2], ordered_scope[3]]
+
+        calls = Ref(0)
+        @test_throws ErrorException CG._scope_any(
+            _ -> begin
+                calls[] += 1
+                calls[] == 2 && error("predicate failure")
+                false
+            end,
+            scope,
+        )
+        @test calls[] == 2
+    end
+
+    tuple_order = Any[]
+    vector_order = Any[]
+    tuple_result = CG._scope_all(ty -> (push!(tuple_order, ty); ty isa Ty), ordered_scope)
+    vector_result = CG._scope_all(
+        ty -> (push!(vector_order, ty); ty isa Ty),
+        collect(ordered_scope),
+    )
+    @test tuple_result === true && vector_result === true
+    @test tuple_order == collect(ordered_scope)
+    @test vector_order == tuple_order
+
+    for scope in (ordered_scope, collect(ordered_scope))
+        visited = Any[]
+        @test !CG._scope_all(
+            ty -> (push!(visited, ty); !isequal(ty, ordered_scope[3])),
+            scope,
+        )
+        @test visited == Any[ordered_scope[1], ordered_scope[2], ordered_scope[3]]
+
+        calls = Ref(0)
+        @test_throws ErrorException CG._scope_all(
+            _ -> begin
+                calls[] += 1
+                calls[] == 2 && error("predicate failure")
+                true
+            end,
+            scope,
+        )
+        @test calls[] == 2
+    end
+
+    fallback_calls = Ref(0)
+    generated_scope = (ty for ty in ordered_scope)
+    @test CG._scope_all(ty -> (fallback_calls[] += 1; ty isa Ty), generated_scope)
+    @test fallback_calls[] == length(ordered_scope)
+
+    fallback_any_calls = Ref(0)
+    generated_any_scope = (ty for ty in ordered_scope)
+    @test CG._scope_any(
+        ty -> (fallback_any_calls[] += 1; isequal(ty, ordered_scope[3])),
+        generated_any_scope,
+    )
+    @test fallback_any_calls[] == 3
+
+    call0 = (:scope_application, 0, :function_type, ((:var, 0, :argument_type),))
+    call1 = (:scope_application, 1, :function_type, ((:var, 0, :argument_type),))
+    call2 = (:scope_application, 2, :function_type, ((:var, 0, :argument_type),))
+    @test CG._signature_calls_scope_binder(call0, 0)
+    @test CG._signature_calls_scope_binder((:lambda, :argument_type, call1), 0)
+    @test CG._signature_calls_scope_binder((:function_def, :id, :type, call1), 0)
+    @test CG._signature_calls_scope_binder((:head, :global, :f, :type, (call0,)), 0)
+    safe_list_signature = (
+        :safe_list_access, :UNCONS_CASE, :list_type, :result_type,
+        (:var, 0, :list_type), call2, call0,
+    )
+    @test CG._signature_calls_scope_binder(safe_list_signature, 0)
+    @test !CG._signature_calls_scope_binder((:lambda, :list_type, safe_list_signature), 0)
+    safe_list_under_lambda = (
+        :lambda,
+        :list_type,
+        (
+            :safe_list_access, :UNCONS_CASE, :list_type, :result_type,
+            (:var, 0, :list_type),
+            (:scope_application, 3, :function_type, ((:var, 0, :argument_type),)),
+            (:scope_application, 1, :function_type, ((:var, 0, :argument_type),)),
+        ),
+    )
+    @test CG._signature_calls_scope_binder(safe_list_under_lambda, 0)
+    @test !CG._signature_calls_scope_binder((:scope_application, 0, :function_type, ()), 0)
+    for malformed in (
+        (:lambda, :argument_type),
+        (:scope_application, 0, :function_type),
+        (:head, :global, :f, :type),
+        (:safe_list_access, :UNCONS_CASE, :list_type, :result_type, (), ()),
+        (:function_def, :id, :type),
+        (:unknown, call0),
+        Any[:scope_application, 0, :function_type, (call0,)],
+    )
+        @test !CG._signature_calls_scope_binder(malformed, 0)
+    end
+
+    genuine_call = CG.LambdaDerivation(
+        FloatTy,
+        CG.ScopeApplicationDerivation(
+            1,
+            TyFun(FloatTy, FloatTy),
+            CG.CoreDerivation[CG.VariableDerivation(0, FloatTy)],
+        ),
+    )
+    @test CG._signature_calls_scope_binder(CG.derivation_signature(genuine_call), 0)
+
+    struct MarkerRequirement <: CG.AbstractGenerationRequirement
+        marker::Base.RefValue{Int}
+    end
+    before = MarkerRequirement(Ref(1))
+    after = MarkerRequirement(Ref(2))
+    call_derivation = CG.ScopeApplicationDerivation(
+        0,
+        TyFun(FloatTy, FloatTy),
+        CG.CoreDerivation[CG.VariableDerivation(1, FloatTy)],
+    )
+    query = CG.GenerationQuery(
+        FloatTy;
+        scope_tys=(FloatTy,),
+        requirements=(before, CG.UsesScopeBinder(0), CG.CallsScopeBinder(0), after),
+    )
+    filtered = CG._without_satisfied_scope_binder_requirements(query, call_derivation)
+    @test filtered !== query
+    @test length(filtered.requirements) == 2
+    @test filtered.requirements[1] === before
+    @test filtered.requirements[2] === after
+    @test CG._without_satisfied_scope_binder_requirements(nothing, call_derivation) === nothing
+
+    no_op = CG.GenerationQuery(FloatTy; requirements=(CG.UsesScopeBinder(9), before))
+    @test CG._without_satisfied_scope_binder_requirements(no_op, call_derivation) === no_op
+    empty_call = CG.ScopeApplicationDerivation(0, TyFun(FloatTy, FloatTy), CG.CoreDerivation[])
+    no_call = CG.GenerationQuery(FloatTy; requirements=(CG.CallsScopeBinder(0),))
+    @test CG._without_satisfied_scope_binder_requirements(no_call, empty_call) === no_call
+
+    malformed_no_op = CG.GenerationQuery(
+        FloatTy,
+        (FloatTy,),
+        0,
+        0,
+        0,
+        16,
+        (),
+        (CG.UsesScopeBinder(9), :invalid_raw_requirement),
+    )
+    @test CG._without_satisfied_scope_binder_requirements(malformed_no_op, call_derivation) === malformed_no_op
+    malformed_after_removal = CG.GenerationQuery(
+        FloatTy,
+        (FloatTy,),
+        0,
+        0,
+        0,
+        16,
+        (),
+        (CG.UsesScopeBinder(0), :invalid_raw_requirement),
+    )
+    @test_throws ArgumentError CG._without_satisfied_scope_binder_requirements(
+        malformed_after_removal,
+        call_derivation,
+    )
+    @test_throws ArgumentError CG.GenerationQuery(FloatTy; requirements=(:invalid_public_requirement,))
+    @test_throws ArgumentError CG.GenerationQuery(FloatTy; scope_tys=(FloatTy, :invalid_scope_type))
+    @test_throws ArgumentError CG.GenerationQuery(FloatTy; depth_left=-1)
 end
 
 function _get_default_lazy_relation_cache_entry(
@@ -4073,6 +4920,11 @@ end
 struct _StructuralKey
     value::Any
     hash_value::UInt
+
+    Base.@noinline Base.@nospecializeinfer function _StructuralKey(value::Any, hash_value::UInt)
+        Base.@nospecialize value
+        return new(value, hash_value)
+    end
 end
 
 function _structural_hash(value)
@@ -4086,7 +4938,7 @@ function _structural_hash(value)
     return result
 end
 
-function _StructuralKey(value::Any)
+Base.@noinline Base.@nospecializeinfer function _StructuralKey(value::Any)
     Base.@nospecialize value
     return _StructuralKey(value, _structural_hash(value))
 end
@@ -4108,7 +4960,7 @@ Base.isequal(left::_StructuralKey, right::_StructuralKey) =
 Base.:(==)(left::_StructuralKey, right::_StructuralKey) = isequal(left, right)
 
 _known_key(scope_tys::Vector{Ty}, target_ty::Ty) =
-    (_StructuralKey(Tuple(typekey.(scope_tys))), _StructuralKey(typekey(target_ty)))
+    (_StructuralKey(_scope_typekeys(scope_tys)), _StructuralKey(typekey(target_ty)))
 
 function _add_variable_derivations!(
     relation::CoreRelation,
@@ -4186,7 +5038,7 @@ function _add_productive_head_derivations!(
                 all_known = false
                 break
             end
-            raw_derivations = _raw_argument_derivations(relation, arg_ty, arg_class, rule, scope_tys)
+            raw_derivations = _productive_argument_derivations(relation, arg_ty, arg_class, rule, scope_tys)
             derivs = _plan_argument_derivations(
                 relation,
                 rule,
@@ -4246,14 +5098,17 @@ function _argument_resolution_order(rule)
     )
 end
 
-function _grounded_derivations(relation::CoreRelation, target_ty::Ty, scope_tys::Vector{Ty})
+# New versioned preparation may supply its owned catalogue without borrowing
+# the legacy query-only cache. The grounded leaf policy itself is unchanged.
+function _grounded_derivations(relation::CoreRelation, target_ty::Ty,
+    scope_tys::Vector{Ty}, catalog::Union{Nothing,CoreCatalog}=nothing)
     out = CoreDerivation[]
     signatures = Set{Any}()
     for (idx0, scope_ty) in enumerate(scope_tys)
-        iscompatible(scope_ty, target_ty) || continue
+        _grounded_iscompatible(scope_ty, target_ty) || continue
         _push_derivation_candidate!(out, signatures, VariableDerivation(idx0 - 1, scope_ty))
     end
-    catalog = _relation_catalog(relation, target_ty, scope_tys)
+    catalog === nothing && (catalog = _relation_catalog(relation, target_ty, scope_tys))
     for head in catalog.heads
         head.type isa Ty || continue
         head.rule_class isa CoreProductive || continue
@@ -4261,10 +5116,322 @@ function _grounded_derivations(relation::CoreRelation, target_ty::Ty, scope_tys:
         _is_instance_factory_head(head) && continue
         _bucket_enabled(relation.weights, head.weight_bucket) || continue
         _head_has_value(head, relation) || continue
-        iscompatible(head.type, target_ty) || continue
+        _grounded_iscompatible(head.type, target_ty) || continue
         _push_derivation_candidate!(out, signatures, ConstantDerivation(head))
     end
     return out
+end
+
+"""Return the old grounded collection's first leaf without building the rest.
+
+The relation supplies constants, catalogue providers, capability policy and
+weights; `scope_tys` retains concrete slot order. Variables deliberately retain
+the grounded helper's policy (no variable-weight gate). Constants retain every
+original admission gate and catalogue order. Unknown/recursive types use the
+existing compatibility predicate. Returns `nothing` when no leaf exists;
+custom whole-vector argument policies must use the collection interface.
+"""
+function _first_grounded_derivation(relation::CoreRelation, target_ty::Ty,
+    scope_tys::Vector{Ty})
+    for (slot, scope_ty) in enumerate(scope_tys)
+        _grounded_iscompatible(scope_ty, target_ty) || continue
+        return VariableDerivation(slot - 1, scope_ty)
+    end
+    for head in _relation_catalog(relation, target_ty, scope_tys).heads
+        head.type isa Ty || continue
+        head.rule_class isa CoreProductive || continue
+        _known_head_admitted(relation, head) || continue
+        _is_instance_factory_head(head) && continue
+        _bucket_enabled(relation.weights, head.weight_bucket) || continue
+        _head_has_value(head, relation) || continue
+        _grounded_iscompatible(head.type, target_ty) || continue
+        return ConstantDerivation(head)
+    end
+    return nothing
+end
+
+@testitem "CanonicalGeneration grounded compatibility compares only certified closed trees" begin
+    using Test
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, Ty, TyArray, TyConst, TyFun
+    using LambdaRegression.TypeSystem: TyList, TyMu, TyNat, TyProd, TyRigid, TyScheme, TySum, TyVar, iscompatible
+
+    CG = LambdaRegression.CanonicalGeneration
+    TS = LambdaRegression.TypeSystem
+
+    higher_order = TyFun(TyFun(FloatTy, BoolTy), TyList(TyArray(TyNat(2), FloatTy)))
+    higher_order_copy = TyFun(
+        TyFun(TyConst(:Float), TyConst(:Bool)),
+        TyList(TyArray(TyNat(2), TyConst(:Float))),
+    )
+    higher_order_negative = TyFun(
+        TyFun(TyConst(:Float), TyConst(:Bool)),
+        TyList(TyArray(TyNat(3), TyConst(:Float))),
+    )
+    closed_pairs = (
+        (FloatTy, TyConst(:Float), true),
+        (FloatTy, BoolTy, false),
+        (TyFun(FloatTy, BoolTy), TyFun(TyConst(:Float), TyConst(:Bool)), true),
+        (TyFun(FloatTy, BoolTy), TyFun(BoolTy, BoolTy), false),
+        (higher_order, higher_order_copy, true),
+        (higher_order, higher_order_negative, false),
+        (TyList(FloatTy), TyList(TyConst(:Float)), true),
+        (TyList(FloatTy), TyList(BoolTy), false),
+        (TyArray(TyNat(2), FloatTy), TyArray(TyNat(2), TyConst(:Float)), true),
+        (TyArray(TyNat(2), FloatTy), TyArray(TyNat(3), FloatTy), false),
+        (TyArray(TyNat(2), FloatTy), TyArray(TyNat(2), BoolTy), false),
+        (FloatTy, TyList(FloatTy), false),
+    )
+    for (left, right, expected) in closed_pairs
+        @test CG._grounded_iscompatible(left, right) == iscompatible(left, right) == expected
+        @test CG._grounded_iscompatible(right, left) == iscompatible(right, left) == expected
+    end
+
+    free = TyVar(8101, 0, nothing)
+    open_function = TyFun(free, FloatTy)
+    open_list = TyList(FloatTy)
+    @test CG._grounded_closed_fragment_fuel(open_function, 64) == -1
+    @test CG._grounded_iscompatible(open_function, open_list) ==
+          iscompatible(open_function, open_list)
+    @test free.instance === nothing
+
+    resolved = TyVar(8102, 0, FloatTy)
+    resolved_function = TyFun(resolved, FloatTy)
+    @test CG._grounded_closed_fragment_fuel(resolved_function, 64) == -1
+    @test CG._grounded_iscompatible(resolved_function, open_list) ==
+          iscompatible(resolved_function, open_list)
+    @test resolved.instance === FloatTy
+
+    binder = TyVar(8103, 0, nothing)
+    recursive = TyMu(binder, TyFun(FloatTy, binder))
+    rigid = TyRigid(8104)
+    product = TyProd(FloatTy, BoolTy)
+    sum = TySum(FloatTy, BoolTy)
+    @test CG._grounded_closed_fragment_fuel(recursive, 64) == -1
+    @test CG._grounded_iscompatible(recursive, recursive) == iscompatible(recursive, recursive)
+    @test CG._grounded_closed_fragment_fuel(rigid, 64) == -1
+    @test CG._grounded_iscompatible(rigid, rigid) == iscompatible(rigid, rigid)
+    @test CG._grounded_closed_fragment_fuel(product, 64) == -1
+    @test CG._grounded_iscompatible(product, sum) == iscompatible(product, sum)
+    @test CG._grounded_closed_fragment_fuel(TyNat(2), 64) == -1
+
+    shared = TyVar(8105, 0, nothing)
+    shared_function = TyFun(shared, shared)
+    independently_instantiable = TyFun(TyVar(8106, 0, nothing), TyVar(8107, 0, nothing))
+    split_target = TyFun(FloatTy, BoolTy)
+    shared_target = TyFun(FloatTy, FloatTy)
+    @test CG._grounded_iscompatible(shared_function, split_target) ==
+          iscompatible(shared_function, split_target) == false
+    @test CG._grounded_iscompatible(split_target, shared_function) ==
+          iscompatible(split_target, shared_function) == false
+    @test CG._grounded_iscompatible(shared_function, shared_target) ==
+          iscompatible(shared_function, shared_target)
+    @test CG._grounded_iscompatible(independently_instantiable, split_target) ==
+          iscompatible(independently_instantiable, split_target)
+    @test CG._grounded_iscompatible(split_target, independently_instantiable) ==
+          iscompatible(split_target, independently_instantiable)
+    @test shared.instance === nothing
+    @test independently_instantiable.arg.instance === nothing
+    @test independently_instantiable.res.instance === nothing
+
+    scheme_var = TyVar(8109, 0, nothing)
+    scheme = TyScheme([scheme_var], TyFun(scheme_var, scheme_var))
+    fallback_pairs = (
+        (resolved_function, open_list),
+        (recursive, TyList(FloatTy)),
+        (rigid, FloatTy),
+        (product, sum),
+        (TyScheme(TyVar[], FloatTy), scheme),
+        (TyNat(2), TyNat(2)),
+    )
+    for (left, right) in fallback_pairs
+        @test CG._grounded_iscompatible(left, right) == iscompatible(left, right)
+        @test CG._grounded_iscompatible(right, left) == iscompatible(right, left)
+    end
+
+    struct GroundedCompatibilityFallbackSentinel <: TS.Ty end
+    fallback_calls = Ref(0)
+    function TS.iscompatible(::GroundedCompatibilityFallbackSentinel, ::TS.TyLike)
+        fallback_calls[] += 1
+        error("sentinel compatibility failure")
+    end
+    @test_throws ErrorException CG._grounded_iscompatible(GroundedCompatibilityFallbackSentinel(), FloatTy)
+    @test fallback_calls[] == 1
+
+    struct GroundedCompatibilityProtocolSentinel <: TS.Ty
+        child::TS.Ty
+        throw_on_children::Bool
+    end
+    protocol_events = Symbol[]
+    function TS.type_constructor_tag(::GroundedCompatibilityProtocolSentinel)
+        push!(protocol_events, :tag)
+        return :GroundedCompatibilityProtocolSentinel
+    end
+    function TS.type_children(ty::GroundedCompatibilityProtocolSentinel)
+        push!(protocol_events, :children)
+        ty.throw_on_children && error("sentinel constructor-children failure")
+        return (ty.child,)
+    end
+    function TS.rebuild_type(
+        ty::GroundedCompatibilityProtocolSentinel,
+        children::Tuple{Ty},
+    )
+        push!(protocol_events, :rebuild)
+        return GroundedCompatibilityProtocolSentinel(children[1], ty.throw_on_children)
+    end
+    function observe_protocol(predicate, left, right)
+        empty!(protocol_events)
+        outcome = try
+            (:return, predicate(left, right))
+        catch err
+            (:error, typeof(err), sprint(showerror, err))
+        end
+        return (outcome, copy(protocol_events))
+    end
+
+    # A closed left side and a right side containing an unknown custom node
+    # must reach the original protocol rather than being rejected shallowly.
+    custom_right = TyFun(
+        GroundedCompatibilityProtocolSentinel(TyVar(8108, 0, FloatTy), false),
+        FloatTy,
+    )
+    original_custom_observation = observe_protocol(iscompatible, TyList(FloatTy), custom_right)
+    grounded_custom_observation = observe_protocol(
+        CG._grounded_iscompatible,
+        TyList(FloatTy),
+        custom_right,
+    )
+    @test grounded_custom_observation == original_custom_observation
+    @test first(grounded_custom_observation) == (:return, false)
+    @test :tag in last(grounded_custom_observation)
+    @test :children in last(grounded_custom_observation)
+    @test :rebuild in last(grounded_custom_observation)
+
+    # A shallow Fun/List mismatch must not hide errors from a nested custom
+    # constructor's protocol hooks during the original compatibility query.
+    custom_throwing_left = TyFun(GroundedCompatibilityProtocolSentinel(FloatTy, true), FloatTy)
+    original_throw_observation = observe_protocol(
+        iscompatible,
+        custom_throwing_left,
+        TyList(FloatTy),
+    )
+    grounded_throw_observation = observe_protocol(
+        CG._grounded_iscompatible,
+        custom_throwing_left,
+        TyList(FloatTy),
+    )
+    @test grounded_throw_observation == original_throw_observation
+    @test first(grounded_throw_observation)[1] == :error
+
+    function list_layers(ty, count)
+        for _ in 1:count
+            ty = TyList(ty)
+        end
+        return ty
+    end
+    @test CG._grounded_closed_fragment_fuel(FloatTy, 1) == 0
+    @test CG._grounded_closed_fragment_fuel(FloatTy, 0) == -1
+    array = TyArray(TyNat(2), FloatTy)
+    @test CG._grounded_closed_fragment_fuel(array, 3) == 0
+    @test CG._grounded_closed_fragment_fuel(array, 2) == -1
+    exactly_64 = list_layers(FloatTy, 63)
+    over_64 = list_layers(FloatTy, 64)
+    @test CG._grounded_closed_fragment_fuel(exactly_64, 64) == 0
+    @test CG._grounded_closed_fragment_fuel(over_64, 64) == -1
+    @test CG._grounded_iscompatible(over_64, TyFun(FloatTy, FloatTy)) ==
+          iscompatible(over_64, TyFun(FloatTy, FloatTy))
+
+    combined_left = list_layers(FloatTy, 31)
+    combined_right = list_layers(TyConst(:Float), 31)
+    combined_fuel = CG._grounded_closed_fragment_fuel(combined_left, 64)
+    @test CG._grounded_closed_fragment_fuel(combined_right, combined_fuel) == 0
+    @test CG._grounded_iscompatible(combined_left, combined_right)
+    over_combined_right = list_layers(TyConst(:Float), 32)
+    combined_fuel = CG._grounded_closed_fragment_fuel(combined_left, 64)
+    @test CG._grounded_closed_fragment_fuel(over_combined_right, combined_fuel) == -1
+    @test CG._grounded_iscompatible(combined_left, over_combined_right) ==
+          iscompatible(combined_left, over_combined_right)
+
+    let shared_dag = TyFun(FloatTy, FloatTy)
+        @test CG._grounded_closed_fragment_fuel(shared_dag, 3) == 0
+        expanded = shared_dag
+        for _ in 1:3
+            shared_dag = TyFun(shared_dag, shared_dag)
+            expanded = TyFun(expanded, deepcopy(expanded))
+        end
+        @test CG._grounded_closed_fragment_fuel(shared_dag, 64) == 33
+        @test CG._grounded_closed_fragment_fuel(expanded, 64) == 33
+        @test CG._grounded_iscompatible(shared_dag, expanded)
+        for _ in 1:7
+            shared_dag = TyFun(shared_dag, shared_dag)
+        end
+        @test CG._grounded_closed_fragment_fuel(shared_dag, 64) == -1
+    end
+
+    # The raw cycle is intentionally passed only to the bounded certifier.
+    raw_cycle = TyFun(FloatTy, FloatTy)
+    setfield!(raw_cycle, :arg, raw_cycle)
+    @test CG._grounded_closed_fragment_fuel(raw_cycle, 64) == -1
+end
+
+"""Push the default non-function argument filter before recursive enumeration.
+
+Only variables/constants can survive this planner for a non-function,
+non-array type. Enumerating applications first can recurse through a mapped
+array and a list consumer forever, even though those applications are discarded.
+Keep function witnesses, source-array construction and custom planners on their
+existing paths; retain exact scoped binder identities and variable weights.
+"""
+function _productive_argument_derivations(relation::CoreRelation, arg_ty::Ty,
+    arg_class::Symbol, rule::CoreRule, scope_tys::Vector{Ty})
+    planner = _metadata_get(rule.head.metadata, :argument_planner, relation.argument_planner)
+    if planner isa DefaultArgumentPlanner && !(arg_ty isa TyFun) && arg_class != :source_array
+        _in_closed_fragment(arg_ty) || return CoreDerivation[]
+        derivations = _grounded_derivations(relation, arg_ty, scope_tys)
+        _bucket_enabled(relation.weights, _VARIABLE_WEIGHT) && return derivations
+        return CoreDerivation[d for d in derivations if !(d isa VariableDerivation)]
+    end
+    return _raw_argument_derivations(relation, arg_ty, arg_class, rule, scope_tys)
+end
+
+@testitem "CanonicalGeneration list observer arguments avoid discarded recursive expansion" begin
+    using Test
+    using LambdaRegression.TypeSystem: Ty, TyLike, TyFun, TyList, TyArray, TyNat, TyVar, TyMu, FloatTy, BoolTy
+    CG = LambdaRegression.CanonicalGeneration
+    array = TyArray(TyNat(4), FloatTy)
+    list = TyList(FloatTy)
+    observer = TyFun(list, TyFun(TyFun(FloatTy, TyFun(list, FloatTy)), TyFun(FloatTy, FloatTy)))
+    relation = CG.CoreRelation(
+        local_consts=Dict{Symbol,Any}(:c13 => LambdaRegression.Primitives.UNCONS_CASE),
+        local_consts_ty=Dict{Symbol,TyLike}(:c13 => observer))
+    derivations = CG._known_derivations!(relation, list, Ty[array])
+    @test !isempty(derivations)
+    @test any(d -> CG._signature_contains(CG._derivation_signature(d), :AMAP), derivations)
+    @test isempty(relation.visiting)
+    @test length(relation.catalogs) < 20
+
+    head = CG.HeadEntry(:CONSUME, :test, TyFun(FloatTy, BoolTy), CG.CoreProductive(),
+        CG.WeightBucket(:test); metadata=(value=identity,))
+    rule = CG.CoreRule(head, BoolTy, Ty[FloatTy], [:closed_recursive])
+    ordinary = CG.CoreRelation(global_consts=Dict{Symbol,Any}(:ZERO=>0.0),
+        global_consts_ty=Dict{Symbol,TyLike}(:ZERO=>FloatTy))
+    scope = Ty[FloatTy, FloatTy]
+    fast = CG._productive_argument_derivations(ordinary, FloatTy, :closed_recursive, rule, scope)
+    old = CG._plan_argument_derivations(ordinary, rule,
+        CG._known_derivations!(ordinary, FloatTy, scope), FloatTy, :closed_recursive)
+    @test CG._derivation_signature.(fast) == CG._derivation_signature.(old)
+    @test [d.index for d in fast if d isa CG.VariableDerivation] == [0, 1]
+    disabled = CG.CoreRelation(weights=CG.GenerationWeights(variable=0))
+    @test isempty(CG._productive_argument_derivations(disabled, FloatTy, :closed_recursive, rule, scope))
+    binder = TyVar(91701, 0, nothing)
+    recursive = TyMu(binder, TyFun(FloatTy, binder))
+    @test isempty(CG._productive_argument_derivations(ordinary, recursive, :closed_recursive, rule, Ty[]))
+
+    # A custom planner may admit applied witnesses: it must not get this filter.
+    custom = CG.CoreRelation(global_consts=Dict{Symbol,Any}(:ZERO=>0.0, :PRED=>(x->true)),
+        global_consts_ty=Dict{Symbol,TyLike}(:ZERO=>FloatTy, :PRED=>TyFun(FloatTy,BoolTy)),
+        argument_planner=(ds, args...)->ds)
+    @test any(d -> d isa CG.HeadApplicationDerivation,
+        CG._productive_argument_derivations(custom, BoolTy, :closed_recursive, rule, Ty[]))
 end
 
 function _raw_argument_derivations(
@@ -4321,7 +5488,7 @@ function _bounded_source_array_derivations(
             raw_derivations =
                 arg_class == :source_array ?
                 _bounded_source_array_derivations(relation, arg_ty, scope_tys, max_depth - 1) :
-                _known_derivations!(relation, arg_ty, scope_tys)
+                _productive_argument_derivations(relation, arg_ty, arg_class, rule, scope_tys)
             derivs = _plan_argument_derivations(
                 relation,
                 rule,
@@ -4541,7 +5708,9 @@ _array_rank(ty::Ty) = ty isa TyArray ? 1 + _array_rank(ty.elem) : 0
 function _afoldl_step_scope(rule::CoreRule, scope_tys::Vector{Ty})
     parts = _afoldl_step_parts(rule)
     parts === nothing && return Ty[]
-    return Ty[parts.elem_ty, parts.acc_ty, scope_tys...]
+    scope = Ty[parts.elem_ty, parts.acc_ty]
+    append!(scope, scope_tys)
+    return scope
 end
 
 function _raw_guarded_argument_derivations(
@@ -4610,6 +5779,15 @@ end
 
 _has_builtin_guarded_provider(providers::Tuple) =
     any(provider -> provider isa GuardedExpansionProvider, providers)
+
+"""Conservatively detect a possible guarded-head producer without preparing menus.
+
+Built-in non-guarded catalog providers cannot add guarded metadata; unknown
+providers remain possible. Headless extension providers may specialise this
+private predicate. A positive result does not prove any target/child feasible.
+"""
+_may_supply_guarded_heads(provider::AbstractHeadProvider) =
+    provider isa GuardedExpansionProvider || !_is_builtin_catalog_provider(provider)
 
 _can_use_builtin_guarded_fast_path(providers::Tuple) =
     all(_is_builtin_catalog_provider, providers)
@@ -4738,8 +5916,15 @@ end
 (::WeightedDerivationSampler)(rng::Random.AbstractRNG, sample_set::DerivationSampleSet) =
     _sample_derivation(rng, sample_set)
 
-_uses_lazy_sampling(config::GenerationConfig) =
-    config.sampler isa WeightedDerivationSampler && config.argument_planner isa DefaultArgumentPlanner
+function _uses_lazy_sampling(config::GenerationConfig)
+    config.sampler isa WeightedDerivationSampler || return false
+    if !(config.argument_planner isa DefaultArgumentPlanner)
+        config.sampler.completion_probability > 0 &&
+            throw(ArgumentError("root completion requires DefaultArgumentPlanner"))
+        return false
+    end
+    return true
+end
 
 function _sample_root_generation_derivation(
     state::DerivationSamplingState,
@@ -4750,7 +5935,8 @@ function _sample_root_generation_derivation(
     guarded_left::Int,
     allow_safe_list_access::Bool=true,
 )
-    if isempty(relation.capability_mask) && isempty(relation.generation_providers)
+    if state.completion.probability == 0 &&
+       isempty(relation.capability_mask) && isempty(relation.generation_providers)
         return _sample_generation_derivation(
             state,
             relation,
@@ -4770,9 +5956,20 @@ function _sample_root_generation_derivation(
         node_budget=state.nodes_left,
         capability_mask=relation.capability_mask,
     )
+    if state.completion.probability > 0 && !_bounded_packet_request_supported(relation, query)
+        throw(ArgumentError("root completion requires a reviewed finite closed generation policy; use probability=0 for unsupported policies"))
+    end
     root_requirements = _root_generation_requirements(relation, query)
     isempty(root_requirements) ||
         (query = _derive_generation_query(query; requirements=root_requirements))
+    if state.completion.probability > 0
+        prepare = (relation, q, rng) -> _prepare_bounded_mixed_packet(
+            relation, q, rng, allow_safe_list_access)
+        certificate = prepare(relation, query, state.rng)
+        certificate === nothing && return nothing
+        return _sample_certified_frontier!(state, relation, query, certificate;
+            prepare, step=_mixed_packet_frontier_step)
+    end
     return _sample_generation_derivation(
         state,
         relation,
@@ -4837,7 +6034,7 @@ function _sample_generation_derivation(
         state,
         relation,
         query,
-        Ty[query.scope_tys...],
+        _scope_type_vector(query.scope_tys),
         allow_safe_list_access,
     )
 end
@@ -4861,10 +6058,11 @@ function _sample_generation_derivation(
             allow_safe_list_access,
         )
     end
-    core_query = _in_closed_fragment(query.target_ty) && all(_in_closed_fragment, query.scope_tys)
+    core_query = _in_closed_fragment(query.target_ty) &&
+        _scope_all(_in_closed_fragment, query.scope_tys)
     extension_query = _supports_recursive_type_queries(relation.generation_providers) &&
         _in_generation_extension_fragment(query.target_ty) &&
-        all(_in_generation_extension_fragment, query.scope_tys)
+        _scope_all(_in_generation_extension_fragment, query.scope_tys)
     core_query || extension_query || return nothing
     node_budget = min(query.node_budget, state.nodes_left)
     bounded = node_budget == query.node_budget ?
@@ -5007,6 +6205,17 @@ function _sample_known_derivation(
     allow_head_application::Bool=true,
 )
     _in_closed_fragment(target_ty) || return nothing
+    if relation.argument_planner isa DefaultArgumentPlanner &&
+       _scope_all(_in_closed_fragment, scope_tys) &&
+       all(generation_catalog_scope_invariant, relation.providers)
+        query = GenerationQuery(target_ty; scope_tys, depth_left,
+            node_budget=state.nodes_left)
+        if _finite_evidence_request_supported(relation, query)
+            sampled = _sample_finite_core_derivation(state, relation, target_ty,
+                scope_tys, depth_left; allow_heads=allow_head_application)
+            sampled isa _UnsupportedEvidenceSampling || return sampled
+        end
+    end
     options = _sampling_options(
         relation,
         target_ty,
@@ -5098,11 +6307,7 @@ function _head_option_weight(relation::CoreRelation, rule::CoreRule)
 end
 
 function _scope_application_option_weight(relation::CoreRelation, rule::ScopeApplicationRule)
-    weight = _scope_application_weight(relation.weights)
-    for arg_class in rule.argument_classes
-        arg_class == :source_array && (weight *= _bucket_weight(relation.weights, _ARRAY_SOURCE_WEIGHT))
-    end
-    return weight
+    return _scope_application_weight(relation.weights)
 end
 
 function _sample_from_options(
@@ -5176,6 +6381,10 @@ function _sample_option(
     allow_safe_list_access::Bool=true,
     generation_query::Union{Nothing,GenerationQuery}=nothing,
 )
+    if generation_query !== nothing &&
+       option.kind != :lambda_known && option.kind != :lambda_generation
+        generation_query = _close_functiondef_prefix(generation_query)
+    end
     if option.kind == :variable || option.kind == :constant
         _consume_sampling_nodes!(state, 1) || return nothing
         return option.value
@@ -5184,19 +6393,22 @@ function _sample_option(
         _consume_sampling_nodes!(state, 1) || return nothing
         target_ty = option.value::TyFun
         body_scope = Ty[target_ty.arg; scope_tys]
-        body =
-            option.kind == :lambda_generation ?
-            _sample_nested_generation_derivation(
-                state,
-                relation,
-                target_ty.res,
-                body_scope,
-                depth_left - 1,
-                guarded_left,
-                allow_safe_list_access,
-                generation_query,
-            ) :
-            _sample_known_derivation(state, relation, target_ty.res, body_scope, depth_left - 1)
+        body = if option.kind == :lambda_generation
+            if generation_query === nothing
+                _sample_nested_generation_derivation(state, relation,
+                    target_ty.res, body_scope, depth_left - 1, guarded_left,
+                    allow_safe_list_access, nothing)
+            else
+                body_query = _nested_generation_query(state, generation_query,
+                    target_ty.res, body_scope, depth_left - 1, guarded_left)
+                body_query = _advance_functiondef_prefix(body_query)
+                _sample_generation_derivation(state, relation, body_query,
+                    body_scope, allow_safe_list_access)
+            end
+        else
+            _sample_known_derivation(state, relation, target_ty.res, body_scope,
+                depth_left - 1)
+        end
         body === nothing && return nothing
         return LambdaDerivation(target_ty.arg, body)
     elseif option.kind == :productive_head
@@ -5286,7 +6498,7 @@ function _sample_option(
         (result_ty === effective.target_ty || iscompatible(result_ty, effective.target_ty)) ||
             return nothing
         rigid_query = _contains_rigid_dummy(effective.target_ty) ||
-            any(_contains_rigid_dummy, effective.scope_tys)
+            _scope_any(_contains_rigid_dummy, effective.scope_tys)
         if rigid_query
             safe = rigid_safe_derivation(derivation)
             safe isa Bool || throw(ArgumentError("rigid_safe_derivation must return Bool"))
@@ -5408,6 +6620,12 @@ function _sample_head_argument(
     end
 
     planner = _metadata_get(rule.head.metadata, :argument_planner, nothing)
+    if arg_class == :source_array && planner === nothing &&
+       !(guarded_head && _afoldl_grounded_argument(rule, i))
+        source = _sample_finite_source_array(state, relation, arg_ty, scope_tys,
+            depth_left, _source_array_depth_limit(rule), generation_query)
+        source isa _UnsupportedEvidenceSampling || return source
+    end
     if planner !== nothing || arg_class == :source_array || (guarded_head && _afoldl_grounded_argument(rule, i))
         raw_derivations =
             guarded_head && _afoldl_grounded_argument(rule, i) ?
@@ -5490,7 +6708,7 @@ function _sample_synthesized_afoldl_step(
         depth_left - 2,
         guarded_left,
         allow_safe_list_access,
-        generation_query,
+        generation_query === nothing ? nothing : _close_functiondef_prefix(generation_query),
     )
     if body === nothing
         state.nodes_left = saved_nodes
@@ -5549,10 +6767,8 @@ end
 
 function _derivation_weight(d::ScopeApplicationDerivation, weights::GenerationWeights)
     weight = _scope_application_weight(weights)
-    arg_tys, _ = _split_fun(d.head_ty)
-    for (arg, arg_ty) in zip(d.args, arg_tys)
+    for arg in d.args
         weight *= _derivation_weight(arg, weights)
-        _argument_class(arg_ty) == :source_array && (weight *= _bucket_weight(weights, _ARRAY_SOURCE_WEIGHT))
     end
     return weight
 end
@@ -5584,6 +6800,7 @@ function _relation_catalog(
     )
     catalog = _build_core_catalog(
         universe;
+        _precollected_inputs=true,
         global_consts=relation.global_consts,
         global_consts_ty=relation.global_consts_ty,
         local_consts=relation.local_consts,
@@ -5680,8 +6897,14 @@ function _array_source_depth(d::HeadApplicationDerivation)
 end
 
 _signature_contains(sig::Symbol, name::Symbol) = sig == name
-_signature_contains(sig::Tuple, name::Symbol) = any(item -> _signature_contains(item, name), sig)
-_signature_contains(sig::AbstractVector, name::Symbol) = any(item -> _signature_contains(item, name), sig)
+Base.@noinline Base.@nospecializeinfer function _signature_contains(sig::Tuple, name::Symbol)
+    Base.@nospecialize sig
+    return _scope_any(item -> _signature_contains(item, name), sig)
+end
+Base.@noinline Base.@nospecializeinfer function _signature_contains(sig::AbstractVector, name::Symbol)
+    Base.@nospecialize sig
+    return _scope_any(item -> _signature_contains(item, name), sig)
+end
 _signature_contains(sig, name::Symbol) = false
 
 function _build_derivation_ast!(
@@ -5936,6 +7159,9 @@ function _fresh_local_name(local_consts_ty::Dict{Symbol,TyLike}, prefix::Symbol)
         i += 1
     end
 end
+
+include("GenerationEvidence.jl")
+include("GenerationObligations.jl")
 
 @testitem "CanonicalGeneration root API smoke" begin
     using Test
@@ -6531,6 +7757,242 @@ end
     @test iscompatible(infer(result.tree, result.local_const_types), FloatTy)
 end
 
+@testitem "CanonicalGeneration universe uses structural lookup and preserves order" begin
+    using Test
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, TyArray, TyFun, TyList, TyNat, TyScheme, make_tyvar_factory, typekey
+
+    CG = LambdaRegression.CanonicalGeneration
+    nested_ty = TyFun(TyList(FloatTy), BoolTy)
+    universe = CG.CoreUniverse(nested_ty)
+    original_order = [nested_ty, TyList(FloatTy), FloatTy, BoolTy]
+
+    @test typekey.(universe.types) == typekey.(original_order)
+    @test all(key -> key isa CG._StructuralKey, universe.typekeys)
+    @test nested_ty in universe
+    @test FloatTy in universe
+    @test !(TyList(BoolTy) in universe)
+    original_instances = copy(universe.types)
+
+    CG.add_universe_type!(universe.types, universe.typekeys, deepcopy(nested_ty))
+    CG.add_universe_type!(universe.types, universe.typekeys, TyList(FloatTy))
+    @test typekey.(universe.types) == typekey.(original_order)
+    @test length(universe.types) == length(original_instances)
+    @test all(universe.types[index] === original_instances[index] for index in eachindex(original_instances))
+
+    struct SharedUniverseIndexProvider <: CG.AbstractHeadProvider
+        saw_shared_index::Base.RefValue{Bool}
+    end
+    function CG.add_universe_types!(
+        provider::SharedUniverseIndexProvider,
+        types,
+        keys,
+        universe;
+        kwargs...,
+    )
+        provider.saw_shared_index[] = keys === universe.typekeys
+        nested_child = TyList(TyArray(TyNat(5), BoolTy))
+        compound = TyFun(nested_child, TyArray(TyNat(2), FloatTy))
+        CG.add_universe_type!(types, keys, compound)
+        CG.add_universe_type!(types, keys, TyList(BoolTy))
+        provider.saw_shared_index[] =
+            provider.saw_shared_index[] &&
+            (compound in universe) &&
+            (nested_child in universe) &&
+            (TyArray(TyNat(5), BoolTy) in universe) &&
+            (TyArray(TyNat(2), FloatTy) in universe) &&
+            (TyList(BoolTy) in universe)
+        return types
+    end
+
+    provider = SharedUniverseIndexProvider(Ref(false))
+    extended = CG._extend_core_universe(universe, (provider,))
+    @test provider.saw_shared_index[]
+    @test extended.types !== universe.types
+    @test extended.typekeys !== universe.typekeys
+    @test TyList(BoolTy) in extended
+    @test !(TyList(BoolTy) in universe)
+    CG.add_universe_type!(extended.types, extended.typekeys, TyList(TyList(BoolTy)))
+    @test !(TyList(TyList(BoolTy)) in universe)
+
+    alpha = make_tyvar_factory()(0)
+    scheme = TyScheme([alpha], TyFun(alpha, alpha))
+    scheme_universe = CG.CoreUniverse(TyFun(FloatTy, BoolTy))
+    instances = CG._finite_scheme_instances(scheme, scheme_universe)
+    expected_instances = [TyFun(FloatTy, FloatTy), TyFun(BoolTy, BoolTy)]
+    @test typekey.(instances) == typekey.(expected_instances)
+end
+
+@testitem "CanonicalGeneration adjacent input collection retains catalog contracts" begin
+    using Test
+    using LambdaRegression.TypeSystem: Ty, TyLike, FloatTy, BoolTy, TyFun, TyList, TyArray, TyNat, typekey
+    import LambdaRegression.TypeSystem as TS
+
+    CG = LambdaRegression.CanonicalGeneration
+    head_key(head) = (head.name, head.source, typekey(head.type),
+        typeof(head.rule_class), head.weight_bucket,
+        Tuple(keys(head.metadata)), get(head.metadata, :weight_tags, nothing),
+        get(head.metadata, :scheme_instance, false))
+    catalog_key(catalog) = (typekey.(catalog.universe.types),
+        copy(catalog.universe.lengths), head_key.(catalog.heads),
+        [(head_key(rule.head), typekey(rule.result_ty), typekey.(rule.argument_tys),
+            rule.argument_classes) for rule in catalog.rules])
+    global_values = CG.test_catalog_consts()
+    explicit = TS.get_type_ctx(copy(global_values))
+    locals = Dict{Symbol,Any}(:CAPTURE => 2.0)
+    local_types = Dict{Symbol,TyLike}(:CAPTURE => FloatTy)
+    scope = Ty[TyArray(TyNat(4), FloatTy), TyFun(FloatTy, BoolTy)]
+    targets = (FloatTy, TyFun(TyList(FloatTy), FloatTy),
+        TyArray(TyNat(4), FloatTy), TyList(BoolTy))
+    for providers in (CG.test_catalog_providers(), CG.default_head_providers())
+        for target in targets
+            universe = CG.CoreUniverse(target; global_consts_ty=explicit,
+                local_consts_ty=local_types, scope_source_tys=scope)
+            initial = typekey.(universe.types)
+            options = (; global_consts=global_values, global_consts_ty=explicit,
+                local_consts=locals, local_consts_ty=local_types,
+                scope_source_tys=scope, providers, catalog_target_ty=target)
+            old = CG._build_core_catalog(universe; options...)
+            prepared = CG._build_core_catalog(universe;
+                options..., _precollected_inputs=true)
+            @test catalog_key(prepared) == catalog_key(old)
+            @test typekey.(universe.types) == initial
+            @test prepared.universe.types !== universe.types
+            @test prepared.universe.typekeys !== universe.typekeys
+        end
+    end
+
+    # A generic universe never promises to include raw values' inferred types.
+    struct CountedInputValue
+        calls::Base.RefValue{Int}
+    end
+    TS.get_type(value::CountedInputValue) = (value.calls[] += 1; BoolTy)
+    for precollected in (false, true)
+        calls = Ref(0)
+        raw = Dict{Symbol,Any}(:INFERRED => CountedInputValue(calls))
+        universe = CG.CoreUniverse(FloatTy)
+        catalog = CG._build_core_catalog(universe; global_consts=raw,
+            providers=(CG.ContextHeadProvider(),), _precollected_inputs=precollected)
+        @test calls[] == 2 # Both old inference points remain for incomplete inputs.
+        @test BoolTy in catalog.universe
+        @test any(head -> head.name == :INFERRED && typekey(head.type) == typekey(BoolTy), catalog.heads)
+    end
+
+    # Unknown callbacks may change inputs before head construction. Retain their
+    # old preparation path and never forward the private provenance marker.
+    struct ChangingInputProvider <: CG.AbstractHeadProvider
+        saw_private::Base.RefValue{Bool}
+    end
+    function CG.add_universe_types!(provider::ChangingInputProvider, types, keys,
+            universe; global_consts_ty, kwargs...)
+        provider.saw_private[] |= haskey(kwargs, :_precollected_inputs)
+        global_consts_ty[:VALUE] = BoolTy
+        CG.add_universe_type!(types, keys, BoolTy)
+        return types
+    end
+    function CG.add_heads!(provider::ChangingInputProvider, heads, universe; kwargs...)
+        provider.saw_private[] |= haskey(kwargs, :_precollected_inputs)
+        return heads
+    end
+    signatures = Any[]
+    for precollected in (false, true)
+        explicit = Dict{Symbol,TyLike}(:VALUE => FloatTy)
+        raw = Dict{Symbol,Any}(:VALUE => 1.0)
+        provider = ChangingInputProvider(Ref(false))
+        universe = CG.CoreUniverse(FloatTy; global_consts_ty=explicit)
+        catalog = CG._build_core_catalog(universe; global_consts=raw,
+            global_consts_ty=explicit, providers=(provider, CG.ContextHeadProvider()),
+            _precollected_inputs=precollected)
+        @test !provider.saw_private[]
+        @test any(head -> head.name == :VALUE && typekey(head.type) == typekey(BoolTy), catalog.heads)
+        push!(signatures, catalog_key(catalog))
+    end
+    @test signatures[1] == signatures[2]
+end
+
+@testitem "CanonicalGeneration scope typekeys preserve ordered sequence contract" begin
+    using Test
+    using LambdaRegression.TypeSystem: Ty, TyArray, TyFun, TyList, TyMu, TyNat, make_tyvar_factory
+
+    CG = LambdaRegression.CanonicalGeneration
+    TS = LambdaRegression.TypeSystem
+    higher_order = TyFun(TyFun(TS.FloatTy, TS.BoolTy), TyFun(TyList(TS.BoolTy), TyArray(TyNat(4), TS.FloatTy)))
+    recursive_var = make_tyvar_factory()(0)
+    recursive = TyMu(recursive_var, TyFun(recursive_var, TS.FloatTy))
+    vector_scope = Ty[TS.FloatTy, TS.BoolTy, higher_order, recursive]
+    long_vector_scope = Ty[vector_scope[mod1(index, length(vector_scope))] for index in 1:40]
+    scopes = (
+        Ty[],
+        (),
+        Ty[TS.FloatTy],
+        vector_scope,
+        (TS.FloatTy, higher_order, recursive),
+        long_vector_scope,
+        Tuple(long_vector_scope),
+    )
+
+    for scope in scopes
+        expected = Tuple(TS.typekey.(scope))
+        actual = CG._scope_typekeys(scope)
+        @test actual == expected
+        @test isequal(actual, expected)
+        @test hash(actual) == hash(expected)
+        @test length(actual) == length(scope)
+        @test CG._StructuralKey(actual) == CG._StructuralKey(expected)
+    end
+
+    struct ScopeTypekeyProbe <: LambdaRegression.TypeSystem.Ty
+        calls::Base.RefValue{Int}
+        payload::Vector{Int}
+        should_throw::Bool
+    end
+    function LambdaRegression.TypeSystem.typekey(probe::ScopeTypekeyProbe)
+        probe.calls[] += 1
+        probe.should_throw && throw(ArgumentError("scope typekey probe failure"))
+        return (:scope_probe, probe.payload)
+    end
+
+    probes = ScopeTypekeyProbe[ScopeTypekeyProbe(Ref(0), [1], false), ScopeTypekeyProbe(Ref(0), [2], false)]
+    probe_scope = Ty[probes...]
+    probe_expected = Tuple(TS.typekey.(probe_scope))
+    @test all(probe -> probe.calls[] == 1, probes)
+    foreach(probe -> (probe.calls[] = 0), probes)
+    probe_actual = CG._scope_typekeys(probe_scope)
+    @test all(probe -> probe.calls[] == 1, probes)
+    @test probe_actual == probe_expected
+    @test hash(probe_actual) == hash(probe_expected)
+    @test probe_actual[1][2] === probes[1].payload
+    @test probe_actual[2][2] === probes[2].payload
+
+    failing_probe = ScopeTypekeyProbe(Ref(0), [3], true)
+    @test_throws ArgumentError CG._scope_typekeys(Ty[failing_probe])
+    @test failing_probe.calls[] == 1
+
+    struct OffsetAxisScope <: AbstractVector{LambdaRegression.TypeSystem.Ty}
+        values::Vector{LambdaRegression.TypeSystem.Ty}
+        index_reads::Base.RefValue{Int}
+    end
+    Base.size(scope::OffsetAxisScope) = (length(scope.values),)
+    Base.axes(scope::OffsetAxisScope) = (0:(length(scope.values) - 1),)
+    Base.IndexStyle(::Type{OffsetAxisScope}) = IndexCartesian()
+    Base.iterate(scope::OffsetAxisScope, state::Int=0) =
+        state >= length(scope.values) ? nothing : (scope.values[state + 1], state + 1)
+    function Base.getindex(scope::OffsetAxisScope, index::Int)
+        scope.index_reads[] += 1
+        throw(AssertionError("nonstandard-axis scope should use native iteration"))
+    end
+
+    offset_scope = OffsetAxisScope(Ty[TS.FloatTy, TS.BoolTy], Ref(0))
+    offset_expected = Tuple(TS.typekey.(offset_scope.values))
+    offset_actual = CG._scope_typekeys(offset_scope)
+    @test offset_actual == offset_expected
+    @test isequal(offset_actual, offset_expected)
+    @test hash(offset_actual) == hash(offset_expected)
+    @test offset_scope.index_reads[] == 0
+
+    unassigned_scope = Vector{Ty}(undef, 1)
+    @test_throws UndefRefError CG._scope_typekeys(unassigned_scope)
+end
+
 @testitem "CanonicalGeneration head metadata can override argument planning" begin
     using Test
     using Random
@@ -6794,6 +8256,110 @@ end
     @test CG._signature_contains(result.metadata[:derivation], :TOLIST)
 end
 
+@testitem "CanonicalGeneration array scoped calls stay distinct from anchored sources" begin
+    using Test, Random
+    using LambdaRegression.TypeSystem: Ty, TyLike, TyFun, TyArray, TyNat, TyList, FloatTy, typekey
+
+    CG = LambdaRegression.CanonicalGeneration
+    array = TyArray(TyNat(4), FloatTy)
+    list = TyList(FloatTy)
+    mapper = TyFun(FloatTy, FloatTy)
+    array_to_float = TyFun(array, FloatTy)
+    providers = (CG.ContextHeadProvider(), CG.AMapProvider(), CG.ToListProvider())
+    scope = Ty[array_to_float, array]
+    no_source_weights = CG.GenerationWeights(default=0, variable=1, constant=1,
+        scope_application=1, amap=1, tolist=1, array_source=0)
+    no_source = CG.CoreRelation(providers=providers, weights=no_source_weights)
+
+    scope_rule = only(filter(rule -> rule.index == 0,
+        CG._scope_application_rules(FloatTy, scope, 1)))
+    @test scope_rule.argument_tys == Ty[array]
+    @test scope_rule.argument_classes == [:closed_recursive]
+    @test CG._scope_application_option_weight(no_source, scope_rule) == 1
+
+    query = CG.GenerationQuery(FloatTy; scope_tys=scope, depth_left=1, node_budget=2)
+    witness = CG.known_generation_witness(no_source, query)
+    @test witness isa CG.ScopeApplicationDerivation
+    if witness isa CG.ScopeApplicationDerivation
+        @test witness.index == 0
+        @test only(witness.args) isa CG.VariableDerivation
+        if only(witness.args) isa CG.VariableDerivation
+            @test only(witness.args).index == 1 # xs remains an ordinary Known argument
+        end
+        @test CG._derivation_weight(witness, no_source_weights) == 1
+    end
+    scope_state = CG.DerivationSamplingState(Random.Xoshiro(1), 2)
+    sampled_scope_call = CG._sample_scope_application(
+        scope_state,
+        no_source,
+        scope_rule,
+        scope,
+        0,
+        0,
+        true,
+    )
+    @test sampled_scope_call isa CG.ScopeApplicationDerivation
+    if sampled_scope_call isa CG.ScopeApplicationDerivation
+        @test only(sampled_scope_call.args) isa CG.VariableDerivation
+        @test CG.derivation_node_count(sampled_scope_call) == 2
+        @test scope_state.nodes_left == 0
+    end
+
+    constants = Dict{Symbol,Any}(:FSIN => LambdaRegression.Primitives.FSIN)
+    constant_types = Dict{Symbol,TyLike}(:FSIN => mapper)
+    source_weights = CG.GenerationWeights(default=0, variable=1, constant=1,
+        scope_application=1, amap=1, tolist=1, array_source=1)
+    with_source = CG.CoreRelation(global_consts=constants, global_consts_ty=constant_types,
+        providers=providers, weights=source_weights)
+    zero_catalog = CG._relation_catalog(no_source, array, Ty[array])
+    array_map_rule = only(filter(rule -> rule.head.name == :AMAP &&
+        typekey(rule.argument_tys[1]) == typekey(mapper) &&
+        typekey(rule.argument_tys[2]) == typekey(array), zero_catalog.rules))
+    list_catalog = CG._relation_catalog(no_source, list, Ty[array])
+    tolist_rule = only(filter(rule -> rule.head.name == :TOLIST &&
+        only(rule.argument_tys) == array, list_catalog.rules))
+    @test array_map_rule.argument_classes == [:function, :source_array]
+    @test tolist_rule.argument_classes == [:source_array]
+    @test CG._head_option_weight(no_source, array_map_rule) == 0
+    @test CG._head_option_weight(no_source, tolist_rule) == 0
+    blocked_source = CG.DerivationSamplingState(Random.Xoshiro(1111), 3)
+    @test CG._sample_head_argument(blocked_source, no_source, array_map_rule, 2,
+        Ty[array], 3, 0, false) === nothing
+    @test blocked_source.nodes_left == 3
+    blocked_tolist_source = CG.DerivationSamplingState(Random.Xoshiro(8000), 3)
+    @test CG._sample_head_argument(blocked_tolist_source, no_source, tolist_rule, 1,
+        Ty[array], 3, 0, false) === nothing
+    @test blocked_tolist_source.nodes_left == 3
+
+    positive_catalog = CG._relation_catalog(with_source, array, Ty[array])
+    positive_map_rule = only(filter(rule -> rule.head.name == :AMAP &&
+        typekey(rule.argument_tys[1]) == typekey(mapper) &&
+        typekey(rule.argument_tys[2]) == typekey(array), positive_catalog.rules))
+    @test CG._head_option_weight(with_source, positive_map_rule) > 0
+    map_state = CG.DerivationSamplingState(Random.Xoshiro(1234), 3)
+    mapped = CG._sample_option(map_state, with_source,
+        (kind=:productive_head, value=positive_map_rule,
+            weight=CG._head_option_weight(with_source, positive_map_rule)),
+        Ty[array], 4, 0, true,
+        CG.GenerationQuery(array; scope_tys=Ty[array], depth_left=4, node_budget=3))
+    @test mapped isa CG.HeadApplicationDerivation
+    if mapped isa CG.HeadApplicationDerivation
+        @test mapped.head.name == :AMAP
+        @test mapped.args[1] isa CG.ConstantDerivation
+        mapped.args[1] isa CG.ConstantDerivation && @test mapped.args[1].head.name == :FSIN
+        @test mapped.args[2] isa CG.VariableDerivation
+        mapped.args[2] isa CG.VariableDerivation && @test mapped.args[2].index == 0
+        @test CG.derivation_node_count(mapped) == 3
+        @test map_state.nodes_left == 0
+        # Scoped application weight is the same whichever primitive source
+        # budget is active; AMAP's own CoreRule still carries that budget.
+        if sampled_scope_call isa CG.ScopeApplicationDerivation
+            @test CG._derivation_weight(sampled_scope_call, source_weights) ==
+                CG._derivation_weight(sampled_scope_call, no_source_weights)
+        end
+    end
+end
+
 @testitem "CanonicalGeneration guarded expansions can be sampled after core success" begin
     using Test
     using Random
@@ -7039,6 +8605,54 @@ end
     no_array_source = CG.CoreRelation(; providers, weights=CG.GenerationWeights(; array_source=0, safe_list_access=1))
     array_options = CG._safe_list_access_generation_options(no_array_source, FloatTy, Ty[Matrix32])
     @test all(option -> option.weight == 0, array_options)
+end
+
+@testitem "CanonicalGeneration list access source cache uses structural keys" begin
+    using Test
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, Ty, TyList, typekey
+
+    CG = LambdaRegression.CanonicalGeneration
+
+    mutable struct CountingListSourceCollector
+        calls::Base.RefValue{Int}
+        head::CG.HeadEntry
+    end
+    function (collector::CountingListSourceCollector)(relation, scope_tys)
+        collector.calls[] += 1
+        return (collector.head,)
+    end
+
+    calls = Ref(0)
+    list_head = CG.HeadEntry(
+        :CACHED_LIST_SOURCE,
+        :test,
+        TyList(FloatTy),
+        CG.CoreProductive(),
+        CG.WeightBucket(:cached_list_source);
+        metadata=(value=[1.0],),
+    )
+    collector = CountingListSourceCollector(calls, list_head)
+    relation = CG.CoreRelation(
+        providers=(CG.SafeListAccessProvider(source_collectors=(collector,)),),
+    )
+
+    first_scope = Ty[FloatTy]
+    first_sources = CG._list_access_sources(relation, first_scope)
+    equal_sources = CG._list_access_sources(relation, Ty[FloatTy])
+    @test equal_sources === first_sources
+    @test calls[] == 1
+
+    different_sources = CG._list_access_sources(relation, Ty[BoolTy])
+    @test different_sources !== first_sources
+    @test calls[] == 2
+
+    cache_keys = collect(keys(relation.list_access_sources))
+    @test length(cache_keys) == 2
+    @test all(key -> key isa CG._StructuralKey, cache_keys)
+    @test Set(key.value for key in cache_keys) == Set((
+        (Tuple(typekey.(Ty[FloatTy])), 0),
+        (Tuple(typekey.(Ty[BoolTy])), 0),
+    ))
 end
 
 @testitem "CanonicalGeneration safe list access accepts injected source collectors" begin
@@ -7538,10 +9152,12 @@ end
     @test CG._bucket_weight(kwargs.weights, CG.WeightBucket(:safe_list_access)) > 1
 end
 
-@testitem "CanonicalGeneration rigid matrix slow seed keeps safe-list fold map coverage" begin
+@testitem "CanonicalGeneration rigid matrix public regression and registered fold sampling" begin
     using Test
     using Random
-    using LambdaRegression.TypeSystem: TyArray, TyNat, TyScheme, TyVar, infer, iscompatible, →
+    using LambdaRegression.TypeSystem: Ty, TyLike, TyArray, TyNat, TyScheme, TyVar,
+        infer, iscompatible, typekey, →
+    using LambdaRegression.ASTs.NodeASTs: AstTree
 
     CG = LambdaRegression.CanonicalGeneration
     ρ = TyVar(240_001, 0, nothing)
@@ -7566,8 +9182,35 @@ end
     @test result isa CG.GenerationResult
     @test iscompatible(infer(result.tree, result.local_const_types), target)
     @test CG._signature_contains(result.metadata[:derivation], :UNCONS_CASE)
-    @test CG._signature_contains(result.metadata[:derivation], :AFOLDL)
     @test CG._signature_contains(result.metadata[:derivation], :AMAP)
+
+    # A changed construction policy changes the seed's RNG trajectory. Fold
+    # coverage is the positive registered route, not decoration that every
+    # output of the public seed-9 regression must happen to contain.
+    demand = CG._rigidify_scheme_demand(target)
+    matrix = demand.target.arg
+    scope = Ty[matrix]
+    fold_relation = CG.CoreRelation(providers=(CG.ContextHeadProvider(), CG.GuardedExpansionProvider()))
+    options = CG._guarded_sampling_options(fold_relation, matrix, scope)
+    registered = filter(options) do option
+        option.kind == :guarded_head && option.value.head.name == :AFOLDL &&
+            typekey(option.value.argument_tys[3]) == typekey(matrix)
+    end
+    @test !isempty(registered)
+    option = first(registered)
+    @test option.weight > 0
+    state = CG.DerivationSamplingState(Random.Xoshiro(2000), 12)
+    query = CG.GenerationQuery(matrix; scope_tys=scope, depth_left=3,
+        guarded_left=1, node_budget=12)
+    fold = CG._sample_option(state, fold_relation, option, scope, 3, 1, false, query)
+    @test fold !== nothing
+    @test CG._signature_contains(CG.derivation_signature(fold), :AFOLDL)
+    @test CG.rigid_safe_derivation(fold)
+    @test CG.derivation_node_count(fold) == 12 - state.nodes_left == 6
+    values, types = Dict{Symbol,Any}(), Dict{Symbol,TyLike}()
+    tree = AstTree(CG.materialize_generation_derivation(CG.DefaultAstMaterializer(),
+        CG.LambdaDerivation(matrix, fold), values, types, fold_relation, Random.Xoshiro(2000)))
+    @test iscompatible(infer(tree, types), demand.target)
 end
 
 @testitem "CanonicalGeneration boolean primitives are ordinary injected constants" begin
@@ -8131,6 +9774,104 @@ end
     @test CG._generation_query_cache_key(immutable_query, provider_key) == cache_key
 end
 
+@testitem "CanonicalGeneration extension option cache uses structural query keys" begin
+    using Test
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, IntTy, Ty, TyFun, TyList
+
+    CG = LambdaRegression.CanonicalGeneration
+
+    mutable struct CacheableQueryOptionProvider <: CG.AbstractHeadProvider
+        calls::Base.RefValue{Int}
+    end
+    mutable struct UncacheableQueryOptionProvider <: CG.AbstractHeadProvider
+        calls::Base.RefValue{Int}
+    end
+
+    CG.add_heads!(::CacheableQueryOptionProvider, heads, universe; kwargs...) = heads
+    CG.add_heads!(::UncacheableQueryOptionProvider, heads, universe; kwargs...) = heads
+    CG.provider_capabilities(::CacheableQueryOptionProvider) = ()
+    CG.provider_capabilities(::UncacheableQueryOptionProvider) = ()
+    CG.provides_generation_options(::CacheableQueryOptionProvider) = true
+    CG.provides_generation_options(::UncacheableQueryOptionProvider) = true
+    CG.generation_provider_cache_key(::CacheableQueryOptionProvider) = (:query_key_cache_probe,)
+
+    function CG.add_generation_options!(
+        provider::CacheableQueryOptionProvider,
+        options,
+        relation,
+        query,
+    )
+        provider.calls[] += 1
+        push!(options, (weight=1.0, token=provider.calls[]))
+        return options
+    end
+    function CG.add_generation_options!(
+        provider::UncacheableQueryOptionProvider,
+        options,
+        relation,
+        query,
+    )
+        provider.calls[] += 1
+        push!(options, (weight=1.0, token=provider.calls[]))
+        return options
+    end
+
+    function make_query(target)
+        return CG.GenerationQuery(
+            target;
+            scope_tys=Ty[TyFun(TyList(FloatTy), FloatTy)],
+            depth_left=4,
+            guarded_left=1,
+            provider_fuel=3,
+            node_budget=32,
+            requirements=(CG.CallsScopeBinder(0),),
+        )
+    end
+
+    original_target = TyFun(TyList(FloatTy), TyFun(FloatTy, TyList(FloatTy)))
+    query = make_query(original_target)
+    provider = CacheableQueryOptionProvider(Ref(0))
+    relation = CG.CoreRelation(providers=(provider,))
+
+    raw_query_key = CG._generation_query_cache_key(query, relation.generation_providers)
+    @test raw_query_key isa Tuple
+    @test !(raw_query_key isa CG._StructuralKey)
+
+    first_options = CG._generation_extension_options(relation, query)
+    first_cache_key = only(keys(relation.sampling_options))
+    @test first_cache_key[1] == :generation_extensions
+    @test first_cache_key[2] isa CG._StructuralKey
+    @test first_cache_key[2].value == raw_query_key
+    @test provider.calls[] == 1
+
+    equal_query = make_query(deepcopy(original_target))
+    equal_options = CG._generation_extension_options(relation, equal_query)
+    @test equal_options === first_options
+    @test provider.calls[] == 1
+    @test length(relation.sampling_options) == 1
+
+    different_query = make_query(TyFun(TyList(BoolTy), TyFun(FloatTy, TyList(IntTy))))
+    different_key = CG._generation_query_cache_key(different_query, relation.generation_providers)
+    @test different_key != raw_query_key
+    different_options = CG._generation_extension_options(relation, different_query)
+    @test different_options !== first_options
+    @test provider.calls[] == 2
+    @test length(relation.sampling_options) == 2
+
+    uncacheable = UncacheableQueryOptionProvider(Ref(0))
+    uncacheable_relation = CG.CoreRelation(providers=(uncacheable,))
+    uncacheable_query = make_query(TyFun(TyList(FloatTy), TyFun(FloatTy, TyList(FloatTy))))
+    @test CG._generation_query_cache_key(
+        uncacheable_query,
+        uncacheable_relation.generation_providers,
+    ) === nothing
+    uncacheable_first = CG._generation_extension_options(uncacheable_relation, uncacheable_query)
+    uncacheable_second = CG._generation_extension_options(uncacheable_relation, uncacheable_query)
+    @test uncacheable_first !== uncacheable_second
+    @test uncacheable.calls[] == 2
+    @test isempty(uncacheable_relation.sampling_options)
+end
+
 @testitem "CanonicalGeneration precomputes extension provider routing" begin
     using Test
     using Random
@@ -8193,8 +9934,12 @@ end
     @test CG.provides_generation_options(CG.ContextHeadProvider()) === false
     @test CG.provides_generation_options(query_option) === nothing
 
-    state = CG.DerivationSamplingState(Random.Xoshiro(1), 8)
-    @test fieldnames(typeof(state)) == (:rng, :nodes_left)
+    rng = Random.Xoshiro(1)
+    state = CG.DerivationSamplingState(rng, 8)
+    @test state.rng === rng && state.nodes_left == 8
+    @test state.completion.probability == 0 && !state.completion.completing
+    @test state.completion.grace_left == 0 && state.completion.boundaries == 0
+    @test state.completion !== CG.DerivationSamplingState(rng, 8).completion
 
     explicit_catalog = ExplicitCatalogOnlyProvider(Ref(0))
     baseline_relation = CG.CoreRelation(providers=(CG.ContextHeadProvider(),))
@@ -9002,9 +10747,9 @@ end
     obligation_plan = (
         rule=scope_rule,
         forced=[-1],
-        exact_choices=((index=1, arguments=[1]),),
+        exact_choices=CG._RequiredScopeExactChoice[(index=1, arguments=[1])],
         prefix_choices=Int[],
-        required_arguments=(1,),
+        required_arguments=Int[1],
     )
     @test CG._materialize_fast_required_scope_application(
         CG.DerivationSamplingState(Random.Xoshiro(8000), 16),
@@ -9018,6 +10763,23 @@ end
         false,
         obligation_query,
     ) === nothing
+end
+
+@testitem "CanonicalGeneration unqueried lambda option keeps its ordinary sampler" begin
+    using Test, Random
+    using LambdaRegression.TypeSystem: Ty, FloatTy, TyFun
+    CG = LambdaRegression.CanonicalGeneration
+    relation = CG.CoreRelation(; providers=(CG.ContextHeadProvider(),),
+        weights=CG.GenerationWeights(default=0, lambda=1, variable=1))
+    state = CG.DerivationSamplingState(Random.Xoshiro(42), 2)
+    option = (kind=:lambda_generation, value=TyFun(FloatTy, FloatTy), weight=1.0)
+    result = CG._sample_option(state, relation, option, Ty[], 2, 0, false, nothing)
+    @test result isa CG.LambdaDerivation
+    if result isa CG.LambdaDerivation
+        @test result.body isa CG.VariableDerivation
+        @test CG.derivation_node_count(result) == 2
+    end
+    @test state.nodes_left == 0
 end
 
 @testitem "CanonicalGeneration productive obligation plans have materializable siblings" begin
@@ -9246,7 +11008,8 @@ end
     @test derivation !== nothing
     derivation === nothing || @test CG.derivation_uses_scope_binder(derivation, 0)
 
-    certificate_keys = count(keys(relation.sampling_options)) do key
+    certificate_keys = count(keys(relation.sampling_options)) do cache_key
+        key = cache_key isa CG._StructuralKey ? cache_key.value : nothing
         key isa Tuple && !isempty(key) && key[1] == :required_scope_certificate
     end
     @test certificate_keys <= 2 * (query.depth_left + 1) * length(scope)
@@ -9336,14 +11099,23 @@ end
         node_budget=32,
         requirements=(CG.CallsScopeBinder(0),),
     )
-    @test isempty(CG._required_scope_certificate_options(
+    value_only_options = CG._required_scope_certificate_options(
         value_only_relation,
         BoolTy,
         value_only_scope,
         5,
         (0,),
         value_only_query,
-    ))
+    )
+    @test !isempty(value_only_options)
+    # A candidate menu is no longer an eager feasibility proof. A bare function
+    # value still cannot satisfy CallsScopeBinder when lambdas are disabled.
+    for option in value_only_options
+        @test CG._materialize_required_scope_certificate(
+            CG.DerivationSamplingState(Random.Xoshiro(42), 32),
+            value_only_relation, option, value_only_scope, 5, 0, false,
+            value_only_query) === nothing
+    end
 
     cache_scope = Ty[BoolTy]
     cache_relation = CG.CoreRelation(
@@ -9395,14 +11167,23 @@ end
         node_budget=12,
         requirements=(CG.CallsScopeBinder(0),),
     )
-    @test isempty(CG._required_scope_certificate_options(
+    missing_argument_options = CG._required_scope_certificate_options(
         cache_relation,
         BoolTy,
         missing_argument_scope,
         3,
         (0,),
         missing_argument_query,
-    ))
+    )
+    # Scoped descriptors no longer prove every free parameter before selection.
+    # The missing Float witness still makes every actual construction fail.
+    @test !isempty(missing_argument_options)
+    for option in missing_argument_options
+        @test CG._materialize_required_scope_certificate(
+            CG.DerivationSamplingState(Random.Xoshiro(42), 12),
+            cache_relation, option, missing_argument_scope, 3, 0, false,
+            missing_argument_query) === nothing
+    end
 
     wrapped_missing_relation = CG.CoreRelation(
         global_consts=Dict{Symbol,Any}(:PRED => (x -> x > 0)),
@@ -9419,14 +11200,21 @@ end
         node_budget=16,
         requirements=(CG.CallsScopeBinder(0),),
     )
-    @test isempty(CG._required_scope_certificate_options(
+    wrapped_missing_options = CG._required_scope_certificate_options(
         wrapped_missing_relation,
         BoolTy,
         wrapped_missing_scope,
         4,
         (0,),
         wrapped_missing_query,
-    ))
+    )
+    @test !isempty(wrapped_missing_options)
+    for option in wrapped_missing_options
+        @test CG._materialize_required_scope_certificate(
+            CG.DerivationSamplingState(Random.Xoshiro(42), 16),
+            wrapped_missing_relation, option, wrapped_missing_scope, 4, 0, false,
+            wrapped_missing_query) === nothing
+    end
 
     ListFloat = TyList(FloatTy)
     safe_relation = CG.CoreRelation(
@@ -9624,7 +11412,9 @@ end
         smaller_plan_query,
     )
     application_plan_keys = count(keys(direct_relation.sampling_options)) do key
-        key isa Tuple && !isempty(key) && key[1] == :fast_required_scope_application_plans
+        structural_key = key isa CG._StructuralKey ? key.value : nothing
+        structural_key isa Tuple && !isempty(structural_key) &&
+            structural_key[1] == :fast_required_scope_application_plans
     end
     @test application_plan_keys >= 2
 
@@ -9751,6 +11541,112 @@ end
     )
     @test any(option -> option.kind == :generation_extension, with_fuel_options)
     @test !any(option -> option.kind == :generation_extension, without_fuel_options)
+end
+
+@testitem "CanonicalGeneration required-scope certificate cache keys are structural" begin
+    using Test
+    using LambdaRegression: CanonicalGeneration
+    using LambdaRegression.TypeSystem: BoolTy, Ty
+
+    CG = CanonicalGeneration
+    scope = Ty[BoolTy, BoolTy]
+    relation = CG.CoreRelation(
+        providers=(),
+        weights=CG.GenerationWeights(default=0, variable=1),
+    )
+    query = CG.GenerationQuery(
+        BoolTy;
+        scope_tys=scope,
+        depth_left=3,
+        guarded_left=1,
+        provider_fuel=3,
+        node_budget=12,
+    )
+    options = CG._required_scope_certificate_options(
+        relation,
+        BoolTy,
+        scope,
+        3,
+        (0,),
+        query,
+    )
+    equal_query = CG.GenerationQuery(
+        BoolTy;
+        scope_tys=scope,
+        depth_left=3,
+        guarded_left=1,
+        provider_fuel=3,
+        node_budget=12,
+    )
+    @test length(options) == 1
+    @test CG._required_scope_certificate_options(
+        relation,
+        BoolTy,
+        scope,
+        3,
+        (0,),
+        equal_query,
+    ) === options
+
+    changed_required = CG._required_scope_certificate_options(
+        relation,
+        BoolTy,
+        scope,
+        3,
+        (1,),
+        query,
+    )
+    @test changed_required !== options
+
+    forbidden_query = CG.GenerationQuery(
+        BoolTy;
+        scope_tys=scope,
+        depth_left=3,
+        guarded_left=1,
+        provider_fuel=3,
+        node_budget=12,
+        requirements=(CG.ForbidsScopeBinder(0),),
+    )
+    forbidden_options = CG._required_scope_certificate_options(
+        relation,
+        BoolTy,
+        scope,
+        3,
+        (0,),
+        forbidden_query,
+    )
+    @test isempty(forbidden_options)
+    @test forbidden_options !== options
+
+    changed_depth = CG._required_scope_certificate_options(
+        relation,
+        BoolTy,
+        scope,
+        2,
+        (0,),
+        query,
+    )
+    @test changed_depth !== options
+
+    changed_query = CG.GenerationQuery(
+        BoolTy;
+        scope_tys=scope,
+        depth_left=3,
+        guarded_left=1,
+        provider_fuel=2,
+        node_budget=12,
+    )
+    @test CG._generation_query_cache_key(changed_query, relation.generation_providers) !=
+          CG._generation_query_cache_key(query, relation.generation_providers)
+    changed_query_options = CG._required_scope_certificate_options(
+        relation,
+        BoolTy,
+        scope,
+        3,
+        (0,),
+        changed_query,
+    )
+    @test changed_query_options !== options
 end
 
 @testitem "CanonicalGeneration disabled constructive routes stay lazy" begin
@@ -9957,7 +11853,9 @@ end
     @test derivation !== nothing
     @test calls[] == 0
     @test !any(keys(relation.sampling_options)) do key
-        key isa Tuple && !isempty(key) && key[1] == :fast_required_productive_head_plans
+        structural_key = key isa CG._StructuralKey ? key.value : key
+        structural_key isa Tuple && !isempty(structural_key) &&
+            structural_key[1] == :fast_required_productive_head_plans
     end
 
     calls[] = 0
@@ -10006,7 +11904,9 @@ end
     )
     @test fallback_derivation !== nothing
     @test !any(keys(fallback_relation.sampling_options)) do key
-        key isa Tuple && !isempty(key) && key[1] == :fast_required_productive_head_plans
+        structural_key = key isa CG._StructuralKey ? key.value : key
+        structural_key isa Tuple && !isempty(structural_key) &&
+            structural_key[1] == :fast_required_productive_head_plans
     end
     rejected_state = CG.DerivationSamplingState(Random.Xoshiro(1111), 16)
     rejected_derivation = CG._sample_fast_proxy_insertion_derivation(
@@ -10024,7 +11924,9 @@ end
     )
     @test rejected_derivation === nothing
     @test !any(keys(fallback_relation.sampling_options)) do key
-        key isa Tuple && !isempty(key) && key[1] == :fast_required_productive_head_plans
+        structural_key = key isa CG._StructuralKey ? key.value : key
+        structural_key isa Tuple && !isempty(structural_key) &&
+            structural_key[1] == :fast_required_productive_head_plans
     end
 
     acceptance_calls = Ref(0)
@@ -10090,7 +11992,9 @@ end
     )
     @test disabled_application === nothing
     @test !any(keys(disabled_application_relation.sampling_options)) do key
-        key isa Tuple && !isempty(key) && key[1] == :fast_required_scope_application_plans
+        structural_key = key isa CG._StructuralKey ? key.value : nothing
+        structural_key isa Tuple && !isempty(structural_key) &&
+            structural_key[1] == :fast_required_scope_application_plans
     end
     @test !CG._required_scope_binder_reachable(
         disabled_application_relation,
@@ -10184,7 +12088,10 @@ end
     @test !(result isa LambdaRegression.Utils.Err)
     @test result.tree.root == ConstNode(:protocol_value)
     @test result.metadata[:derivation] == (:protocol_derivation,)
-    @test result.metadata[:derivation_metadata][:protocol_test]
+    @test isequal(
+        result.metadata[:derivation_metadata],
+        Dict{Symbol,Any}(:protocol_test => true),
+    )
     @test result.metadata[:sampling_nodes_used] == 1
     @test result.local_const_types[:protocol_value] == FloatTy
 
@@ -10441,6 +12348,227 @@ end
     @test_throws ArgumentError CG.GenerationWeights(1.0, Dict{Symbol,Float64}(:constant => -1.0))
 end
 
+@testitem "CanonicalGeneration signature contains preserves ordered iteration" begin
+    using Test
+    CG = LambdaRegression.CanonicalGeneration
+
+    struct OffsetSignatureVector <: AbstractVector{Any}
+        values::Vector{Any}
+        visited::Vector{Int}
+    end
+    Base.size(values::OffsetSignatureVector) = (length(values.values),)
+    Base.axes(values::OffsetSignatureVector) = (0:(length(values.values) - 1),)
+    function Base.getindex(values::OffsetSignatureVector, index::Int)
+        index in axes(values, 1) || throw(BoundsError(values, index))
+        push!(values.visited, index)
+        return values.values[index + 1]
+    end
+    function Base.iterate(values::OffsetSignatureVector, state=first(axes(values, 1)))
+        state > last(axes(values, 1)) && return nothing
+        return (values[state], state + 1)
+    end
+
+    @test CG._signature_contains(:TARGET, :TARGET)
+    @test !CG._signature_contains(:OTHER, :TARGET)
+    @test CG._signature_contains((:head, :global, :f, :type, ((:TARGET,),)), :TARGET)
+    @test !CG._signature_contains((:head, :global, :f, :type, ()), :TARGET)
+    @test !CG._signature_contains(17, :TARGET)
+
+    offset = OffsetSignatureVector(Any[:before, (:inside, :TARGET), :after], Int[])
+    @test CG._signature_contains(offset, :TARGET)
+    @test offset.visited == [0, 1]
+end
+
+@testitem "Safe-list binder requirement filters preserve ordered reconstruction" begin
+    using Test
+    using LambdaRegression.TypeSystem: FloatTy, TyFun
+
+    CG = LambdaRegression.CanonicalGeneration
+    struct MarkerGenerationRequirement <: CG.AbstractGenerationRequirement
+        token::Vector{Int}
+    end
+
+    before = MarkerGenerationRequirement([1])
+    after = MarkerGenerationRequirement([2])
+    uses_zero = CG.UsesScopeBinder(0)
+    forbids_two = CG.ForbidsScopeBinder(2)
+    calls_one = CG.CallsScopeBinder(1)
+    raw = CG.GenerationQuery(
+        FloatTy,
+        (FloatTy,),
+        0,
+        0,
+        0,
+        17,
+        (:opaque, :opaque),
+        (before, uses_zero, forbids_two, calls_one, after),
+    )
+
+    subset = CG._scope_binder_requirement_subset(raw, [0])
+    @test subset.requirements == (before, uses_zero, forbids_two, after)
+    @test subset.requirements[1] === before
+    @test subset.requirements[2] === uses_zero
+    @test subset.requirements[3] === forbids_two
+    @test subset.requirements[4] === after
+    @test subset.capability_mask == (:opaque,)
+
+    without_binders = CG._without_scope_binder_requirements(raw)
+    @test without_binders.requirements == (before, forbids_two, after)
+    @test without_binders.requirements[1] === before
+    @test without_binders.requirements[2] === forbids_two
+    @test without_binders.requirements[3] === after
+    @test without_binders.capability_mask == (:opaque,)
+    @test CG._scope_binder_requirement_subset(nothing, Int[]) === nothing
+    @test CG._without_scope_binder_requirements(nothing) === nothing
+
+    raw_noop = CG.GenerationQuery(
+        FloatTy,
+        (FloatTy,),
+        0,
+        0,
+        0,
+        19,
+        (:custom, :custom),
+        (before,),
+    )
+    subset_noop = CG._scope_binder_requirement_subset(raw_noop, Int[])
+    without_noop = CG._without_scope_binder_requirements(raw_noop)
+    @test subset_noop !== raw_noop
+    @test without_noop !== raw_noop
+    @test subset_noop.requirements == (before,)
+    @test without_noop.requirements == (before,)
+    @test subset_noop.capability_mask == (:custom,)
+    @test without_noop.capability_mask == (:custom,)
+    @test subset_noop.node_budget == without_noop.node_budget == raw_noop.node_budget
+
+    invalid_raw = CG.GenerationQuery(
+        FloatTy,
+        (),
+        0,
+        0,
+        0,
+        23,
+        (),
+        (:invalid_raw_requirement,),
+    )
+    @test_throws ArgumentError CG._scope_binder_requirement_subset(invalid_raw, Int[])
+    @test_throws ArgumentError CG._without_scope_binder_requirements(invalid_raw)
+
+    invalid_noop = CG.GenerationQuery(
+        FloatTy,
+        (),
+        0,
+        0,
+        0,
+        23,
+        (),
+        (:invalid_raw_requirement,),
+    )
+    unused_scope_call = CG.ScopeApplicationDerivation(
+        1,
+        TyFun(FloatTy, FloatTy),
+        CG.CoreDerivation[],
+    )
+    @test CG._without_satisfied_scope_binder_requirements(invalid_noop, unused_scope_call) === invalid_noop
+
+    invalid_after_satisfied = CG.GenerationQuery(
+        FloatTy,
+        (FloatTy,),
+        0,
+        0,
+        0,
+        23,
+        (),
+        (CG.UsesScopeBinder(0), :invalid_raw_requirement),
+    )
+    satisfied_scope_call = CG.ScopeApplicationDerivation(
+        0,
+        TyFun(FloatTy, FloatTy),
+        CG.CoreDerivation[],
+    )
+    @test_throws ArgumentError CG._without_satisfied_scope_binder_requirements(
+        invalid_after_satisfied,
+        satisfied_scope_call,
+    )
+end
+
+@testitem "CanonicalGeneration known generation rules preserve structural deduplication" begin
+    using Test
+    using LambdaRegression.TypeSystem: FloatTy, Ty, TyFun, TyMu, make_tyvar_factory, typekey
+
+    CG = LambdaRegression.CanonicalGeneration
+    fadd_ty = TyFun(FloatTy, TyFun(FloatTy, FloatTy))
+    recursive_binder = make_tyvar_factory()(0)
+    recursive_argument = TyMu(recursive_binder, TyFun(FloatTy, recursive_binder))
+    recursive_head_ty = TyFun(recursive_argument, TyFun(FloatTy, FloatTy))
+
+    struct RecursiveRuleProvider <: CG.AbstractHeadProvider
+        head::CG.HeadEntry
+    end
+    function CG.add_heads!(provider::RecursiveRuleProvider, heads, universe; kwargs...)
+        push!(heads, provider.head)
+        return heads
+    end
+
+    extension_head = CG.HeadEntry(
+        :RECURSIVE_BOUNDARY,
+        :test_extension,
+        recursive_head_ty,
+        CG.CoreProductive(),
+        CG.WeightBucket(:recursive_boundary),
+    )
+    provider = RecursiveRuleProvider(extension_head)
+    relation = CG.CoreRelation(
+        global_consts=Dict{Symbol,Any}(:FADD => ((x, y) -> x + y)),
+        global_consts_ty=Dict{Symbol,Any}(:FADD => fadd_ty),
+        providers=(CG.ContextHeadProvider(), provider),
+        weights=CG.GenerationWeights(default=1, recursive_boundary=1),
+    )
+
+    function legacy_raw_key_rules(relation, target_ty::Ty, scope_tys::Vector{Ty})
+        catalog = CG._relation_catalog(relation, target_ty, scope_tys)
+        rules = copy(catalog.rules)
+        signatures = Set{Any}()
+        for rule in rules
+            push!(signatures, (
+                rule.head.source,
+                rule.head.name,
+                typekey(rule.head.type),
+                Tuple(typekey.(rule.argument_tys)),
+            ))
+        end
+        for head in (catalog.heads..., CG._extension_context_heads(relation)...)
+            head.rule_class isa CG.CoreProductive || continue
+            head.type isa Ty || continue
+            CG._in_generation_extension_fragment(head.type) || continue
+            args, result = CG._split_fun(head.type)
+            isempty(args) && continue
+            CG.iscompatible(result, target_ty) || continue
+            all(CG._in_generation_extension_fragment, args) || continue
+            signature = (head.source, head.name, typekey(head.type), Tuple(typekey.(args)))
+            signature in signatures && continue
+            push!(signatures, signature)
+            push!(rules, CG.CoreRule(head, result, args, [CG._argument_class(arg) for arg in args]))
+        end
+        return rules
+    end
+    rule_key(rule) = (
+        rule.head.source,
+        rule.head.name,
+        typekey(rule.head.type),
+        Tuple(typekey.(rule.argument_tys)),
+    )
+
+    actual = CG._known_generation_rules(relation, FloatTy, Ty[])
+    expected = legacy_raw_key_rules(relation, FloatTy, Ty[])
+    @test rule_key.(actual) == rule_key.(expected)
+    @test count(rule -> rule.head.name === :FADD, actual) == 1
+    recursive_rule = only(filter(rule -> rule.head.name === :RECURSIVE_BOUNDARY, actual))
+    @test recursive_rule.argument_tys[1] === recursive_argument
+    @test typekey.(recursive_rule.argument_tys) == [typekey(recursive_argument), typekey(FloatTy)]
+end
+
 include("FunctionDefGeneration.jl")
+include("GenerationFrontier.jl")
 
 end # module CanonicalGeneration

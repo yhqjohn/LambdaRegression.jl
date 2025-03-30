@@ -619,6 +619,69 @@ function iscompatible(a::TyLike, b::TyLike)::Bool
     return isnothing(unify!(t1, t2))
 end
 
+# Exact compatibility for a small, closed built-in fragment. The fuel bounds
+# only this fast path: every other type keeps the full unification semantics.
+function _grounded_closed_fragment_fuel(ty::Ty, fuel::Int)::Int
+    if ty isa TyConst
+        fuel > 0 || return -1
+        return fuel - 1
+    elseif ty isa TyFun
+        fuel > 0 || return -1
+        fuel -= 1
+        fuel = _grounded_closed_fragment_fuel(ty.arg, fuel)
+        fuel < 0 && return -1
+        return _grounded_closed_fragment_fuel(ty.res, fuel)
+    elseif ty isa TyList
+        fuel > 0 || return -1
+        return _grounded_closed_fragment_fuel(ty.elem, fuel - 1)
+    elseif ty isa TyArray
+        ty.len isa TyNat || return -1
+        fuel > 1 || return -1
+        return _grounded_closed_fragment_fuel(ty.elem, fuel - 2)
+    end
+    # Variables (even resolved ones), μ, rigid, products, sums, schemes and
+    # custom constructors require the original compatibility predicate.
+    return -1
+end
+
+function _grounded_exact_closed_tree_equal(left::Ty, right::Ty)::Bool
+    if left isa TyConst
+        right isa TyConst || return false
+        return left.name == right.name
+    elseif left isa TyFun
+        right isa TyFun || return false
+        return _grounded_exact_closed_tree_equal(left.arg, right.arg) &&
+               _grounded_exact_closed_tree_equal(left.res, right.res)
+    elseif left isa TyList
+        right isa TyList || return false
+        return _grounded_exact_closed_tree_equal(left.elem, right.elem)
+    elseif left isa TyArray
+        right isa TyArray || return false
+        left_length = left.len::TyNat
+        right_length = right.len::TyNat
+        return left_length.value == right_length.value &&
+               _grounded_exact_closed_tree_equal(left.elem, right.elem)
+    end
+    return false
+end
+
+"""
+    _grounded_iscompatible(left, right)
+
+Use direct comparison only when both operands are certified closed built-in
+trees within one shared 64-node fuel. Unknown constructors and exhausted fuel
+fall back to `iscompatible` with the original operands. Fuel is not an
+admission or type-size limit.
+"""
+@inline function _grounded_iscompatible(left::TyLike, right::TyLike)::Bool
+    (left isa Ty && right isa Ty) || return iscompatible(left, right)
+    fuel = _grounded_closed_fragment_fuel(left, 64)
+    fuel < 0 && return iscompatible(left, right)
+    fuel = _grounded_closed_fragment_fuel(right, fuel)
+    fuel < 0 && return iscompatible(left, right)
+    return _grounded_exact_closed_tree_equal(left, right)
+end
+
 """
     typekey(t::TyLike) -> Any
 
@@ -640,6 +703,10 @@ function typekey(t::TyLike)
         return _typekey(t)
     end
 end
+
+# A concrete atomic type is already a complete one-record DAG. This applies to
+# every TyConst name, not only the built-in primitive-name set.
+_typekey(t::TyConst) = (:const, :dag, 1, ((:const, (t.name,), ()),))
 
 function _typekey(t::Ty)
     builder = _TypeKeyBuilder()
@@ -972,7 +1039,7 @@ function lookup(env::Env, idx::Int)
     return env.stack[pos].second
 end
 
-function lookup(env::Env, name::Symbol)::TyScheme
+function lookup(env::Env, name::Symbol)
     for (n, sch) in Iterators.reverse(env.stack)
         if n isa Symbol && n == name
             return sch
@@ -1945,6 +2012,13 @@ end
     @test result.value.name == :missing
 end
 
+@testitem "infer reports unbound named lexical variables through Err" setup=[TSBaseImports] begin
+    result = infer(AstTree(VarNode(:missing)), Dict{Symbol,TyLike}(:missing => IntTy))
+    @test result isa Err
+    @test result.value isa TypeSystem.UnboundVariableError
+    @test result.value.name == :missing
+end
+
 @testitem "typekey alpha invariance and mu termination" setup=[TSBaseImports] begin
     # α-invariance for free vars (by first-occurrence numbering).
     a1, b1 = newtyvar(0), newtyvar(0)
@@ -1974,6 +2048,63 @@ end
     @test mu isa TyMu
     kmu = typekey(mu)
     @test kmu[1] == :mu
+end
+
+@testitem "typekey TyConst leaf fast path matches generic builder" setup=[TSBaseImports] begin
+    using Test
+    using LambdaRegression.TypeSystem:
+        TyArray,
+        TyConst,
+        TyFun,
+        TyList,
+        TyProd,
+        TyScheme,
+        TySum,
+        TyVar,
+        _TypeKeyBuilder,
+        _typekey_walk,
+        make_tyvar_factory
+
+    TS = LambdaRegression.TypeSystem
+    generic_key = function (ty)
+        builder = _TypeKeyBuilder()
+        root = _typekey_walk(builder, ty)
+        return (builder.records[root][1], :dag, root, Tuple(builder.records))
+    end
+    compare_with_generic = function (ty)
+        actual = TS.typekey(ty)
+        expected = generic_key(ty isa TyScheme ? ty.ty : ty)
+        @test isequal(actual, expected)
+        @test actual == expected
+        @test hash(actual) == hash(expected)
+    end
+
+    atoms = TyConst[
+        TS.BoolTy,
+        TS.FloatTy,
+        TyConst(:arbitrary_external_atom),
+        TyConst(Symbol("punctuation/and spaces")),
+    ]
+    for atom in atoms
+        compare_with_generic(atom)
+        @test TS.typekey(atom) == (:const, :dag, 1, ((:const, (atom.name,), ()),))
+
+        empty_scheme = TyScheme(TyVar[], atom)
+        unused_scheme = TyScheme([make_tyvar_factory()(0)], atom)
+        compare_with_generic(empty_scheme)
+        compare_with_generic(unused_scheme)
+        @test TS.typekey(empty_scheme) == TS.typekey(atom)
+        @test TS.typekey(unused_scheme) == TS.typekey(atom)
+    end
+
+    composites = (
+        TyFun(atoms[3], TyList(atoms[4])),
+        TyArray(TS.TyNat(7), atoms[2]),
+        TyProd(atoms[1], TySum(atoms[4], atoms[3])),
+    )
+    for composite in composites
+        compare_with_generic(composite)
+    end
 end
 
 @testitem "typectx_fingerprint is order independent" setup=[TSBaseImports] begin

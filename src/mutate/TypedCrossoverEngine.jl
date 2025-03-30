@@ -258,8 +258,8 @@ function _engine_replays_target(child_site, original_target_site)::Bool
         return !(replay isa Err) && replay
     end
 
-    child_boundary = Tuple(getproperty(child_site, :boundary_visible))
-    original_boundary = Tuple(getproperty(original_target_site, :boundary_visible))
+    child_boundary = collect(Any, getproperty(child_site, :boundary_visible))
+    original_boundary = collect(Any, getproperty(original_target_site, :boundary_visible))
     child_positions = Dict{Any,Int}(binder => index for (index, binder) in enumerate(child_boundary))
     original_positions = Dict{Any,Int}(binder => index for (index, binder) in enumerate(original_boundary))
     candidate_allowed = (source, target) ->
@@ -387,7 +387,7 @@ function recombine(
     length(donor_sites) >= op.min_sites ||
         return Err(NoEligibleCrossoverSiteErr())
     if donor_path !== nothing
-        selected_path = Tuple(Int.(collect(donor_path)))
+        selected_path = Int.(collect(donor_path))
         donor_ids = typed_analysis_site_ids(
             donor_snapshot;
             include_root=op.allow_root,
@@ -592,7 +592,7 @@ function recombine(
             child_site_ids = typed_analysis_site_ids(
                 child_snapshot;
                 include_root=true,
-                site_path=Tuple(path),
+                site_path=path,
             )
             child_site_id = isempty(child_site_ids) ? nothing : only(child_site_ids)
             if child_site_id === nothing

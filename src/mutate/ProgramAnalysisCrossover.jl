@@ -77,7 +77,7 @@ function typed_analysis_site_ids(
     include_root::Bool=true,
     site_path::Union{Nothing,AbstractVector{<:Integer},Tuple{Vararg{Int}}}=nothing,
 )
-    requested = site_path === nothing ? nothing : Tuple(Int.(collect(site_path)))
+    requested = site_path === nothing ? nothing : Int.(collect(site_path))
     if requested !== nothing
         id = 1
         for edge in requested
@@ -200,6 +200,8 @@ end
     @test length(typed_analysis_site_ids(ordinary; site_path=Int[])) == 1
     @test isempty(typed_analysis_site_ids(ordinary; include_root=false, site_path=Int[]))
     @test length(typed_analysis_site_ids(ordinary; site_path=[1])) == 1
+    @test typed_analysis_site_ids(ordinary; site_path=(1,)) ==
+          typed_analysis_site_ids(ordinary; site_path=[1])
     @test length(typed_analysis_site_ids(
         ordinary; include_root=false, site_path=[1])) == 1
     root = typed_analysis_site(recursive, only(filter(

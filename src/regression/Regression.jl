@@ -473,7 +473,8 @@ function _validate_program_contract(
     program,
     target_ty::Ty,
     components::NamedTuple,
-    label::AbstractString,
+    label::AbstractString;
+    check_type::Bool=true,
 )
     program isa Program || return ArgumentError("$label is not a Program")
     Set(keys(program.local_consts)) == Set(keys(program.local_consts_ty)) ||
@@ -489,19 +490,29 @@ function _validate_program_contract(
             name in components.input_slots ||
             return ArgumentError("$label references unresolved constant :$name")
     end
-    ctx = merge(components.global_consts_ty, components.input_types, program.local_consts_ty)
-    query_ctx, detached_targets = TypeSystem._detached_type_inputs(ctx, target_ty)
-    query_target = only(detached_targets)
-    factory = components.tyfactory_ctor()
-    inferred = TypeSystem.infer_term(program.tree, query_ctx; factory)
-    inferred isa Err &&
-        return ArgumentError("$label type inference returned Err($(repr(inferred.value)))")
-    inferred isa TyLike ||
-        return ArgumentError("$label type inference returned a non-type")
-    TypeSystem.iscompatible(inferred, query_target) ||
-        return ArgumentError("$label inferred type is incompatible with target")
+    if check_type
+        ctx = merge(components.global_consts_ty, components.input_types, program.local_consts_ty)
+        query_ctx, detached_targets = TypeSystem._detached_type_inputs(ctx, target_ty)
+        query_target = only(detached_targets)
+        factory = components.tyfactory_ctor()
+        inferred = TypeSystem.infer_term(program.tree, query_ctx; factory)
+        inferred isa Err &&
+            return ArgumentError("$label type inference returned Err($(repr(inferred.value)))")
+        inferred isa TyLike ||
+            return ArgumentError("$label type inference returned a non-type")
+        TypeSystem.iscompatible(inferred, query_target) ||
+            return ArgumentError("$label inferred type is incompatible with target")
+    end
     return nothing
 end
+
+"""Whether a mutation driver verifies every successful final tree against its
+target and detached constant-type context before returning it. Unknown drivers
+are unchecked; a wrapper may forward this contract only when it preserves the
+same final tree and declarations without editing them afterward.
+"""
+_mutation_result_typechecked(::Any) = false
+_mutation_result_typechecked(::typeof(Mutations.mutate_tree)) = true
 
 function _preflight_initial_population(pop, reg::Regressor, components::NamedTuple, N::Int)
     pop isa AbstractVector || return ArgumentError("init_population must return a vector")
@@ -606,7 +617,11 @@ rejection filter; it is not a typing check or a termination proof.
 Initialization growth uses the configured unary composition, binary
 composition, and contextual expansion operators. The returned NamedTuple is
 a loader result: it runs no business logic and can be customized with
-`merge`.
+`merge`. AgeSearch consumes `crossover_op` through one directed
+`Populations.recombine` call per proposal, so the configured operator must
+support that seam. This is local to AgeSearch; it does not make `recombine` a
+requirement of every `Populations.AbstractCrossover`, which also exposes the
+independent two-child `crossover` interface.
 """
 function default_components(;
     global_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
@@ -737,9 +752,7 @@ function default_components(;
     bloat_policy::Mutations.BloatPolicy=Mutations.BloatPolicy(),
     candidate_failure=_known_candidate_exception,
     loss_failure=_no_candidate_exception,
-    crossover_op=Populations.IndependentCrossover(
-        Populations.TypedSubtreeSwapCrossover(require_same_depth=false),
-    ),
+    crossover_op=Populations.TypedSubtreeSwapCrossover(require_same_depth=false),
     mutation_driver=Mutations.mutate_tree,
     generation_config_factory=rng -> CanonicalGeneration.GenerationConfig(;
         rng,
@@ -866,8 +879,6 @@ function default_components(;
                         provider=Mutations.IndexedProvider(),
                         max_try=init_growth_max_try,
                         prune_consts=mutation_prune_consts,
-                        copy_tree=true,
-                        copy_ctx=true,
                         global_consts,
                         global_consts_ty=merge(global_consts_ty, input_types),
                         local_consts=attempt_consts,
@@ -1298,7 +1309,8 @@ end
     @test c.force_lambda_root_probability == 0.5
     @test c.functiondef_generation_weight == 1.0
     @test c.functiondef_recursive_body_site_weight == 4.0
-    @test c.crossover_op isa LambdaRegression.Mutations.Populations.IndependentCrossover
+    @test c.crossover_op isa LambdaRegression.Mutations.Populations.TypedSubtreeSwapCrossover
+    @test !c.crossover_op.require_same_depth
     @test c.binary_composition_site_selection isa
         LambdaRegression.Mutations.LocalCallSiteSelectionPolicy
     @test c.binary_composition_site_selection.multiplier == 32.0

@@ -28,23 +28,17 @@ struct _ScopedApp <: _ScopedTerm
     end
 end
 
-mutable struct _ScopedAncestry
-    nodes::Vector{AstNode}
-    node_ids::IdDict{AstNode,Int}
-    parent_ids::Vector{Int}
-    first_child_ids::Vector{Int}
-    second_child_ids::Vector{Int}
-    depths::Vector{Int}
+mutable struct _ScopedLCA
+    index::SyntaxIndex
     up::Union{Nothing,Matrix{Int}}
-    binder_occurrences::Dict{Int,Vector{Int}}
     binder_lca::Dict{Int,Int}
 end
 
 struct _ScopedTree
     root::_ScopedTerm
-    by_ast::IdDict{AstNode,_ScopedTerm}
-    parent_by_ast::IdDict{AstNode,Tuple{Union{Nothing,AstNode},Int}}
-    ancestry::Union{Nothing,_ScopedAncestry}
+    index::Union{Nothing,SyntaxIndex}
+    terms::Union{Nothing,Vector{_ScopedTerm}}
+    lca::Union{Nothing,_ScopedLCA}
     next_binder_id::Int
 end
 
@@ -66,8 +60,8 @@ end
 
 _ScopedTree(root::_ScopedTerm) = _ScopedTree(
     root,
-    IdDict{AstNode,_ScopedTerm}(),
-    IdDict{AstNode,Tuple{Union{Nothing,AstNode},Int}}(),
+    nothing,
+    nothing,
     nothing,
     _compute_next_scoped_binder_id(root),
 )
@@ -109,91 +103,20 @@ struct _ScopedLetBinding
     rhs::_ScopedTerm
 end
 
-mutable struct _ScopedResolver
-    binders::Vector{Int}
-    next_binder_id::Int
-    by_ast::IdDict{AstNode,_ScopedTerm}
-    parent_by_ast::IdDict{AstNode,Tuple{Union{Nothing,AstNode},Int}}
-    nodes::Vector{AstNode}
-    node_ids::IdDict{AstNode,Int}
-    parent_ids::Vector{Int}
-    first_child_ids::Vector{Int}
-    second_child_ids::Vector{Int}
-    depths::Vector{Int}
-    binder_occurrences::Dict{Int,Vector{Int}}
-end
-
 _application_role(term::_ScopedApp) = term.role
 _application_role(::_ScopedTerm) = nothing
 
 _application_roles_stable(old::_ScopedTerm, new::_ScopedTerm) =
     _application_role(old) === _application_role(new)
 
-function _resolve_scoped_node(
-    node::AstNode,
-    state::_ScopedResolver,
-    parent::Union{Nothing,AstNode},
-    child_index::Int,
-)
-    state.parent_by_ast[node] = (parent, child_index)
-    node_id = length(state.nodes) + 1
-    parent_id = parent === nothing ? 0 : state.node_ids[parent]
-    state.node_ids[node] = node_id
-    push!(state.nodes, node)
-    push!(state.parent_ids, parent_id)
-    push!(state.first_child_ids, 0)
-    push!(state.second_child_ids, 0)
-    if parent_id != 0
-        child_index == 1 && (state.first_child_ids[parent_id] = node_id)
-        child_index == 2 && (state.second_child_ids[parent_id] = node_id)
-    end
-    push!(state.depths, parent_id == 0 ? 0 : state.depths[parent_id] + 1)
-    if node isa ConstNode
-        term = _ScopedConst(node.name)
-        state.by_ast[node] = term
-        return term
-    elseif node isa VarNode
-        term = _ScopedFree(node.name)
-        state.by_ast[node] = term
-        return term
-    elseif node isa IndexNode
-        index = node.index
-        0 <= index < length(state.binders) ||
-            return Err(_UnresolvedScopedIndexErr(index, length(state.binders)))
-        binder_id = state.binders[end - index]
-        push!(get!(state.binder_occurrences, binder_id, Int[]), node_id)
-        term = _ScopedBound(binder_id)
-        state.by_ast[node] = term
-        return term
-    elseif node isa AbsNode
-        binder_id = state.next_binder_id
-        state.next_binder_id += 1
-        push!(state.binders, binder_id)
-        body = _resolve_scoped_node(node.body, state, node, 1)
-        pop!(state.binders)
-        body isa Err && return body
-        term = _ScopedAbs(binder_id, node.name, body)
-        state.by_ast[node] = term
-        return term
-    elseif node isa AppNode
-        func = _resolve_scoped_node(node.func, state, node, 1)
-        func isa Err && return func
-        arg = _resolve_scoped_node(node.arg, state, node, 2)
-        arg isa Err && return arg
-        term = _ScopedApp(func, arg)
-        state.by_ast[node] = term
-        return term
-    end
-    return Err(_UnsupportedScopedNodeErr(typeof(node)))
-end
-
-function _scoped_lca_ready(ancestry::_ScopedAncestry, left::Int, right::Int)
-    up = ancestry.up::Matrix{Int}
+function _scoped_lca_ready(lca::_ScopedLCA, left::Int, right::Int)
+    index = lca.index
+    up = lca.up::Matrix{Int}
     a, b = left, right
-    if ancestry.depths[a] < ancestry.depths[b]
+    if index.depth[a] < index.depth[b]
         a, b = b, a
     end
-    difference = ancestry.depths[a] - ancestry.depths[b]
+    difference = index.depth[a] - index.depth[b]
     level = 1
     while difference > 0
         isodd(difference) && (a = up[a, level])
@@ -208,78 +131,134 @@ function _scoped_lca_ready(ancestry::_ScopedAncestry, left::Int, right::Int)
             a, b = up_a, up_b
         end
     end
-    return ancestry.parent_ids[a]
+    return index.parent[a]
 end
 
-function _build_scoped_ancestry(state::_ScopedResolver)
-    return _ScopedAncestry(
-        state.nodes,
-        state.node_ids,
-        state.parent_ids,
-        state.first_child_ids,
-        state.second_child_ids,
-        state.depths,
-        nothing,
-        state.binder_occurrences,
-        Dict{Int,Int}(),
-    )
-end
-
-function _ensure_scoped_lca!(ancestry::_ScopedAncestry)
-    ancestry.up === nothing || return ancestry
-    node_count = length(ancestry.nodes)
+function _ensure_scoped_lca!(lca::_ScopedLCA)
+    lca.up === nothing || return lca
+    index = lca.index
+    node_count = length(index)
     levels = 1
     while (1 << (levels - 1)) < max(node_count, 1)
         levels += 1
     end
     up = zeros(Int, node_count, levels)
     for node_id in 1:node_count
-        up[node_id, 1] = ancestry.parent_ids[node_id]
+        up[node_id, 1] = index.parent[node_id]
     end
     for level in 2:levels, node_id in 1:node_count
         parent_id = up[node_id, level - 1]
         up[node_id, level] = parent_id == 0 ? 0 : up[parent_id, level - 1]
     end
-    ancestry.up = up
-    for (binder_id, occurrences) in ancestry.binder_occurrences
-        isempty(occurrences) && continue
-        lca = first(occurrences)
-        for occurrence in @view occurrences[2:end]
-            lca = _scoped_lca_ready(ancestry, lca, occurrence)
+    lca.up = up
+    for occurrence in eachindex(index.nodes)
+        index.nodes[occurrence] isa IndexNode || continue
+        binder_id = index.reference_binder[occurrence]
+        binder_id == 0 && continue
+        if haskey(lca.binder_lca, binder_id)
+            lca.binder_lca[binder_id] = _scoped_lca_ready(
+                lca,
+                lca.binder_lca[binder_id],
+                occurrence,
+            )
+        else
+            lca.binder_lca[binder_id] = occurrence
         end
-        ancestry.binder_lca[binder_id] = lca
     end
-    return ancestry
+    return lca
 end
 
-function _scoped_lca(ancestry::_ScopedAncestry, left::Int, right::Int)
-    _ensure_scoped_lca!(ancestry)
-    return _scoped_lca_ready(ancestry, left, right)
+function _scoped_lexical_depth(index::SyntaxIndex, occurrence::Int)
+    binder = index.env_head[occurrence]
+    return binder == 0 ? 0 : index.bindings[binder].depth
 end
 
-function _resolve_scoped(tree::AstTree)::Union{_ScopedTree,Err}
-    state = _ScopedResolver(
-        Int[],
-        1,
-        IdDict{AstNode,_ScopedTerm}(),
-        IdDict{AstNode,Tuple{Union{Nothing,AstNode},Int}}(),
-        AstNode[],
-        IdDict{AstNode,Int}(),
-        Int[],
-        Int[],
-        Int[],
-        Int[],
-        Dict{Int,Vector{Int}}(),
-    )
-    root = _resolve_scoped_node(tree.root, state, nothing, 0)
+function _resolve_scoped_occurrence(
+    index::SyntaxIndex,
+    occurrence::Int,
+    terms::Vector{_ScopedTerm},
+)
+    node = index.nodes[occurrence]
+    term = if node isa ConstNode
+        _ScopedConst(node.name)
+    elseif node isa VarNode
+        # De Bruijn-scoped rewrites deliberately treat named variables as free.
+        _ScopedFree(node.name)
+    elseif node isa IndexNode
+        binder_id = index.reference_binder[occurrence]
+        binder_id == 0 && return Err(_UnresolvedScopedIndexErr(
+            node.index,
+            _scoped_lexical_depth(index, occurrence),
+        ))
+        _ScopedBound(binder_id)
+    elseif node isa AbsNode
+        body = _resolve_scoped_occurrence(index, only(index.children[occurrence]), terms)
+        body isa Err && return body
+        _ScopedAbs(index.owner_binder[occurrence], node.name, body)
+    elseif node isa AppNode
+        child_ids = index.children[occurrence]
+        func = _resolve_scoped_occurrence(index, child_ids[1], terms)
+        func isa Err && return func
+        arg = _resolve_scoped_occurrence(index, child_ids[2], terms)
+        arg isa Err && return arg
+        _ScopedApp(func, arg)
+    else
+        return Err(_UnsupportedScopedNodeErr(typeof(node)))
+    end
+    terms[occurrence] = term
+    return term
+end
+
+function _resolve_scoped(index::SyntaxIndex)::Union{_ScopedTree,Err}
+    terms = Vector{_ScopedTerm}(undef, length(index))
+    root = _resolve_scoped_occurrence(index, 1, terms)
     root isa Err && return root
     return _ScopedTree(
         root,
-        state.by_ast,
-        state.parent_by_ast,
-        _build_scoped_ancestry(state),
-        state.next_binder_id,
+        index,
+        terms,
+        _ScopedLCA(index, nothing, Dict{Int,Int}()),
+        length(index.bindings) + 1,
     )
+end
+
+function _resolve_scoped(tree::AstTree)::Union{_ScopedTree,Err}
+    index = try
+        analyze_syntax(tree)
+    catch error
+        error isa UnsupportedSyntaxError || rethrow()
+        return Err(_UnsupportedScopedNodeErr(error.node_type))
+    end
+    return _resolve_scoped(index)
+end
+
+function _resolved_scoped(env::MutationEnv)
+    return get!(env.eligibility_cache, _resolve_scoped) do
+        if env.analysis isa TypedAnalysis
+            return _resolve_scoped(env.analysis.index)
+        elseif env.tree !== nothing
+            return _resolve_scoped(env.tree)
+        end
+        return Err(NoEligibleSiteErr())
+    end
+end
+
+function _scoped_occurrence(scoped::_ScopedTree, site::Site)
+    index = scoped.index
+    index === nothing && return 0
+    analysis = getfield(site, :analysis)
+    if analysis isa TypedAnalysis && analysis.index === index
+        occurrence = getfield(site, :occurrence)
+        return 1 <= occurrence <= length(index) ? occurrence : 0
+    end
+    occurrence = occurrence_id(index, site.path)
+    return occurrence === nothing ? 0 : occurrence
+end
+
+function _scoped_term_at_occurrence(scoped::_ScopedTree, occurrence::Int)
+    terms = scoped.terms
+    terms === nothing && return nothing
+    return 1 <= occurrence <= length(terms) ? terms[occurrence] : nothing
 end
 
 function _materialize_scoped_node(
@@ -403,12 +382,6 @@ end
                _scoped_uses_binder(term.arg, binder_id)
     end
     return false
-end
-
-function _resolved_scoped(env::MutationEnv)
-    return get!(env.eligibility_cache, _resolve_scoped) do
-        _resolve_scoped(env.tree)
-    end
 end
 
 function _retained_application_ancestors(
@@ -595,23 +568,36 @@ function _legal_hoist_sizes(
     scoped::_ScopedTree,
     path::AbstractVector{<:Integer},
 )
-    site_path = collect(Int, path)
-    isempty(site_path) && return Int[]
-    term = _scoped_at_path(scoped, site_path)
-    term isa Err && return Int[]
-    parent_path = site_path[1:(end - 1)]
-    parent = _scoped_at_path(scoped, parent_path)
-    parent isa Err && return Int[]
-    parent_is_function = false
-    if !isempty(parent_path) && last(parent_path) == 1
-        grandparent = _scoped_at_path(scoped, parent_path[1:(end - 1)])
-        parent_is_function = grandparent isa _ScopedApp
-    end
+    index = scoped.index
+    index === nothing && return Int[]
+    occurrence = occurrence_id(index, path)
+    occurrence === nothing && return Int[]
+    return _legal_hoist_sizes_at_occurrence(mutation, scoped, occurrence)
+end
+
+function _legal_hoist_sizes_at_occurrence(
+    mutation,
+    scoped::_ScopedTree,
+    site_id::Int,
+)
+    index = scoped.index
+    index === nothing && return Int[]
+    1 < site_id <= length(index) || return Int[]
+    parent_id = index.parent[site_id]
+    parent_id == 0 && return Int[]
+    term = _scoped_term_at_occurrence(scoped, site_id)
+    parent = _scoped_term_at_occurrence(scoped, parent_id)
+    (term isa _ScopedTerm && parent isa _ScopedTerm) || return Int[]
+
+    grandparent_id = index.parent[parent_id]
+    parent_is_function = grandparent_id != 0 &&
+        index.nodes[grandparent_id] isa AppNode &&
+        index.parent_edge[parent_id] == 1
     return _legal_hoist_sizes(
         mutation,
         term,
         parent,
-        parent isa _ScopedApp && last(site_path) == 1,
+        index.nodes[parent_id] isa AppNode && index.parent_edge[site_id] == 1,
         parent_is_function,
     )
 end
@@ -621,23 +607,10 @@ function _legal_hoist_sizes(
     scoped::_ScopedTree,
     site::Site,
 )
-    site.parent === nothing && return Int[]
-    term = get(scoped.by_ast, site.node, nothing)
-    parent = get(scoped.by_ast, site.parent, nothing)
-    if !(term isa _ScopedTerm && parent isa _ScopedTerm)
-        return _legal_hoist_sizes(mutation, scoped, site.path)
-    end
-    grandparent, parent_child_index = get(
-        scoped.parent_by_ast,
-        site.parent,
-        (nothing, 0),
-    )
-    return _legal_hoist_sizes(
+    return _legal_hoist_sizes_at_occurrence(
         mutation,
-        term,
-        parent,
-        site.parent isa AppNode && site.child_index == 1,
-        grandparent isa AppNode && parent_child_index == 1,
+        scoped,
+        _scoped_occurrence(scoped, site),
     )
 end
 
@@ -649,9 +622,13 @@ function _legal_hoist_sizes(
     env::MutationEnv,
 )
     cache = get!(env.eligibility_cache, _legal_hoist_sizes) do
-        Dict{Tuple{Int,Int,Tuple},Vector{Int}}()
+        Dict{Tuple{Int,Int,Int},Vector{Int}}()
     end
-    key = (mutation.min_bindings, mutation.max_bindings, Tuple(site.path))
+    key = (
+        mutation.min_bindings,
+        mutation.max_bindings,
+        _scoped_occurrence(scoped, site),
+    )
     return get!(cache, key) do
         _legal_hoist_sizes(mutation, scoped, site)
     end
@@ -727,86 +704,73 @@ struct _SinkCandidate
 end
 
 @inline function _scoped_is_ancestor(
-    ancestry::_ScopedAncestry,
+    lca::_ScopedLCA,
     ancestor_id::Int,
     node_id::Int,
 )
-    return _scoped_lca(ancestry, ancestor_id, node_id) == ancestor_id
-end
-
-function _ancestry_id_at_path(
-    ancestry::_ScopedAncestry,
-    path::AbstractVector{<:Integer},
-)
-    node_id = 1
-    for child_index in path
-        node_id = child_index == 1 ?
-            ancestry.first_child_ids[node_id] :
-            child_index == 2 ? ancestry.second_child_ids[node_id] : 0
-        node_id == 0 && return 0
-    end
-    return node_id
+    index = lca.index
+    return 1 <= ancestor_id <= length(index) &&
+           ancestor_id <= node_id < index.subtree_end[ancestor_id]
 end
 
 function _sink_candidate(mutation, scoped::_ScopedTree, site_id::Int)
-    ancestry = scoped.ancestry
-    ancestry === nothing && return nothing
-    _ensure_scoped_lca!(ancestry)
-    1 <= site_id <= length(ancestry.nodes) || return nothing
-    site_node = ancestry.nodes[site_id]
+    lca = scoped.lca
+    index = scoped.index
+    (lca === nothing || index === nothing) && return nothing
+    _ensure_scoped_lca!(lca)
+    1 <= site_id <= length(index) || return nothing
+    site_node = index.nodes[site_id]
     site_node isa AppNode || return nothing
-    term = get(scoped.by_ast, site_node, nothing)
+    term = _scoped_term_at_occurrence(scoped, site_id)
     term isa _ScopedApp || return nothing
     term.func isa _ScopedAbs || return nothing
 
-    abstraction_id = ancestry.first_child_ids[site_id]
+    site_children = index.children[site_id]
+    abstraction_id = length(site_children) >= 1 ? site_children[1] : 0
     abstraction_id == 0 && return nothing
-    body_id = ancestry.first_child_ids[abstraction_id]
+    abstraction_children = index.children[abstraction_id]
+    body_id = length(abstraction_children) >= 1 ? abstraction_children[1] : 0
     body_id == 0 && return nothing
     binder_id = term.func.binder_id
-    target_id = get(ancestry.binder_lca, binder_id, 0)
+    target_id = get(lca.binder_lca, binder_id, 0)
     target_id == 0 && return nothing
-    _scoped_is_ancestor(ancestry, body_id, target_id) || return nothing
+    _scoped_is_ancestor(lca, body_id, target_id) || return nothing
 
     # Removing the source let must not expose a direct abstraction as the
     # function of an application that was previously ordinary.
-    source_parent_id = ancestry.parent_ids[site_id]
+    source_parent_id = index.parent[site_id]
     if source_parent_id != 0 &&
-       ancestry.nodes[source_parent_id] isa AppNode &&
-       ancestry.first_child_ids[source_parent_id] == site_id &&
-       ancestry.nodes[body_id] isa AbsNode
+       index.nodes[source_parent_id] isa AppNode &&
+       index.parent_edge[site_id] == 1 &&
+       index.nodes[body_id] isa AbsNode
         return nothing
     end
 
-    target_node = ancestry.nodes[target_id]
+    target_node = index.nodes[target_id]
     if !mutation.allow_trivial && target_node isa IndexNode
-        target_id = ancestry.parent_ids[target_id]
+        target_id = index.parent[target_id]
         target_id == 0 && return nothing
-        target_node = ancestry.nodes[target_id]
+        target_node = index.nodes[target_id]
     end
 
     # Wrapping a direct function-side abstraction would turn an existing HM
     # let-like application into an ordinary application. Use its parent region.
-    parent_id = ancestry.parent_ids[target_id]
+    parent_id = index.parent[target_id]
     if parent_id != 0
-        parent_node = ancestry.nodes[parent_id]
-        child_index = ancestry.first_child_ids[parent_id] == target_id ? 1 : 2
+        parent_node = index.nodes[parent_id]
+        child_index = index.parent_edge[target_id]
         if parent_node isa AppNode && child_index == 1 && target_node isa AbsNode
             target_id = parent_id
         end
     end
 
     target_id == body_id && return nothing
-    _scoped_is_ancestor(ancestry, body_id, target_id) || return nothing
+    _scoped_is_ancestor(lca, body_id, target_id) || return nothing
     return _SinkCandidate(body_id, target_id)
 end
 
 function _sink_candidate(mutation, scoped::_ScopedTree, site::Site)
-    ancestry = scoped.ancestry
-    ancestry === nothing && return nothing
-    site_id = get(ancestry.node_ids, site.node, 0)
-    site_id == 0 && (site_id = _ancestry_id_at_path(ancestry, site.path))
-    return _sink_candidate(mutation, scoped, site_id)
+    return _sink_candidate(mutation, scoped, _scoped_occurrence(scoped, site))
 end
 
 function _sink_candidate(
@@ -816,9 +780,9 @@ function _sink_candidate(
     env::MutationEnv,
 )
     cache = get!(env.eligibility_cache, _sink_candidate) do
-        Dict{Tuple{Bool,Tuple},Union{Nothing,_SinkCandidate}}()
+        Dict{Tuple{Bool,Int},Union{Nothing,_SinkCandidate}}()
     end
-    key = (mutation.allow_trivial, Tuple(site.path))
+    key = (mutation.allow_trivial, _scoped_occurrence(scoped, site))
     return get!(cache, key) do
         _sink_candidate(mutation, scoped, site)
     end
@@ -829,18 +793,18 @@ function _relative_ast_path(
     ancestor_id::Int,
     descendant_id::Int,
 )
-    ancestry = scoped.ancestry
-    ancestry === nothing && return Err(NoEligibleSiteErr())
+    lca = scoped.lca
+    index = scoped.index
+    (lca === nothing || index === nothing) && return Err(NoEligibleSiteErr())
     ancestor_id == 0 && return Err(NoEligibleSiteErr())
-    _scoped_is_ancestor(ancestry, ancestor_id, descendant_id) ||
+    _scoped_is_ancestor(lca, ancestor_id, descendant_id) ||
         return Err(NoEligibleSiteErr())
 
     reverse_path = Int[]
     cursor = descendant_id
     while cursor != ancestor_id
-        parent_id = ancestry.parent_ids[cursor]
-        child_index = ancestry.first_child_ids[parent_id] == cursor ? 1 : 2
-        push!(reverse_path, child_index)
+        push!(reverse_path, index.parent_edge[cursor])
+        parent_id = index.parent[cursor]
         cursor = parent_id
     end
     reverse!(reverse_path)
@@ -882,9 +846,10 @@ all uses of its binder. Unused and split-at-root bindings are rejected.
 `allow_trivial=false` also refuses the degenerate inverse-lift neighborhood
 whose destination is only the bound-variable leaf.
 
-The analysis uses one attempt-local binder-occurrence/LCA index. Rewriting
-preserves binder identities and affected direct-`Abs` HM application roles,
-then delegates final target compatibility to `mutate_tree`.
+The analysis reuses the attempt's `SyntaxIndex` for occurrence and binder
+structure, building the use-site LCA lazily. Rewriting preserves binder
+identities and affected direct-`Abs` HM application roles, then delegates
+final target compatibility to `mutate_tree`.
 
 No mutation-specific `ctx` field is required. Expected failure modes are an
 unused binder, no strict legal descendant, a disabled trivial destination, an
@@ -961,6 +926,86 @@ end
     @test materialized.root.name == :x
     @test materialized.root.body.name == :x
     @test materialized.root.body.body.arg.func.name == :x
+end
+
+@testitem "ScopedRewrite projects shared occurrences through SyntaxIndex" begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, FunctionDefNode, IndexNode, VarNode
+    using LambdaRegression.Mutations:
+        AdaptivePolicy, BloatPolicy, MutationEnv, MutationStat, Site,
+        _ScopedAbs, _ScopedBound, _ScopedFree, _resolve_scoped,
+        _resolved_scoped, _scoped_occurrence, _scoped_term_at_occurrence
+    using LambdaRegression.ProgramAnalysis: TypedAnalysis, analyze_syntax
+    using LambdaRegression.Transforms: occurrence_id
+    using LambdaRegression.TypeSystem: IntTy, TyLike
+    using LambdaRegression.Utils: Err
+    using Random
+
+    shared_index = IndexNode(0)
+    tree = AstTree(AppNode(
+        AbsNode(:left, shared_index),
+        AbsNode(:right, shared_index),
+    ))
+    index = analyze_syntax(tree)
+    scoped = _resolve_scoped(index)
+    @test !(scoped isa Err)
+    scoped isa Err && return
+
+    left_abs = occurrence_id(index, [1])
+    right_abs = occurrence_id(index, [2])
+    left_use = occurrence_id(index, [1, 1])
+    right_use = occurrence_id(index, [2, 1])
+    @test scoped.terms[left_use] == _ScopedBound(index.owner_binder[left_abs])
+    @test scoped.terms[right_use] == _ScopedBound(index.owner_binder[right_abs])
+    @test scoped.terms[left_use].binder_id != scoped.terms[right_use].binder_id
+
+    named_index = analyze_syntax(AstTree(AbsNode(:named, VarNode(:named))))
+    named_scoped = _resolve_scoped(named_index)
+    named_use = occurrence_id(named_index, [1])
+    @test named_index.reference_binder[named_use] != 0
+    @test named_scoped.terms[named_use] == _ScopedFree(:named)
+
+    typed(index) = TypedAnalysis(
+        index,
+        Dict{Int,Tuple{TyLike,TyLike}}(),
+        Dict{Int,TyLike}(),
+        IntTy,
+    )
+    matching = typed(index)
+    same_index_site = Site(matching, left_use, :index)
+    @test _scoped_occurrence(scoped, same_index_site) == left_use
+    @test getfield(same_index_site, :path_cache) === nothing
+    manual_site = Site([2], tree.root.arg, tree.root, 2, 1, :abs, IntTy, TyLike[])
+    @test _scoped_occurrence(scoped, manual_site) == right_abs
+
+    other_index = analyze_syntax(AstTree(AppNode(
+        ConstNode(:root),
+        AppNode(ConstNode(:left), ConstNode(:right)),
+    )))
+    foreign_occurrence = occurrence_id(other_index, [2])
+    foreign_site = Site(typed(other_index), foreign_occurrence, :app)
+    @test foreign_occurrence != occurrence_id(index, [2])
+    @test _scoped_occurrence(scoped, foreign_site) == occurrence_id(index, [2])
+    @test _scoped_term_at_occurrence(scoped, occurrence_id(index, [2])) isa _ScopedAbs
+
+    env = MutationEnv(
+        MersenneTwister(1),
+        IntTy,
+        Dict{Symbol,TyLike}(),
+        index.tree,
+        matching,
+        false,
+        IdDict{Any,Any}(),
+        AdaptivePolicy(),
+        IdDict{DataType,MutationStat}(),
+        BloatPolicy(),
+    )
+    @test _resolved_scoped(env).index === index
+
+    rejected = _resolve_scoped(AstTree(FunctionDefNode(ConstNode(:f))))
+    @test rejected isa Err
+    @test rejected.value isa LambdaRegression.Mutations._UnsupportedScopedNodeErr
 end
 
 @testitem "ScopedRewrite rejects escaped binder identity" begin
@@ -2451,6 +2496,89 @@ end
     @test run(inner, LetHoistMutation(), 515) == outer
     @test run(run(outer, LetSinkMutation(), 516), LetHoistMutation(), 517) == outer
     @test run(run(inner, LetHoistMutation(), 518), LetSinkMutation(), 519) == inner
+end
+
+@testitem "Scoped rewrite eligibility caches resolved occurrence keys" begin
+    using Test
+    using Random
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
+    using LambdaRegression.Mutations:
+        AdaptivePolicy, BloatPolicy, LetHoistMutation, LetSinkMutation,
+        MutationEnv, MutationStat, Site, _legal_hoist_sizes, _resolve_scoped,
+        _sink_candidate
+    using LambdaRegression.TypeSystem: IntTy, Ty, TyFun, TyLike
+
+    type_ctx = Dict{Symbol,TyLike}(
+        :f => TyFun(IntTy, IntTy),
+        :one => IntTy,
+    )
+    tree = AstTree(
+        AppNode(
+            AbsNode(:x, AppNode(ConstNode(:f), IndexNode(0))),
+            ConstNode(:one),
+        ),
+    )
+    new_env(current_tree) = MutationEnv(
+        MersenneTwister(42),
+        IntTy,
+        type_ctx,
+        current_tree,
+        nothing,
+        false,
+        IdDict{Any,Any}(),
+        AdaptivePolicy(),
+        IdDict{DataType,MutationStat}(),
+        BloatPolicy(),
+    )
+
+    sink_env = new_env(tree)
+    scoped = _resolve_scoped(tree)
+    root_site = Site(Int[], tree.root, nothing, 0, 0, :app, IntTy, Ty[])
+    default_sink = LetSinkMutation()
+    trivial_sink = LetSinkMutation(allow_trivial=true)
+    @test _sink_candidate(default_sink, scoped, root_site, sink_env) === nothing
+    trivial_candidate = _sink_candidate(trivial_sink, scoped, root_site, sink_env)
+    @test trivial_candidate !== nothing
+    @test _sink_candidate(trivial_sink, scoped, root_site, sink_env) === trivial_candidate
+
+    other_path = [1]
+    other_site = Site(other_path, tree.root.func, tree.root, 1, 1, :abs, TyFun(IntTy, IntTy), Ty[])
+    @test _sink_candidate(default_sink, scoped, other_site, sink_env) === nothing
+    sink_cache = sink_env.eligibility_cache[_sink_candidate]
+    @test sink_cache isa Dict{Tuple{Bool,Int},Union{Nothing,LambdaRegression.Mutations._SinkCandidate}}
+    @test length(sink_cache) == 3
+    @test haskey(sink_cache, (false, 1))
+    @test haskey(sink_cache, (true, 1))
+    @test haskey(sink_cache, (false, 2))
+    other_path[1] = 2
+    @test haskey(sink_cache, (false, 2))
+
+    hoist_tree = AstTree(
+        AppNode(
+            ConstNode(:f),
+            AppNode(AbsNode(:x, IndexNode(0)), ConstNode(:one)),
+        ),
+    )
+    hoist_env = new_env(hoist_tree)
+    hoist_mutation = LetHoistMutation()
+    hoist_path = [2]
+    hoist_site = Site(hoist_path, hoist_tree.root.arg, hoist_tree.root, 2, 1, :app, IntTy, Ty[])
+    hoist_scoped = _resolve_scoped(hoist_tree)
+    hoist_sizes = _legal_hoist_sizes(hoist_mutation, hoist_scoped, hoist_site, hoist_env)
+    @test hoist_sizes == [1]
+    @test _legal_hoist_sizes(hoist_mutation, hoist_scoped, hoist_site, hoist_env) === hoist_sizes
+    other_hoist_site = Site([1], hoist_tree.root.func, hoist_tree.root, 1, 1, :const_global, TyFun(IntTy, IntTy), Ty[])
+    @test isempty(_legal_hoist_sizes(hoist_mutation, hoist_scoped, other_hoist_site, hoist_env))
+    block_only = LetHoistMutation(min_bindings=2, max_bindings=2)
+    @test isempty(_legal_hoist_sizes(block_only, hoist_scoped, hoist_site, hoist_env))
+    hoist_cache = hoist_env.eligibility_cache[_legal_hoist_sizes]
+    @test hoist_cache isa Dict{Tuple{Int,Int,Int},Vector{Int}}
+    @test length(hoist_cache) == 3
+    @test haskey(hoist_cache, (1, 1, 3))
+    @test haskey(hoist_cache, (1, 1, 2))
+    @test haskey(hoist_cache, (2, 2, 3))
+    hoist_path[1] = 1
+    @test haskey(hoist_cache, (1, 1, 3))
 end
 
 @testitem "LetSinkMutation apply does not require eligibility cache warmup" begin

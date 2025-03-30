@@ -15,17 +15,45 @@ The state owns one RNG stream per island, scored populations, counters, a
 bounded recent-offspring buffer, and a loss-by-written-complexity archive.
 `advance_age_search!` performs a bounded number of *outer* proposal attempts;
 the existing mutation and crossover implementations retain ownership of their
-inner retry limits. This layer intentionally does not add scheduling policy,
-teacher structures, or a second evaluator. A changed task or component world
-requires a new state. Candidate scoring uses Regression's shared per-sample
-loop while this state retains its own invalid-candidate accounting and penalty
-policy.
+inner retry limits. Caller workflows retain outer scheduling and teacher
+ownership; this layer exposes narrow hooks for parent selection, replacement,
+and valid-candidate observation. AgeSearch's `crossover_op` must
+support the directed `Populations.recombine` seam; each crossover proposal
+chooses one recipient/donor direction and produces at most one child. This is
+an AgeSearch component requirement, not a requirement imposed on every
+`AbstractCrossover`, whose separate two-child `crossover` seam remains
+available. A changed task or component world requires a new state. Candidate
+scoring uses Regression's shared per-sample loop while this state retains its
+own invalid-candidate accounting and penalty policy.
 """
 
 export AgeSearchState, AgeSearchIndividual, AgeSearchMigration
 export AgeSearchCounters, AgeSearchReport
 export AgeSearchNoValidErr
 export initialize_age_search, advance_age_search!, inject_age_migrants!
+export AbstractAgeSearchPolicy
+export age_select_parent, age_replacement_index, age_observe_candidate!
+export age_parent_candidates
+
+"""
+    AbstractAgeSearchPolicy
+
+Optional caller-owned hooks for parent selection, replacement, and observation
+of valid scored candidates. Extend `age_select_parent(policy, state, island,
+candidates, rng, tournament_size, role)` to return one of `candidates`;
+`role` is `:parent` or `:donor`. Extend `age_replacement_index(policy, state,
+record, island)` to return a population position or `nothing` to reject admission.
+`age_observe_candidate!(policy, state, record, island, replaced, admitted)` is
+called after every valid candidate is scored and its admission decision is
+applied. It receives the actual scored record and the complete replaced record,
+or `nothing` when admission is rejected. A policy does not supply candidate
+scores.
+
+Each hook has an inherited default: tournament selection, oldest-member
+replacement, and no-op observation. A subtype can override only the hooks it
+needs. Passing `policy=nothing` uses the same defaults.
+"""
+abstract type AbstractAgeSearchPolicy end
 
 """Finite failure returned when every island currently lacks a valid candidate."""
 struct AgeSearchNoValidErr end
@@ -127,6 +155,20 @@ struct AgeSearchMigration
     program::Program
     parent_ids::Tuple{Vararg{UInt64}}
 end
+
+# Optional caller-owned timing callbacks. Clock tokens do not wrap the operator
+# call or change its return/exception dispatch; spans here never nest. Only
+# advance proposals activate diagnostics, so initialization/migration are not
+# silently included. Callback work belongs to the caller's measured overhead.
+_age_span_begin(::Nothing, category::Symbol) = nothing
+_age_span_begin(diagnostics, category::Symbol) = diagnostics.begin_span(category)
+_age_span_end(::Nothing, category::Symbol, token) = nothing
+_age_span_end(diagnostics, category::Symbol, token) = diagnostics.end_span(category, token)
+_age_proposal_begin(::Nothing, state) = nothing
+_age_proposal_begin(diagnostics, state) = diagnostics.begin_proposal(state)
+_age_proposal_end(::Nothing, state, label, left, right, child) = nothing
+_age_proposal_end(diagnostics, state, label, left, right, child) =
+    diagnostics.end_proposal(state, label, left, right, child)
 
 function _age_checked_weight(value, label::Symbol)
     value isa Real || throw(ArgumentError("$label must be real"))
@@ -277,12 +319,28 @@ function _age_oldest_index(population::Vector{AgeSearchIndividual})
     return oldest
 end
 
-function _age_insert!(state::AgeSearchState, record::AgeSearchIndividual, population::Int)
-    pop = state.populations[population]
-    index = _age_oldest_index(pop)
-    pop[index] = record
+function _age_insert!(
+    state::AgeSearchState,
+    record::AgeSearchIndividual,
+    population::Int;
+    policy::Union{Nothing,AbstractAgeSearchPolicy}=nothing,
+)
     _age_archive!(state, record)
-    return nothing
+    pop = state.populations[population]
+    index = age_replacement_index(policy, state, record, population)
+    if index === nothing
+        age_observe_candidate!(policy, state, record, population, nothing, false)
+        return false
+    end
+    index isa Integer && !(index isa Bool) || throw(ArgumentError(
+        "age_replacement_index must return an integer population position or nothing",
+    ))
+    1 <= index <= length(pop) || throw(BoundsError(pop, index))
+    slot = Int(index)
+    replaced = pop[slot]
+    pop[slot] = record
+    age_observe_candidate!(policy, state, record, population, replaced, true)
+    return true
 end
 
 function _age_valid_records(state::AgeSearchState, population::Int)
@@ -301,13 +359,82 @@ function _age_tournament(rng::AbstractRNG, candidates::Vector{AgeSearchIndividua
     return ties[rand(rng, 1:length(ties))]
 end
 
+function age_select_parent(
+    ::Union{Nothing,AbstractAgeSearchPolicy},
+    state,
+    island,
+    candidates,
+    rng,
+    tournament_size,
+    role::Symbol,
+)
+    tournament_size >= 1 || throw(ArgumentError("tournament size must be positive"))
+    return _age_tournament(rng, candidates, tournament_size)
+end
+
+function age_replacement_index(
+    ::Union{Nothing,AbstractAgeSearchPolicy},
+    state,
+    record,
+    island,
+)
+    return _age_oldest_index(state.populations[island])
+end
+
+function age_observe_candidate!(
+    ::Union{Nothing,AbstractAgeSearchPolicy},
+    state,
+    record,
+    island,
+    replaced,
+    admitted,
+)
+    return nothing
+end
+
+function _age_selected_parent(
+    policy::Union{Nothing,AbstractAgeSearchPolicy},
+    state::AgeSearchState,
+    island::Int,
+    candidates::Vector{AgeSearchIndividual},
+    rng::AbstractRNG,
+    tournament_size::Int,
+    role::Symbol,
+)
+    tournament_size >= 1 || throw(ArgumentError("tournament size must be positive"))
+    pool = age_parent_candidates(policy, state, island, candidates, role)
+    pool isa Vector{AgeSearchIndividual} && !isempty(pool) || throw(ArgumentError(
+        "age_parent_candidates must return a nonempty scored-record vector"))
+    all(record -> record.valid && isfinite(record.loss), pool) || throw(ArgumentError(
+        "age_parent_candidates must contain valid scored records from the stable task"))
+    selected = age_select_parent(
+        policy, state, island, pool, rng, tournament_size, role,
+    )
+    selected isa AgeSearchIndividual || throw(ArgumentError(
+        "age_select_parent must return an AgeSearchIndividual from candidates",
+    ))
+    any(candidate -> candidate === selected, pool) || throw(ArgumentError(
+        "age_select_parent must return an AgeSearchIndividual from candidates",
+    ))
+    return selected
+end
+
+"""Optional owned, same-task scored archive material for mating; default uses live candidates.
+
+An extension may add actual scored witnesses, never synthetic scores or records
+from another task. The returned vector is borrowed for synchronous selection.
+"""
+age_parent_candidates(::Union{Nothing,AbstractAgeSearchPolicy}, state,
+    island, candidates, role::Symbol) = candidates
+
 function _age_validate_candidate(
     state::AgeSearchState,
     program::Program,
-    label::AbstractString,
+    label::AbstractString;
+    type_checked::Bool=false,
 )
     issue = _validate_program_contract(program, state.reg.target_ty,
-        state.reg.components, label)
+        state.reg.components, label; check_type=!type_checked)
     issue === nothing || throw(issue)
     policy = get(state.reg.components, :bloat_policy, Mutations.BloatPolicy())
     _within_bloat_limit(program.tree, policy) || return :bloat
@@ -348,29 +475,27 @@ function _age_score!(state::AgeSearchState, program::Program, source::Symbol)
         state.counters.advance_objective_calls += 1
     end
 
-    rejection = _program_candidate_rejection(program, components)
-    if rejection !== nothing
-        state.counters.invalids += 1
-        if source === :init
-            state.counters.init_invalids += 1
-        elseif source === :migration
-            state.counters.migration_invalids += 1
-        else
-            state.counters.advance_invalids += 1
-        end
-        return false, penalty, complexity
+    diagnostics = get(components, :age_diagnostics, nothing)
+    token = _age_span_begin(diagnostics, :preparation)
+    prepared = try
+        prepare_task_evaluator(
+        program, state.reg.target_ty, components, config; copy_tree=false,
+        )
+    finally
+        _age_span_end(diagnostics, :preparation, token)
     end
-
-    prepared = prepare_task_evaluator(
-        program, state.reg.target_ty, components, config; copy_tree=true,
-    )
-    result = score_samples(state.data, prepared, loss_fn;
+    token = _age_span_begin(diagnostics, :scoring)
+    result = try
+        score_samples(state.data, prepared, loss_fn;
         failure_mode=:continue_penalty,
         failure_penalty=penalty,
         candidate_failure=issue -> _age_expected_exception(issue, components),
         loss_failure=issue -> _age_expected_exception(issue, components; loss=true),
         strict_returned_errors=get(config, :strict_errors, false),
         on_samples=count -> _age_count_samples!(state, source, count))
+    finally
+        _age_span_end(diagnostics, :scoring, token)
+    end
     if !result.valid
         state.counters.invalids += 1
         if source === :init
@@ -389,9 +514,18 @@ function _age_score_record!(
     program::Program,
     parent_ids::Tuple{Vararg{UInt64}},
     origin::Symbol,
-    source::Symbol,
+    source::Symbol;
+    type_checked::Bool=false,
 )
-    admissibility = _age_validate_candidate(state, program, "$(origin) candidate")
+    diagnostics = get(state.reg.components, :age_diagnostics, nothing)
+    token = _age_span_begin(diagnostics, :validation)
+    admissibility = try
+        _age_validate_candidate(
+        state, program, "$(origin) candidate"; type_checked,
+        )
+    finally
+        _age_span_end(diagnostics, :validation, token)
+    end
     if admissibility !== nothing
         complexity_fn = get(state.reg.components, :complexity, _node_count)
         complexity = Int(complexity_fn(program.tree))
@@ -431,8 +565,6 @@ function _age_mutation(state::AgeSearchState, parent::AgeSearchIndividual, rng::
         provider=c.mutation_provider,
         max_try=c.mutation_max_try,
         prune_consts=c.mutation_prune_consts,
-        copy_tree=true,
-        copy_ctx=true,
         global_consts=c.global_consts,
         global_consts_ty=merge(c.global_consts_ty, c.input_types),
         local_consts,
@@ -457,25 +589,27 @@ function _age_crossover(
     c = state.reg.components
     op = get(c, :crossover_op, nothing)
     op === nothing && return Err(Populations.NoEligibleCrossoverPairErr())
-    children = Populations.crossover(
+    direction = rand(rng, Bool) ? :left : :right
+    recipient, donor, selection_roles = direction === :left ?
+        (left, right, (:left, :right)) :
+        (right, left, (:right, :left))
+    child = Populations.recombine(
         op,
-        left.program,
-        right.program;
-        target_a=state.reg.target_ty,
-        target_b=state.reg.target_ty,
+        recipient.program,
+        donor.program;
+        recipient_target=state.reg.target_ty,
+        donor_target=state.reg.target_ty,
         rng,
         global_consts_ty=merge(c.global_consts_ty, c.input_types),
         tyfactory_ctor=c.tyfactory_ctor,
         const_symfactory_ctor=c.const_symfactory_ctor,
+        selection_roles,
         prune=true,
     )
-    children isa Err && return children
-    children isa Tuple && length(children) == 2 || throw(ArgumentError(
-        "crossover_op must return a two-child tuple or Err",
+    child isa Err && return child
+    child isa Program || throw(ArgumentError(
+        "crossover_op recombine must return a Program or Err",
     ))
-    chosen = rand(rng, 1:2)
-    child = children[chosen]
-    child isa Program || throw(ArgumentError("crossover children must be Programs"))
     return child
 end
 
@@ -605,9 +739,10 @@ end
 
 Run at most `max_attempts` outer proposals and at most `max_evaluations`
 candidate objective calls. Each changed candidate is scored against the
-borrowed task (which the caller must keep stable); a valid changed candidate
-replaces the oldest member of its round-robin island, regardless of whether
-its loss improves.
+borrowed task (which the caller must keep stable). Valid candidates are admitted
+or rejected through `policy`; omitting it retains oldest-member replacement.
+Rejected valid candidates remain in the score archive and are reported to the
+policy observer, but do not count as accepted offspring.
 """
 function advance_age_search!(
     state::AgeSearchState;
@@ -616,6 +751,7 @@ function advance_age_search!(
     mutation_weight::Real=1.0,
     crossover_weight::Real=1.0,
     proposal=nothing,
+    policy::Union{Nothing,AbstractAgeSearchPolicy}=nothing,
 )
     max_attempts >= 0 || throw(ArgumentError("max_attempts must be non-negative"))
     max_evaluations >= 0 || throw(ArgumentError("max_evaluations must be non-negative"))
@@ -635,9 +771,14 @@ function advance_age_search!(
     invalid_start = state.counters.invalids
     mutation_start = state.counters.mutation_attempts
     crossover_start = state.counters.crossover_attempts
+    diagnostics = get(state.reg.components, :age_diagnostics, nothing)
 
     for _ in 1:max_attempts
         state.counters.objective_calls - objective_start < max_evaluations || break
+        left = right = child_result = nothing
+        label = :no_valid_parent
+        _age_proposal_begin(diagnostics, state)
+        try
         island = state.cursor
         state.cursor = mod1(state.cursor + 1, length(state.populations))
         state.counters.raw_attempts += 1
@@ -649,10 +790,15 @@ function advance_age_search!(
         end
         rng = state.rngs[island]
         tournament_size = Int(get(state.reg.config, :tournament_size, 2))
-        left = _age_tournament(rng, valid, tournament_size)
-        right = _age_tournament(rng, valid, tournament_size)
+        left = _age_selected_parent(
+            policy, state, island, valid, rng, tournament_size, :parent,
+        )
+        right = _age_selected_parent(
+            policy, state, island, valid, rng, tournament_size, :donor,
+        )
         label = :mutation
         child_result = nothing
+        type_checked = false
         if proposal !== nothing
             proposal_result = _age_call_proposal(proposal, state, island, left, right, rng)
             proposal_result isa Err || ((label, child_result) = proposal_result)
@@ -665,10 +811,26 @@ function advance_age_search!(
             if choose_crossover
                 label = :crossover
                 state.counters.crossover_attempts += 1
-                child_result = _age_crossover(state, left, right, rng)
+                token = _age_span_begin(diagnostics, :crossover)
+                child_result = try
+                    _age_crossover(state, left, right, rng)
+                finally
+                    _age_span_end(diagnostics, :crossover, token)
+                end
             else
                 state.counters.mutation_attempts += 1
-                child_result = _age_mutation(state, left, rng)
+                token = _age_span_begin(diagnostics, :mutation)
+                child_result = try
+                    _age_mutation(state, left, rng)
+                finally
+                    _age_span_end(diagnostics, :mutation, token)
+                end
+                # The built-in driver has already inferred the final child against
+                # this exact target and detached constant context. The returned
+                # tree and local declarations are not edited before scoring.
+                type_checked = _mutation_result_typechecked(get(
+                    state.reg.components, :mutation_driver, Mutations.mutate_tree,
+                ))
             end
         end
         _age_add_operator!(state.counters, label)
@@ -689,7 +851,8 @@ function advance_age_search!(
             child_result,
             label === :mutation ? (left.id,) : (left.id, right.id),
             label,
-            :advance,
+            :advance;
+            type_checked,
         )
         if !record.valid
             continue
@@ -698,9 +861,12 @@ function advance_age_search!(
             record.program, record.id, record.parent_ids, record.origin,
             record.loss, record.complexity, record.valid, _age_birth!(state),
         )
-        _age_insert!(state, record, island)
+        _age_insert!(state, record, island; policy) || continue
         _age_push_recent!(state, record)
         state.counters.accepted += 1
+        finally
+            _age_proposal_end(diagnostics, state, label, left, right, child_result)
+        end
     end
     return AgeSearchReport(
         state.counters.raw_attempts - before.raw_attempts,
@@ -741,10 +907,11 @@ end
                          max_evaluations=length(individuals), max_migrants=...)
 
 Freshly validate and score caller-provided programs in the borrowed task,
-then insert valid non-duplicates using ordinary oldest replacement. Any loss
-stored on an incoming record is deliberately ignored. Plain `Program`s have
-empty ancestry; use `AgeSearchMigration` or a named record with `parent_ids` to
-provide provenance explicitly.
+then offer valid non-duplicates to `policy` for admission. Omitting it uses
+ordinary oldest replacement. Any loss stored on an incoming record is
+deliberately ignored; rejected valid candidates are archived and observed but
+do not count as accepted migrants. Plain `Program`s have empty ancestry; use
+`AgeSearchMigration` or a named record with `parent_ids` to provide provenance.
 """
 function inject_age_migrants!(
     state::AgeSearchState,
@@ -752,6 +919,7 @@ function inject_age_migrants!(
     population::Int=1,
     max_evaluations::Int=typemax(Int),
     max_migrants::Int=typemax(Int),
+    policy::Union{Nothing,AbstractAgeSearchPolicy}=nothing,
 )
     1 <= population <= length(state.populations) || throw(BoundsError(state.populations, population))
     max_evaluations >= 0 || throw(ArgumentError("max_evaluations must be non-negative"))
@@ -790,9 +958,10 @@ function inject_age_migrants!(
             record.program, record.id, record.parent_ids, record.origin,
             record.loss, record.complexity, record.valid, _age_birth!(state),
         )
-        _age_insert!(state, record, population)
-        report = merge(report, (accepted=report.accepted + 1,))
-        state.counters.migration_accepted += 1
+        if _age_insert!(state, record, population; policy)
+            report = merge(report, (accepted=report.accepted + 1,))
+            state.counters.migration_accepted += 1
+        end
     end
     return report
 end
@@ -841,6 +1010,115 @@ end
     end
 end
 
+@testitem "Age search crossover calls one selected recombine direction" setup=[AgeSearchBaseImports] begin
+    Populations = LambdaRegression.Mutations.Populations
+    Regression = LambdaRegression.Regression
+
+    mutable struct RecombineSpy <: Populations.AbstractCrossover
+        calls::Vector{NamedTuple}
+        fail::Bool
+        binary_calls::Int
+    end
+    function Populations.recombine(
+        spy::RecombineSpy,
+        recipient::Program,
+        donor::Program;
+        recipient_target,
+        donor_target,
+        selection_roles,
+        kwargs...,
+    )
+        push!(spy.calls, (; recipient, donor, recipient_target, donor_target, selection_roles))
+        return spy.fail ? Err(Populations.NoEligibleCrossoverPairErr()) : recipient
+    end
+    function Populations.crossover(
+        spy::RecombineSpy,
+        left::Program,
+        right::Program;
+        kwargs...,
+    )
+        spy.binary_calls += 1
+        return (left, right)
+    end
+
+    struct BinaryOnlySpy <: Populations.AbstractCrossover
+        binary_calls::Base.RefValue{Int}
+    end
+    function Populations.crossover(
+        spy::BinaryOnlySpy,
+        left::Program,
+        right::Program;
+        kwargs...,
+    )
+        spy.binary_calls[] += 1
+        return (left, right)
+    end
+
+    function age_state(crossover_op)
+        reg, data = age_test_fixture(population_size=1)
+        components = merge(reg.components, (; crossover_op))
+        checked = Regressor(reg.target_ty, components, reg.config, MersenneTwister(42))
+        return initialize_age_search(
+            checked,
+            data;
+            population_count=1,
+            population_size=1,
+            seed=72,
+        )
+    end
+    individual(program, id) = Regression.AgeSearchIndividual(
+        program, UInt64(id), (), :test, 0.0, 1, true, UInt64(id),
+    )
+
+    left_program = Program(AstTree(AbsNode(:left, IndexNode(0))))
+    right_program = Program(AstTree(AbsNode(:right, IndexNode(0))))
+    spy = RecombineSpy(NamedTuple[], false, 0)
+    state = age_state(spy)
+    left, right = individual(left_program, 1), individual(right_program, 2)
+
+    seed = 991
+    selected_left = rand(MersenneTwister(seed), Bool)
+    child = LambdaRegression.Regression._age_crossover(
+        state, left, right, MersenneTwister(seed),
+    )
+    @test child isa Program
+    @test length(spy.calls) == 1
+    call = only(spy.calls)
+    @test call.recipient === (selected_left ? left.program : right.program)
+    @test call.donor === (selected_left ? right.program : left.program)
+    @test call.recipient_target == state.reg.target_ty
+    @test call.donor_target == state.reg.target_ty
+    @test call.selection_roles == (selected_left ? (:left, :right) : (:right, :left))
+    @test spy.binary_calls == 0
+
+    empty!(spy.calls)
+    spy.fail = true
+    failed = LambdaRegression.Regression._age_crossover(
+        state, left, right, MersenneTwister(seed),
+    )
+    @test failed isa Err
+    @test length(spy.calls) == 1
+    @test spy.binary_calls == 0
+
+    binary_only = BinaryOnlySpy(Ref(0))
+    binary_state = age_state(binary_only)
+    interface_error = try
+        LambdaRegression.Regression._age_crossover(
+            binary_state,
+            left,
+            right,
+            MersenneTwister(seed),
+        )
+        nothing
+    catch error
+        error
+    end
+    @test interface_error isa ErrorException
+    @test occursin("BinaryOnlySpy", sprint(showerror, interface_error))
+    @test occursin("directional recombine required", sprint(showerror, interface_error))
+    @test binary_only.binary_calls[] == 0
+end
+
 @testitem "Age search chunked continuation preserves cursor and accounting" setup=[AgeSearchBaseImports] begin
     reg, data = age_test_fixture(population_size=2)
     candidate = Program(
@@ -861,6 +1139,189 @@ end
     @test whole.counters.advance_objective_calls <= 4
     @test [[r.birth for r in p] for p in whole.populations] ==
         [[r.birth for r in p] for p in chunked.populations]
+end
+
+@testitem "Age search policy hooks select parents, admit records, observe rejection, and rescore migrants" setup=[AgeSearchBaseImports] begin
+    Regression = LambdaRegression.Regression
+
+    mutable struct PolicySpy <: Regression.AbstractAgeSearchPolicy
+        replacement::Any
+        selector::Symbol
+        roles::Vector{Symbol}
+        observations::Vector{Any}
+    end
+    PolicySpy(replacement; selector=:valid) =
+        PolicySpy(replacement, selector, Symbol[], Any[])
+
+    function Regression.age_select_parent(
+        policy::PolicySpy, state, island, candidates, rng, tournament_size,
+        role::Symbol,
+    )
+        push!(policy.roles, role)
+        if policy.selector === :forged
+            chosen = first(candidates)
+            return Regression.AgeSearchIndividual(
+                chosen.program, chosen.id, chosen.parent_ids, chosen.origin,
+                -1.0e9, chosen.complexity, chosen.valid, chosen.birth,
+            )
+        end
+        return role === :parent ? last(candidates) : first(candidates)
+    end
+
+    Regression.age_replacement_index(policy::PolicySpy, state, record, island) =
+        policy.replacement
+    Regression.age_observe_candidate!(policy::PolicySpy, state, record, island, replaced, admitted) =
+        push!(policy.observations, (record, island, replaced, admitted))
+
+    function policy_state(; evaluate=nothing)
+        reg, data = age_test_fixture(evaluate=evaluate, population_size=2)
+        NodeASTs = LambdaRegression.ASTs.NodeASTs
+        components = merge(reg.components, (; complexity=tree ->
+            only(NodeASTs.children(tree.root)) isa ConstNode ? 10 : 1))
+        checked = Regression.Regressor(reg.target_ty, components, reg.config, MersenneTwister(555))
+        state = initialize_age_search(checked, data;
+            population_count=1, population_size=2, seed=502)
+        return state
+    end
+
+    candidate = Program(
+        AstTree(AbsNode(:z, ConstNode(:candidate)));
+        local_consts=Dict{Symbol,Any}(:candidate => 3.0),
+        local_consts_ty=Dict{Symbol,TyLike}(:candidate => FloatTy),
+    )
+
+    accepted_state = policy_state()
+    old_replacement = accepted_state.populations[1][2]
+    accepting = PolicySpy(2)
+    proposal = (state, island, left, right; rng) -> candidate
+    accepted = advance_age_search!(accepted_state;
+        max_attempts=1, max_evaluations=1, proposal, policy=accepting)
+    observed = only(accepting.observations)
+    @test accepting.roles == [:parent, :donor]
+    @test accepted.accepted == 1
+    @test observed[1].parent_ids == (UInt64(2), UInt64(1))
+    @test observed[1].loss == 0.0
+    @test observed[2] == 1
+    @test observed[3] === old_replacement
+    @test observed[4] === true
+    @test accepted_state.populations[1][2] === observed[1]
+    @test only(accepted_state.recent_valid_offspring) === observed[1]
+
+    rejected_state = policy_state()
+    rejecting = PolicySpy(nothing)
+    rejected = advance_age_search!(rejected_state;
+        max_attempts=1, max_evaluations=1, proposal, policy=rejecting)
+    rejected_record = only(rejecting.observations)[1]
+    @test rejected.accepted == 0
+    @test rejected.objective_calls == 1
+    @test rejected_state.counters.accepted == 0
+    @test isempty(rejected_state.recent_valid_offspring)
+    @test rejected_state.archive[10] === rejected_record
+    @test only(rejecting.observations)[3] === nothing
+    @test only(rejecting.observations)[4] === false
+    @test all(record -> record.id != rejected_record.id, rejected_state.populations[1])
+
+    evaluate_migrant = (ind, x, target_ty, components, config) ->
+        haskey(ind.local_consts, :bad) ? x + 2 : x
+    migrant_state = policy_state(evaluate=evaluate_migrant)
+    migrant = Program(
+        AstTree(AbsNode(:z, ConstNode(:bad)));
+        local_consts=Dict{Symbol,Any}(:bad => 1.0),
+        local_consts_ty=Dict{Symbol,TyLike}(:bad => FloatTy),
+    )
+    stale = Regression.AgeSearchIndividual(
+        migrant, UInt64(999), (UInt64(77),), :external,
+        -1.0e9, 999, true, UInt64(1),
+    )
+    migrant_policy = PolicySpy(nothing)
+    migration = inject_age_migrants!(migrant_state, [stale];
+        max_evaluations=1, max_migrants=1, policy=migrant_policy)
+    migrant_observation = only(migrant_policy.observations)
+    @test migration.attempts == 1
+    @test migration.accepted == 0
+    @test migration.objective_calls == 1
+    @test migration.sample_executions == 2
+    @test migrant_observation[1].id != stale.id
+    @test migrant_observation[1].origin === :migration
+    @test migrant_observation[1].loss == 4.0
+    @test migrant_observation[1].complexity == 10
+    @test migrant_observation[1].parent_ids == (UInt64(77),)
+    @test migrant_observation[3] === nothing
+    @test migrant_observation[4] === false
+    @test migrant_state.archive[10] === migrant_observation[1]
+    @test migrant_state.counters.migration_accepted == 0
+
+    forged_state = policy_state()
+    forged_selection = PolicySpy(1; selector=:forged)
+    @test_throws ArgumentError advance_age_search!(forged_state;
+        max_attempts=1, max_evaluations=1, proposal, policy=forged_selection)
+    @test forged_state.counters.advance_objective_calls == 0
+
+    forged_replacement_state = policy_state()
+    forged_replacement = PolicySpy(first(forged_replacement_state.populations[1]))
+    @test_throws ArgumentError advance_age_search!(forged_replacement_state;
+        max_attempts=1, max_evaluations=1, proposal, policy=forged_replacement)
+    @test all(record -> record.id != UInt64(3), forged_replacement_state.populations[1])
+end
+
+@testitem "Age search applies candidate admission once before scoring" setup=[AgeSearchBaseImports] begin
+    reg, data = age_test_fixture(population_size=1)
+    calls = Ref(0)
+    components = merge(reg.components, (;
+        candidate_admissibility=program -> begin
+            calls[] += 1
+            return nothing
+        end,
+    ))
+    checked = Regressor(reg.target_ty, components, reg.config, MersenneTwister(2000))
+    state = initialize_age_search(checked, data;
+        population_count=1, population_size=1, seed=18)
+    @test calls[] == 1
+
+    candidate = Program(
+        AstTree(AbsNode(:z, ConstNode(:k)));
+        local_consts=Dict{Symbol,Any}(:k => 1.0),
+        local_consts_ty=Dict{Symbol,TyLike}(:k => FloatTy),
+    )
+    proposal = (state, island, left, right; rng) -> candidate
+    report = advance_age_search!(state;
+        max_attempts=1, max_evaluations=1, proposal)
+    @test report.objective_calls == 1
+    @test calls[] == 2
+end
+
+@testitem "Age search certified mutation skips only the repeated type check" setup=[AgeSearchBaseImports] begin
+    @test LambdaRegression.Regression._mutation_result_typechecked(
+        LambdaRegression.Mutations.mutate_tree,
+    )
+    @test !LambdaRegression.Regression._mutation_result_typechecked((args...; kwargs...) -> nothing)
+    reg, data = age_test_fixture(population_size=1)
+    factory_calls = Ref(0)
+    original_factory = reg.components.tyfactory_ctor
+    components = merge(reg.components, (;
+        tyfactory_ctor=() -> begin
+            factory_calls[] += 1
+            return original_factory()
+        end,
+    ))
+    checked = Regressor(reg.target_ty, components, reg.config, MersenneTwister(1111))
+    state = initialize_age_search(checked, data;
+        population_count=1, population_size=1, seed=20)
+    factory_calls[] = 0
+    candidate = only(state.populations[1]).program
+    @test LambdaRegression.Regression._age_validate_candidate(
+        state, candidate, "certified"; type_checked=true,
+    ) === nothing
+    @test factory_calls[] == 0
+    @test LambdaRegression.Regression._age_validate_candidate(
+        state, candidate, "ordinary",
+    ) === nothing
+    @test factory_calls[] == 1
+
+    unresolved = Program(AstTree(AbsNode(:z, ConstNode(:missing))))
+    @test_throws ArgumentError LambdaRegression.Regression._age_validate_candidate(
+        state, unresolved, "bad"; type_checked=true,
+    )
 end
 
 @testitem "Age search borrows task and data and preserves caller resources and init seeds" setup=[AgeSearchBaseImports] begin

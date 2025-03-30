@@ -15,9 +15,32 @@ result = run_mixed_alternation!(state; rng=MersenneTwister(1), cycles=2,
 All four layer policies are supplied by the caller; this library module does
 not prescribe a task-specific profile.
 
+`run_continuous_search!` is the alternative serial action composition: bounded
+outer and local work publish material immediately, with an optional bounded
+`StructurePolicy` for family opportunities and survival. Action weights count
+actions rather than CPU share; local source selection includes an explicit
+exploration fraction over deduplicated archive/live/recent/representative material.
+Exact local-state resume and multicore execution remain active extensions.
+`StructurePolicy(world)` connects a stable `StructureDiversity.StructureWorld`
+directly; its scalar named-input policy must match the local scalar options.
+
+```julia
+world = StructureDiversity.StructureWorld(reg.components.global_consts_ty;
+    values=reg.components.global_consts, input_types=reg.components.input_types,
+    target_ty=reg.target_ty)
+result = run_continuous_search!(state; rng=MersenneTwister(1),
+    config=ContinuousSearchConfig(max_actions=16),
+    outer=outer_options, typed=typed_options, scalar=scalar_options,
+    policy=StructurePolicy(world))
+```
+
 The state retains the regressor and training data. Optional `on_observe` is
 synchronous and receives borrowed `(entry, state, selected, materials)`; the
 callback must not mutate or retain them. Copy only what an observer needs.
+Scalar scoring is synchronous as well: its temporary `Program` path-copies the
+edited ancestors and borrows untouched syntax read-only. The scalar scorer
+must not mutate or retain that candidate; returned materials are separately
+published as owned `Program`s.
 """
 module Workflows
 
@@ -28,6 +51,7 @@ using ..ASTs.NodeASTs: AstNode, children
 using ..Programs: Program
 using ..TypeSystem: Ty, TyLike
 using ..ScalarSearch: ScalarSearchConfig, scalar_complexity, search_multi_scalar
+using ..StructureDiversity: StructureWorld, StructureBoundaryPolicy, describe_structure
 import ..Regression
 using ..Regression: Regressor, SupervisedDataset, AgeSearchState,
     AgeSearchIndividual, AgeSearchMigration, prepare_task_evaluator,
@@ -36,6 +60,7 @@ using ..Regression: Regressor, SupervisedDataset, AgeSearchState,
     search_scalar_region
 
 export run_mixed_alternation!, ObjectiveCounts, score_candidate!
+export StructurePolicy, structure_snapshot, ContinuousSearchConfig, run_continuous_search!
 
 mutable struct ObjectiveCounts
     calls::Int
@@ -83,12 +108,14 @@ function _record_phase_snapshot!(ledger, entry, on_phase, on_observe,
     return nothing
 end
 
+"""Score one complete candidate; `copy_tree=false` is for synchronous read-only borrows."""
 function score_candidate!(counts::ObjectiveCounts, program::Program,
-                          reg::Regressor, data::SupervisedDataset)
+                          reg::Regressor, data::SupervisedDataset;
+                          copy_tree::Bool=true)
     counts.calls += 1
     loss_fn = get(reg.components, :loss, mse)
     prepared = prepare_task_evaluator(
-        program, reg.target_ty, reg.components, reg.config; copy_tree=true,
+        program, reg.target_ty, reg.components, reg.config; copy_tree,
     )
     result = score_samples(data, prepared, loss_fn;
         failure_mode=:return_error,
@@ -609,7 +636,8 @@ function run_mixed_alternation!(state::AgeSearchState;
                             push!(scalar_admitted_ids, UInt64(attempt.source_id))
                         push!(scalar_paths, path)
                         result = search_scalar_region(region,
-                            program -> score_candidate!(scalar_counts, program, reg, train);
+                            program -> score_candidate!(scalar_counts, program, reg, train;
+                                copy_tree=false);
                             config=scalar_search_config,
                             rng=MersenneTwister(rand(rng, UInt64)),
                             max_return=Int(scalar_cfg.max_return),
@@ -738,6 +766,8 @@ function run_mixed_alternation!(state::AgeSearchState;
         scalar_size_refusals,
     )
 end
+
+include("continuous.jl")
 
 @testitem "Mixed workflow outer-only run borrows initialized state" begin
     using Random: MersenneTwister

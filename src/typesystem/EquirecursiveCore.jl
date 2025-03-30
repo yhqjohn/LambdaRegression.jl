@@ -342,6 +342,11 @@ periods of the same contractive `μ` type. Open inference metas are rejected.
 """
 semantic_typekey(t::Ty) = _semantic_mu_graph_key(_mu_eq_graph(t))
 
+# These built-in leaves elaborate to exactly one constructor node. Evaluate
+# that graph's canonical encoding directly, not a different structural key.
+semantic_typekey(t::Union{TyConst,TyRigid,TyNat}) =
+    (:equirecursive, ((type_constructor_tag(t), type_static_parameters(t), ()),))
+
 # Query-local graph used by unification. Written μ binders elaborate to fixed
 # constructor back edges; only `_GRAPH_META` nodes may acquire links.
 const _GRAPH_META = UInt8(1)

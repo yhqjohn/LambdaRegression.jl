@@ -98,7 +98,6 @@ export AbstractCrossoverSelectionPolicy, UniformCrossoverSelectionPolicy
 export CrossoverSite, PathCrossoverSelectionPolicy
 export crossover_site_weight, crossover_pair_weight
 export TypedSubtreeSwapCrossover, CrossoverPairPoolExhaustedErr
-export IndependentCrossover
 export NoEligibleCrossoverPairErr
 export CrossoverAnswerBudgetExhaustedErr
 export DonorPool, DonorPoolConfig, DonorPoolOutcome, DonorPoolSelection
@@ -141,10 +140,12 @@ target program and `recipient_target` supplies its root requirement; `donor`
 supplies the fragment and `donor_target` its own root requirement. Concrete
 operators implement the semantics for the variation family they support.
 The existing [`crossover`](@ref) tuple interface remains independent of this
-directional seam.
+directional seam. This generic fallback does not impose a directional method
+on every `AbstractCrossover`; consumers requiring one direction surface an
+explicit interface error when an operator has not implemented it.
 """
 function recombine(
-    ::AbstractCrossover,
+    op::AbstractCrossover,
     ::Program,
     ::Program;
     recipient_target::Ty,
@@ -152,7 +153,7 @@ function recombine(
     rng::AbstractRNG=MersenneTwister(2000),
     kwargs...,
 )
-    error("recombine not implemented")
+    error("$(typeof(op)) has no directional recombine method; directional recombine required")
 end
 
 include("TypedCrossoverRetrieval.jl")

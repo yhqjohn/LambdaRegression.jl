@@ -696,7 +696,7 @@ function Mutations.apply(
         ))
         body = (replacement.root::FunctionDefNode).body
         body == site.node.body && return Err(Mutations.NoEligibleSiteErr())
-        site.node.body = deepcopy(body)
+        site.node.body = body
         return tree
     end
 

@@ -185,6 +185,97 @@ end
     @test iscompatible(LambdaRegression.TypeSystem.infer_term(result, type_context), target)
 end
 
+@testitem "FunctionDef recursive-body publication owns its replacement tree" begin
+    using Test
+    using Random
+    using LambdaRegression
+    using LambdaRegression.ASTs.NodeASTs:
+        AstTree, AbsNode, AppNode, ConstNode, FunctionDefNode, IndexNode
+    using LambdaRegression.TypeSystem: FloatTy, IntTy, TyFun, TyLike
+    using LambdaRegression.Mutations: IndexedProvider, WeightedPairChooser, mutate_tree
+    using LambdaRegression.Utils: Err
+
+    Mutations = LambdaRegression.Mutations
+    CG = LambdaRegression.CanonicalGeneration
+    target = TyFun(FloatTy, FloatTy)
+
+    mutable struct RetainedRecursiveGenerator
+        result::Any
+        invalid_argument::Bool
+    end
+    function (generator::RetainedRecursiveGenerator)(
+        mode,
+        target_ty,
+        scope,
+        env,
+        ctx,
+        provider,
+        generation_kwargs,
+    )
+        argument = generator.invalid_argument ? ConstNode(:BAD) : IndexNode(0)
+        body = AbsNode(:x, AppNode(IndexNode(1), argument))
+        result = CG.GenerationResult(
+            AstTree(FunctionDefNode(body)),
+            target_ty,
+            Dict{Symbol,Any}(),
+            Dict{Symbol,TyLike}(),
+            Dict{Symbol,Any}(),
+        )
+        generator.result = result
+        return result
+    end
+
+    chooser = WeightedPairChooser(
+        weights=Dict{Type,Float64}(Mutations.FunctionDefMutation => 1.0),
+        cache_eligibility=true,
+    )
+    source = AstTree(FunctionDefNode(AbsNode(:x, IndexNode(0))))
+    source_before = deepcopy(source)
+    generator = RetainedRecursiveGenerator(nothing, false)
+    mutation = Mutations.FunctionDefMutation(
+        :recursive_body;
+        replacement_generator=generator,
+    )
+    published = mutate_tree(
+        source,
+        target;
+        rng=MersenneTwister(42),
+        mutations=[mutation],
+        chooser,
+        provider=IndexedProvider(),
+        max_try=1,
+    )
+
+    @test published isa AstTree
+    @test generator.result isa CG.GenerationResult
+    published_before = deepcopy(published)
+    generator.result.tree.root.body = ConstNode(:MUTATED)
+    @test published == published_before
+    @test source == source_before
+
+    failing_generator = RetainedRecursiveGenerator(nothing, true)
+    failing_mutation = Mutations.FunctionDefMutation(
+        :recursive_body;
+        replacement_generator=failing_generator,
+    )
+    failed = mutate_tree(
+        source,
+        target;
+        rng=MersenneTwister(555),
+        mutations=[failing_mutation],
+        chooser,
+        provider=IndexedProvider(),
+        max_try=1,
+        global_consts=Dict{Symbol,Any}(:BAD => 1),
+        global_consts_ty=Dict{Symbol,TyLike}(:BAD => IntTy),
+    )
+    @test failed isa Err
+    @test failing_generator.result isa CG.GenerationResult
+    @test failing_generator.result.tree ==
+        AstTree(FunctionDefNode(AbsNode(:x, AppNode(IndexNode(1), ConstNode(:BAD)))))
+    @test source == source_before
+end
+
 @testitem "FunctionDef recursive admissibility distinguishes calls from passed self values" begin
     using Test
     using LambdaRegression

@@ -1,23 +1,26 @@
-# Program-guided specialised search
+# Program-guided search
 
-LambdaRegression keeps the ordinary lambda and function-definition AST as the
-authoritative program. It owns source semantics, lexical sharing,
-serialization, and written complexity. Search and execution use derived views
-that are checked against explicit contexts.
+The ordinary lambda and function-definition AST is authoritative: it defines
+source semantics, lexical sharing, inspection, serialization, and written
+complexity. Scalar search, frozen typed search, and execution plans are derived
+views with explicit validity conditions.
 
-The architecture separates general typed program search, scalar search for
-dense real-valued regions, frozen occurrence-typed search, and execution
-preparation with a general fallback. A specialised candidate becomes a
-program candidate only after source reconstruction, type checking, capture
-avoidance, and contextual scoring.
+The system combines dense scalar regions, frozen occurrence-typed variation,
+predefined collection structure, and general typed program search. A
+specialised candidate is materialised into the ordinary AST, checked for
+typing and capture, and scored in its enclosing task. General search can then
+create new structure and later expose eligible regions again.
 
-Program analysis supplies occurrence identities, binding and dependency facts,
-typing evidence, and validity inputs. Consumers build their own projections;
-scalar regions, frozen occurrences, and executable regions need not share a
-physical graph or have a one-to-one relationship.
+The alternating coordinator keeps complete programs as scored and inherited
+individuals. It grants bounded local refinement opportunities, publishes
+returned material through ordinary program checks, and continues with general
+program variation. Population replacement, archives, donor transfer, and
+scheduling are policies around these contracts.
 
-The repeated coordinator keeps complete programs as scored and inherited
-individuals, gives bounded refinement opportunities to specialised views, and
-publishes returned material through ordinary program checks. General phases can
-introduce structure that local phases cannot express. Population replacement,
-archives, donor transfer, and scheduling remain replaceable policies.
+The continuous workflow composes bounded complete-program, typed, and scalar
+actions over one stable task. Each local action restarts its bounded backend
+state, publishes material immediately, validates it in the enclosing task, and
+re-scores accepted migrants before they re-enter the complete-program
+population. A structure policy manages family opportunities, representatives,
+and survival while keeping scores and development costs separate. Action,
+time, attempt, and migration limits remain explicit.

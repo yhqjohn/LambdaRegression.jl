@@ -11,6 +11,16 @@ struct _SnapshotOpenAnswer
     residual::_ScopedResidual
 end
 
+struct _SnapshotPathOrderKey
+    path::Vector{Int}
+end
+
+struct _SnapshotBinderOrderKey
+    kind::String
+    owner_path::Vector{Int}
+    ordinal::Int
+end
+
 struct _SnapshotOpenRetrievalBatch
     answers::Vector{_SnapshotOpenAnswer}
     status::Symbol
@@ -28,7 +38,48 @@ Base.showerror(io::IO, ::_SnapshotUnclassifiedSiteErr) =
     print(io, "snapshot open retrieval cannot classify one target site variable")
 
 Base.:(==)(left::_SnapshotOpenAnswer, right::_SnapshotOpenAnswer) =
-    left.site == right.site && left.h == right.h && left.residual == right.residual
+    _snapshot_paths_equal(left.site, right.site) &&
+    left.h == right.h && left.residual == right.residual
+
+function _snapshot_lexical_path_less(left::Vector{Int}, right::Vector{Int})
+    common_length = min(length(left), length(right))
+    @inbounds for index in 1:common_length
+        left_edge = left[index]
+        right_edge = right[index]
+        left_edge < right_edge && return true
+        left_edge > right_edge && return false
+    end
+    return length(left) < length(right)
+end
+
+Base.isless(left::_SnapshotPathOrderKey, right::_SnapshotPathOrderKey) =
+    _snapshot_lexical_path_less(left.path, right.path)
+
+function Base.isless(left::_SnapshotBinderOrderKey, right::_SnapshotBinderOrderKey)
+    isless(left.kind, right.kind) && return true
+    isless(right.kind, left.kind) && return false
+    _snapshot_lexical_path_less(left.owner_path, right.owner_path) && return true
+    _snapshot_lexical_path_less(right.owner_path, left.owner_path) && return false
+    return left.ordinal < right.ordinal
+end
+
+Base.@noinline function _snapshot_path_vector(path)
+    Base.@nospecialize path
+    result = Int[]
+    for edge in path
+        push!(result, Int(edge))
+    end
+    return result
+end
+
+Base.@noinline function _snapshot_paths_equal(left, right)::Bool
+    Base.@nospecialize left right
+    length(left) == length(right) || return false
+    for index in 1:length(left)
+        left[index] == right[index] || return false
+    end
+    return true
+end
 
 _snapshot_body(ty::Ty) = ty
 _snapshot_body(scheme::TyScheme) = scheme.ty
@@ -162,18 +213,32 @@ function _snapshot_numbered_keys(
     return result
 end
 
-function _snapshot_binder_key(binder)
+Base.@noinline function _snapshot_binder_key(binder)
+    Base.@nospecialize binder
     all(name -> hasproperty(binder, name), (:kind, :owner_path, :ordinal)) ||
         throw(ArgumentError("snapshot binder lacks stable lexical identity fields"))
-    return (
+    return _SnapshotBinderOrderKey(
         String(getproperty(binder, :kind)),
-        Tuple(getproperty(binder, :owner_path)),
+        _snapshot_path_vector(getproperty(binder, :owner_path)),
         Int(getproperty(binder, :ordinal)),
     )
 end
 
-_snapshot_occurrence_key(occurrence) = Tuple(getproperty(occurrence, :path))
+Base.@noinline function _snapshot_occurrence_key(occurrence)
+    Base.@nospecialize occurrence
+    return _SnapshotPathOrderKey(
+        _snapshot_path_vector(getproperty(occurrence, :path)),
+    )
+end
+
 _snapshot_site_key(site) = Tuple(getproperty(site, :path))
+
+Base.@noinline function _snapshot_site_order_key(site)
+    Base.@nospecialize site
+    return _SnapshotPathOrderKey(
+        _snapshot_path_vector(getproperty(site, :path)),
+    )
+end
 
 function _snapshot_target_site(site, site_id::Int)
     entries = sort!(collect(pairs(getproperty(site, :binder_schemes)));
@@ -354,10 +419,17 @@ function _snapshot_open_retrieval_bounded(
     ))
     target_sites = _snapshot_site_list(target_input)
     if length(target_sites) > 1
-        sort!(target_sites; by=_snapshot_site_key)
-        paths = [_snapshot_site_key(site) for site in target_sites]
-        length(paths) == length(unique(paths)) ||
-            throw(ArgumentError("duplicate target site path"))
+        order_keys = _SnapshotPathOrderKey[
+            _snapshot_site_order_key(site) for site in target_sites
+        ]
+        order = sortperm(order_keys)
+        for index in 2:length(order)
+            previous = order_keys[order[index - 1]]
+            current = order_keys[order[index]]
+            isless(previous, current) ||
+                throw(ArgumentError("duplicate target site path"))
+        end
+        target_sites = target_sites[order]
     end
 
     donor, group_trace = _snapshot_donor_signature(donor_site)
@@ -437,6 +509,68 @@ end
         only(keys(site.external_occurrences)),
         only(keys(site.binder_schemes)),
     )
+end
+
+@testitem "snapshot open retrieval keeps lexical order across runtime path lengths" begin
+    using Test
+    using LambdaRegression.Mutations.Populations:
+        _snapshot_binder_key, _snapshot_occurrence_key,
+        _snapshot_open_retrieval, _snapshot_paths_equal
+    using LambdaRegression.TypeSystem: IntTy, TyLike
+
+    populations = LambdaRegression.Mutations.Populations
+    donor = (
+        demand=IntTy,
+        offer=IntTy,
+        external_occurrences=Dict{Any,Vector{Any}}(),
+        binder_schemes=Dict{Any,TyLike}(),
+    )
+    target(path) = (
+        path=path,
+        demand=IntTy,
+        offer=IntTy,
+        binder_schemes=Dict{Any,TyLike}(),
+    )
+    targets = Any[
+        target((2,)),
+        target((1, 2)),
+        target((1, 1, 1)),
+        target((1,)),
+        target((1, 1)),
+    ]
+
+    answers = _snapshot_open_retrieval(donor, targets)
+    @test [answer.site for answer in answers] == [
+        (1,), (1, 1), (1, 1, 1), (1, 2), (2,),
+    ]
+    @test _snapshot_paths_equal((1,), (1,))
+    @test !_snapshot_paths_equal((1,), (1, 1))
+    @test_throws ArgumentError _snapshot_open_retrieval(
+        donor,
+        Any[target((1, 2)), target((1, 2))],
+    )
+
+    binder_keys = populations._SnapshotBinderOrderKey[
+        _snapshot_binder_key((kind=:abs, owner_path=(1, 2), ordinal=2)),
+        _snapshot_binder_key((kind=:abs, owner_path=(1, 2), ordinal=1)),
+        _snapshot_binder_key((kind=:abs, owner_path=(1,), ordinal=1)),
+        _snapshot_binder_key((kind=:function_def, owner_path=(), ordinal=1)),
+    ]
+    sort!(binder_keys)
+    @test [(key.kind, key.owner_path, key.ordinal) for key in binder_keys] == [
+        ("abs", [1], 1),
+        ("abs", [1, 2], 1),
+        ("abs", [1, 2], 2),
+        ("function_def", Int[], 1),
+    ]
+
+    occurrence_keys = populations._SnapshotPathOrderKey[
+        _snapshot_occurrence_key((; path=(1, 2))),
+        _snapshot_occurrence_key((; path=(1,))),
+        _snapshot_occurrence_key((; path=(1, 1))),
+    ]
+    sort!(occurrence_keys)
+    @test [key.path for key in occurrence_keys] == [[1], [1, 1], [1, 2]]
 end
 
 @testitem "snapshot open retrieval bounds answers and remaps role predicate" begin
