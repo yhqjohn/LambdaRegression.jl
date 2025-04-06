@@ -24,7 +24,9 @@ Finite, conservative metadata about how a call may depend on its inputs.
 Argument positions are one-based.
 `value_inputs` marks argument values that may affect returned values;
 `shape_inputs` marks argument shapes or lengths that may affect returned values
-or result shape. `callback_inputs` marks positions whose callable values may be
+or result shape. Shape relations are coarse and do not distinguish logical array
+layers; a nested-shape dependency need not affect an outer-length observer.
+`callback_inputs` marks positions whose callable values may be
 invoked. `callback_result_values` and `callback_result_shapes` separately mark
 whether callback results may affect result values or result shape. These are
 all may-relations: the summary cannot express
@@ -323,7 +325,8 @@ const _BUILTIN_DEPENDENCY_RULES = (
         value_inputs=(1, 2), shape_inputs=(2,), callback_inputs=(1,),
         callback_result_values=(1,), callback_result_shapes=(1,), assumptions=(
             :maps_outer_logical_layer,
-            :callback_result_may_affect_values_and_dense_output_shape,
+            :preserves_outer_logical_length,
+            :callback_result_may_affect_values_and_nested_shapes,
             :callback_may_be_invoked_zero_or_more_times));
         argument_types=(_FUNCTION_DEPENDENCY_PATTERN, _ARRAY_DEPENDENCY_PATTERN)),
     PrimitiveDependencyRule(AFOLDL, DependencySummary(3;
@@ -335,8 +338,8 @@ const _BUILTIN_DEPENDENCY_RULES = (
             _ARRAY_DEPENDENCY_PATTERN)),
     PrimitiveDependencyRule(LENF, DependencySummary(1;
         shape_inputs=(1,), assumptions=(
-            :array_length_affects_numeric_result,
-            :input_elements_do_not_affect_length));
+            :outer_logical_length_affects_numeric_result,
+            :input_elements_and_inner_shapes_do_not_affect_length));
         argument_types=(_ARRAY_DEPENDENCY_PATTERN,)),
     (PrimitiveDependencyRule(primitive, DependencySummary(1;
         value_inputs=(1,), assumptions=(:scalar_value_operation,));
@@ -411,8 +414,11 @@ using TestItems
     @test !map_summary.unknown
     @test map_summary.callback_inputs == (1,)
     @test map_summary.callback_result_values == (1,)
-    @test map_summary.callback_result_shapes == (1,) # dense high-rank callback results can change shape
+    @test map_summary.callback_result_shapes == (1,) # inner shapes, not outer length
+    @test :preserves_outer_logical_length in map_summary.assumptions
     @test length_summary.shape_inputs == (1,)
+    @test isempty(length_summary.value_inputs)
+    @test :input_elements_and_inner_shapes_do_not_affect_length in length_summary.assumptions
     @test query_dependency(builtins, LENF, [IntTy]).unknown
     fold_type = TyFun(FloatTy, TyFun(FloatTy, FloatTy))
     @test !query_dependency(builtins, AFOLDL, [fold_type, FloatTy, array_type]).unknown

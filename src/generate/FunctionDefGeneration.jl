@@ -678,6 +678,8 @@ node balance is charged. One argument root excludes its original leading
 parameter; other child facts keep their true cheaper costs. Certified minima
 reserve the entire packet, while ordinary child sampling explores proven steps
 within each leased budget; the minimum certificate is not forced as output.
+The scoped head's node charge equals its applied arity, matching canonical
+derivation cost.
 The old joint obligation route remains selectable outside this finite core.
 This is deliberately not a negative result for queries with additional use or
 call obligations, custom argument policies, or mixed-only children.
@@ -711,16 +713,17 @@ function _sample_preplanned_functiondef_call!(state::CG.DerivationSamplingState,
     chosen = pool[CG._weighted_option_index(state.rng, pool, total)]
     rule, self = chosen.rule, chosen.self
     isempty(rule.argument_tys) && return nothing # progress needs a changed argument
+    head_cost = length(rule.argument_tys)
     changed = rand(state.rng, eachindex(rule.argument_tys))
     available = min(state.nodes_left, query.node_budget)
-    available > 1 || return nothing
+    available > head_cost || return nothing
     child_depth = query.depth_left - 1
     # Prepare every child before construction, so their proven minimum costs
     # reserve a complete packet. A certificate is a completion guarantee, not
     # the ordinary exploration distribution of its descendants.
     children = Any[]
     lower_bounds = Int[]
-    max_child_budget = available - length(rule.argument_tys)
+    max_child_budget = available - head_cost
     max_child_budget >= 1 || return nothing
     for i in eachindex(rule.argument_tys)
         if i == changed
@@ -742,15 +745,15 @@ function _sample_preplanned_functiondef_call!(state::CG.DerivationSamplingState,
             push!(lower_bounds, child_cost)
         end
     end
-    1 + sum(lower_bounds) <= available || return nothing
-    changed_budget = available - 1 - sum(lower_bounds) + lower_bounds[changed]
+    head_cost + sum(lower_bounds) <= available || return nothing
+    changed_budget = available - head_cost - sum(lower_bounds) + lower_bounds[changed]
     selection_state = CG.DerivationSamplingState(state.rng, changed_budget,
         state.completion)
     selected = CG._select_finite_core_nonbare_root(selection_state, children[changed])
     selected === nothing && return nothing
     lower_bounds[changed] = selected.cost
     args = CG.CoreDerivation[]
-    cost = 1
+    cost = head_cost
     for (i, prepared) in enumerate(children)
         reserved = sum(lower_bounds[j] for j in (i + 1):length(children); init=0)
         child_budget = available - cost - reserved

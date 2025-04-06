@@ -2193,6 +2193,14 @@ end
 Symbol-keyed nonnegative weights for canonical generation. Zero disables that
 bucket during derivation and sampling without changing the catalog. Unknown
 bucket keys use `default`.
+
+`root_constant` is a sampling-only multiplier (default `1`, independent of
+`default`) for direct non-function constant leaves and zero-argument factories
+at the request root, continuing through leading lambdas. Operator arguments
+and all other descendants retain their ordinary weights. This is not a test of
+semantic input dependence. Non-neutral values require the bounded default
+weighted sampler and planner; certificate completion and custom samplers are
+not covered. A scoped caller must enable it only for the intended output root.
 """
 struct GenerationWeights
     default::Float64
@@ -5917,6 +5925,12 @@ end
     _sample_derivation(rng, sample_set)
 
 function _uses_lazy_sampling(config::GenerationConfig)
+    if get(config.weights.overrides, :root_constant, 1.0) != 1.0
+        config.sampler isa WeightedDerivationSampler &&
+            config.sampler.completion_probability == 0 &&
+            config.argument_planner isa DefaultArgumentPlanner ||
+            throw(ArgumentError("root_constant requires bounded WeightedDerivationSampler and DefaultArgumentPlanner"))
+    end
     config.sampler isa WeightedDerivationSampler || return false
     if !(config.argument_planner isa DefaultArgumentPlanner)
         config.sampler.completion_probability > 0 &&
@@ -5935,6 +5949,7 @@ function _sample_root_generation_derivation(
     guarded_left::Int,
     allow_safe_list_access::Bool=true,
 )
+    root_constant_weight = get(relation.weights.overrides, :root_constant, 1.0)
     if state.completion.probability == 0 &&
        isempty(relation.capability_mask) && isempty(relation.generation_providers)
         return _sample_generation_derivation(
@@ -5944,7 +5959,8 @@ function _sample_root_generation_derivation(
             scope_tys,
             depth_left,
             guarded_left,
-            allow_safe_list_access,
+            allow_safe_list_access;
+            root_constant_weight,
         )
     end
     query = GenerationQuery(
@@ -5975,7 +5991,8 @@ function _sample_root_generation_derivation(
         relation,
         query,
         scope_tys,
-        allow_safe_list_access,
+        allow_safe_list_access;
+        root_constant_weight,
     )
 end
 
@@ -5996,7 +6013,8 @@ function _sample_generation_derivation(
     scope_tys::Vector{Ty},
     depth_left::Int,
     guarded_left::Int,
-    allow_safe_list_access::Bool=true,
+    allow_safe_list_access::Bool=true;
+    root_constant_weight::Float64=1.0,
 )
     _in_closed_fragment(target_ty) || return nothing
     options = copy(_sampling_options(
@@ -6020,7 +6038,8 @@ function _sample_generation_derivation(
         scope_tys,
         depth_left,
         guarded_left,
-        allow_safe_list_access,
+        allow_safe_list_access;
+        root_constant_weight,
     )
 end
 
@@ -6028,14 +6047,16 @@ function _sample_generation_derivation(
     state::DerivationSamplingState,
     relation::CoreRelation,
     query::GenerationQuery,
-    allow_safe_list_access::Bool=true,
+    allow_safe_list_access::Bool=true;
+    root_constant_weight::Float64=1.0,
 )
     return _sample_generation_derivation(
         state,
         relation,
         query,
         _scope_type_vector(query.scope_tys),
-        allow_safe_list_access,
+        allow_safe_list_access;
+        root_constant_weight,
     )
 end
 
@@ -6044,7 +6065,8 @@ function _sample_generation_derivation(
     relation::CoreRelation,
     query::GenerationQuery,
     scope_tys::Vector{Ty},
-    allow_safe_list_access::Bool,
+    allow_safe_list_access::Bool;
+    root_constant_weight::Float64=1.0,
 )
     query_relation, effective = _relation_for_query(relation, query)
     if _generation_extensions_exhausted(query_relation, effective)
@@ -6055,7 +6077,8 @@ function _sample_generation_derivation(
             scope_tys,
             effective.depth_left,
             effective.guarded_left,
-            allow_safe_list_access,
+            allow_safe_list_access;
+            root_constant_weight,
         )
     end
     core_query = _in_closed_fragment(query.target_ty) &&
@@ -6104,7 +6127,8 @@ function _sample_generation_derivation(
         depth_left,
         guarded_left,
         allow_safe_list_access,
-        effective,
+        effective;
+        root_constant_weight,
     )
 end
 
@@ -6310,6 +6334,26 @@ function _scope_application_option_weight(relation::CoreRelation, rule::ScopeApp
     return _scope_application_weight(relation.weights)
 end
 
+function _root_constant_option(option)
+    if option.kind === :constant
+        return option.value.head.source !== :preset &&
+            !(TypeSystem.prune(option.value.head.type) isa TyFun)
+    elseif option.kind === :productive_head
+        rule = option.value
+        return isempty(rule.argument_tys) &&
+            !(TypeSystem.prune(rule.result_ty) isa TyFun)
+    end
+    return false
+end
+
+# Return fresh options only when requested; never mutate the relation's cached
+# menu or affect the weights subsequently read for arguments/subexpressions.
+function _root_weighted_options(options, factor::Float64)
+    factor == 1.0 && return options
+    return NamedTuple[_root_constant_option(option) ?
+        merge(option, (; weight=option.weight * factor)) : option for option in options]
+end
+
 function _sample_from_options(
     state::DerivationSamplingState,
     relation::CoreRelation,
@@ -6318,9 +6362,10 @@ function _sample_from_options(
     depth_left::Int,
     guarded_left::Int,
     allow_safe_list_access::Bool=true,
-    generation_query::Union{Nothing,GenerationQuery}=nothing,
+    generation_query::Union{Nothing,GenerationQuery}=nothing;
+    root_constant_weight::Float64=1.0,
 )
-    pool, total_weight = _positive_option_pool(options)
+    pool, total_weight = _positive_option_pool(_root_weighted_options(options, root_constant_weight))
     while !isempty(pool) && total_weight > 0
         chosen = _weighted_option_index(state.rng, pool, total_weight)
         option = pool[chosen]
@@ -6333,7 +6378,8 @@ function _sample_from_options(
             depth_left,
             guarded_left,
             allow_safe_list_access,
-            generation_query,
+            generation_query;
+            root_constant_weight,
         )
         derivation !== nothing && return derivation
         state.nodes_left = saved_nodes
@@ -6379,7 +6425,8 @@ function _sample_option(
     depth_left::Int,
     guarded_left::Int,
     allow_safe_list_access::Bool=true,
-    generation_query::Union{Nothing,GenerationQuery}=nothing,
+    generation_query::Union{Nothing,GenerationQuery}=nothing;
+    root_constant_weight::Float64=1.0,
 )
     if generation_query !== nothing &&
        option.kind != :lambda_known && option.kind != :lambda_generation
@@ -6395,15 +6442,15 @@ function _sample_option(
         body_scope = Ty[target_ty.arg; scope_tys]
         body = if option.kind == :lambda_generation
             if generation_query === nothing
-                _sample_nested_generation_derivation(state, relation,
+                _sample_generation_derivation(state, relation,
                     target_ty.res, body_scope, depth_left - 1, guarded_left,
-                    allow_safe_list_access, nothing)
+                    allow_safe_list_access; root_constant_weight)
             else
                 body_query = _nested_generation_query(state, generation_query,
                     target_ty.res, body_scope, depth_left - 1, guarded_left)
                 body_query = _advance_functiondef_prefix(body_query)
                 _sample_generation_derivation(state, relation, body_query,
-                    body_scope, allow_safe_list_access)
+                    body_scope, allow_safe_list_access; root_constant_weight)
             end
         else
             _sample_known_derivation(state, relation, target_ty.res, body_scope,
@@ -7180,6 +7227,108 @@ include("GenerationObligations.jl")
     @test LambdaRegression.GenerationWeights isa DataType
     @test LambdaRegression.GenerationConfig() isa LambdaRegression.GenerationConfig
     @test LambdaRegression.GenerationResult isa DataType
+end
+
+@testitem "CanonicalGeneration root constant weights preserve child construction" begin
+    using Random: MersenneTwister
+    using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, ConstNode, IndexNode
+    using LambdaRegression.TypeSystem: FloatTy, Ty, TyFun, TyMu, TyVar, TyLike
+    using LambdaRegression.Utils: Err
+    CG = LambdaRegression.CanonicalGeneration
+    providers = (CG.ContextHeadProvider(),)
+    constants = Dict{Symbol,Any}(:c => 2.0, :f => sin)
+    types = Dict{Symbol,TyLike}(:c => FloatTy, :f => TyFun(FloatTy, FloatTy))
+    weights = CG.GenerationWeights(root_constant=0)
+
+    # The only permitted outer route is f(...), whose constant argument must
+    # remain constructible even though direct root constants have zero weight.
+    result = CG.generate_canonical(FloatTy; rng=MersenneTwister(1234), providers,
+        global_consts=constants, global_consts_ty=types, weights,
+        sampling_depth_limit=1, sampling_node_budget=3, guarded_expansion_depth=0)
+    @test result isa CG.GenerationResult
+    @test result.tree.root == AppNode(ConstNode(:f), ConstNode(:c))
+
+    # Leading lambda binders are transparent to the output-root preference.
+    identity_result = CG.generate_canonical(TyFun(FloatTy, FloatTy);
+        rng=MersenneTwister(8000), providers,
+        global_consts=Dict{Symbol,Any}(:c => 2.0),
+        global_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy), weights,
+        sampling_depth_limit=1, sampling_node_budget=2)
+    @test identity_result isa CG.GenerationResult
+    @test identity_result.tree.root isa AbsNode
+    @test identity_result.tree.root.body == IndexNode(0)
+
+    # A function value can consume its caller's input; it is not a scalar
+    # constant output. Nor does this finite sampler add recursive-type support.
+    function_result = CG.generate_canonical(TyFun(FloatTy, FloatTy);
+        rng=MersenneTwister(42), providers, global_consts=constants,
+        global_consts_ty=types, weights, sampling_depth_limit=0)
+    @test function_result isa CG.GenerationResult
+    @test function_result.tree.root == ConstNode(:f)
+    recursive_var = TyVar(19201, 0, nothing)
+    @test CG.generate_canonical(TyMu(recursive_var, TyFun(FloatTy, recursive_var));
+        providers, weights) isa Err
+
+    # Root-only weights never mutate cached menus or global child weights.
+    relation = CG.CoreRelation(; providers, global_consts=constants,
+        global_consts_ty=types, weights)
+    options = CG._sampling_options(relation, FloatTy, Ty[], 1;
+        allow_head_application=true, lambda_kind=:lambda_generation)
+    adjusted = CG._root_weighted_options(options, 0.1)
+    constant_index = findfirst(option -> option.kind === :constant, options)
+    head_index = findfirst(option -> option.kind === :productive_head, options)
+    @test adjusted[constant_index].weight == 0.1 * options[constant_index].weight
+    @test adjusted[head_index].weight == options[head_index].weight
+    @test options[constant_index].weight == 1
+    @test CG._root_weighted_options(options, 1.0) === options
+    preset_relation = CG.CoreRelation(; providers,
+        presets=Dict{Symbol,Any}(:preset => 2.0),
+        preset_types=Dict{Symbol,TyLike}(:preset => FloatTy))
+    preset_options = CG._sampling_options(preset_relation, FloatTy, Ty[], 0;
+        allow_head_application=true, lambda_kind=:lambda_generation)
+    @test !isempty(preset_options)
+    @test all(option -> !CG._root_constant_option(option), preset_options)
+
+    factories = (CG.TypedValueFactoryProvider(
+        LambdaRegression.ValueFactories.FloatScalarFactory()),)
+    factory_relation = CG.CoreRelation(; providers=factories)
+    factory_options = CG._sampling_options(factory_relation, FloatTy, Ty[], 1;
+        allow_head_application=true, lambda_kind=:lambda_generation)
+    @test !isempty(factory_options)
+    @test all(CG._root_constant_option, factory_options)
+    @test all(option -> option.weight == 0.1,
+        CG._root_weighted_options(factory_options, 0.1))
+end
+
+@testitem "CanonicalGeneration neutral root weight preserves randomness and rejects unsupported policies" begin
+    using Random: MersenneTwister, rand
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
+    CG = LambdaRegression.CanonicalGeneration
+    providers = (CG.ContextHeadProvider(),)
+    constants = Dict{Symbol,Any}(:c => 2.0, :f => sin)
+    types = Dict{Symbol,TyLike}(:c => FloatTy, :f => TyFun(FloatTy, FloatTy))
+    for seed in 1:4
+        left_rng, right_rng = MersenneTwister(seed), MersenneTwister(seed)
+        left = CG.generate_canonical(FloatTy; rng=left_rng, providers,
+            global_consts=constants, global_consts_ty=types,
+            sampling_depth_limit=2, sampling_node_budget=5)
+        right = CG.generate_canonical(FloatTy; rng=right_rng, providers,
+            global_consts=constants, global_consts_ty=types,
+            weights=CG.GenerationWeights(root_constant=1),
+            sampling_depth_limit=2, sampling_node_budget=5)
+        @test left.tree.root == right.tree.root
+        @test rand(left_rng) == rand(right_rng)
+    end
+    @test_throws ArgumentError CG.generate_canonical(FloatTy;
+        global_consts=constants, global_consts_ty=types,
+        config=CG.GenerationConfig(; providers,
+            weights=CG.GenerationWeights(root_constant=0.1),
+            sampler=CG.WeightedDerivationSampler(completion_probability=0.1)))
+    @test_throws ArgumentError CG.generate_canonical(FloatTy;
+        global_consts=constants, global_consts_ty=types,
+        config=CG.GenerationConfig(; providers,
+            weights=CG.GenerationWeights(root_constant=0.1),
+            sampler=(rng, sample_set) -> nothing))
 end
 
 @testitem "CanonicalGeneration scoped generation can use binder variables" begin

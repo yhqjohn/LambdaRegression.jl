@@ -152,8 +152,10 @@ function _node_regularized_report(population, archive, best, evaluations,
         mutation_attempts, crossover_attempts, composition_attempts,
         changed_variations, mutation_kind_counts, accepted_offspring,
         rejected_offspring, skipped_variations, oldest_replacements,
-        hof_migrations, annealing, use_frequency, frequency_window)
-    best_expr = _simplify_scalar(_node_to_scalar(best).expr)
+        hof_migrations, annealing, use_frequency, frequency_window,
+        cycle_refinement_calls, offspring_refinement_calls,
+        total_evaluation_budget, remaining_total_evaluations)
+    best_expr = _node_to_scalar(best).expr
     population_candidates = [_node_to_scalar(member.candidate) for member in population]
     report_candidates = copy(population_candidates)
     push!(report_candidates, _ScalarCandidate(best_expr, best.loss, 0, true))
@@ -206,6 +208,12 @@ function _node_regularized_report(population, archive, best, evaluations,
         annealing,
         use_frequency,
         frequency_window,
+        constant_refinement_calls=
+            cycle_refinement_calls + offspring_refinement_calls,
+        cycle_refinement_calls,
+        offspring_refinement_calls,
+        total_evaluation_budget,
+        remaining_total_evaluations,
         final_population_size=length(population),
         final_unique_structures=length(structures),
         final_complexity_histogram,
@@ -241,6 +249,33 @@ end
     using Test
     using Random
     using LambdaRegression.ScalarSearch
+end
+
+@testitem "scalar reports retain scored trees under floating-point cancellation" setup=[NodeRegularizedSearchImports] begin
+    input = scalar_input(1)
+    original = scalar_binary(:-, input,
+        scalar_binary(:+, scalar_constant(1.0), input))
+    for strategy in (:regularized, :generational), x in (1.0e16, 2.0)
+        X = reshape([x], 1, 1)
+        y = [0.0]
+        config = ScalarSearchConfig(population_size=2, max_evaluations=2,
+            max_complexity=5, initial_depth=0, tournament_size=1, elite_count=1,
+            unary_operators=(), binary_operators=(:+, :-), initial_pool_multiplier=1,
+            constant_refinement_iterations=0, max_constant_refinement_evaluations=0,
+            parsimony_coefficient=0.0, evolution_strategy=strategy)
+        result = search_scalar(X, y; config, rng=MersenneTwister(1234),
+            initial_population=[deepcopy(original), deepcopy(original)], stop_loss=nothing)
+        @test ScalarSearch._same_scalar_expression(result.best, original)
+        expected = abs2(only(evaluate_scalar_reference(original, X)))
+        @test result.best_loss == expected == (x == 1.0e16 ? 0.0 : 1.0)
+        @test abs2(only(evaluate_scalar_reference(result.best, X))) == result.best_loss
+        @test result.evaluations == 2
+        @test result.constant_refinement_evaluations == 0
+        @test result.variation.attempts == 0
+        for leader in result.leaders
+            @test abs2(only(evaluate_scalar_reference(leader.expr, X))) == leader.loss
+        end
+    end
 end
 
 @testitem "node regularized policy helpers preserve cost, cycle, and migration behavior" setup=[NodeRegularizedSearchImports] begin
@@ -296,8 +331,7 @@ end
 
     scalar_population = [ScalarSearch._node_to_scalar(member.candidate)
         for member in state.population]
-    expected_best = ScalarSearch._simplify_scalar(
-        ScalarSearch._node_to_scalar(state.best).expr)
+    expected_best = ScalarSearch._node_to_scalar(state.best).expr
     report_candidates = copy(scalar_population)
     push!(report_candidates,
         ScalarSearch._ScalarCandidate(expected_best, state.best.loss, 0, true))

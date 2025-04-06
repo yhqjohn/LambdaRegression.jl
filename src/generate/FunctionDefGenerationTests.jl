@@ -2779,6 +2779,63 @@ end
     @test sampled_mappers == Set((:SQR, :CUBE))
 end
 
+@testitem "FunctionDef preplanned self-call charges full multi-argument head arity" begin
+    using Test, Random
+    using LambdaRegression.TypeSystem: TyFun, FloatTy
+    CG = LambdaRegression.CanonicalGeneration
+
+    weights = CG.GenerationWeights(default=0, variable=0, constant=1,
+        scope_application=1, constraint_evidence=1e12)
+    relation = CG.CoreRelation(
+        global_consts=Dict{Symbol,Any}(:ONE => 1.0),
+        global_consts_ty=Dict{Symbol,Any}(:ONE => FloatTy),
+        providers=(CG.ContextHeadProvider(),),
+        weights=weights,
+    )
+
+    for (arity, exact_budget) in ((2, 4), (3, 6))
+        self_ty = FloatTy
+        for _ in 1:arity
+            self_ty = TyFun(FloatTy, self_ty)
+        end
+        scope = (ntuple(_ -> FloatTy, arity)..., self_ty)
+        self_index = arity
+        query = CG.GenerationQuery(FloatTy;
+            scope_tys=scope, depth_left=5, provider_fuel=5,
+            node_budget=exact_budget,
+            requirements=(CG.CallsScopeBinder(self_index),
+                CG.FunctionDefSelfBinder(self_index, arity, false)))
+
+        exact_state = CG.DerivationSamplingState(Random.Xoshiro(100 + arity),
+            exact_budget)
+        sampled = CG._sample_preplanned_functiondef_call!(
+            exact_state, relation, query)
+        @test sampled isa CG.ScopeApplicationDerivation
+        if sampled isa CG.ScopeApplicationDerivation
+            @test sampled.index == self_index
+            @test length(sampled.args) == arity
+            @test CG.derivation_node_count(sampled) == exact_budget
+            @test CG._generation_requirements_satisfied(sampled, query)
+            @test all(argument -> argument isa CG.ConstantDerivation, sampled.args)
+        end
+        @test exact_state.nodes_left == 0
+        @test !exact_state.completion.completing
+
+        short_budget = exact_budget - 1
+        short_query = CG.GenerationQuery(FloatTy;
+            scope_tys=scope, depth_left=5, provider_fuel=5,
+            node_budget=short_budget,
+            requirements=(CG.CallsScopeBinder(self_index),
+                CG.FunctionDefSelfBinder(self_index, arity, false)))
+        short_state = CG.DerivationSamplingState(Random.Xoshiro(200 + arity),
+            short_budget)
+        @test CG._sample_preplanned_functiondef_call!(
+            short_state, relation, short_query) === nothing
+        @test short_state.nodes_left == short_budget
+        @test !short_state.completion.completing
+    end
+end
+
 @testitem "FunctionDef preplanned self call is consumed by a mixed head packet" begin
     using Test, Random
     using LambdaRegression.TypeSystem: Ty, TyArray, TyFun, TyNat, FloatTy

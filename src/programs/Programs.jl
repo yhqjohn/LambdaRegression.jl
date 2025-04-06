@@ -13,6 +13,9 @@ parent's read-only tree and type graph while copying only the updated value
 group. The default copier deep-copies ordinary data as one group and borrows
 top-level `Function` values; callers own the stability/purity contract for
 borrowed resources and may inject an explicit group copier for other values.
+`numeric_parameter_schema` and `numeric_parameter_blocks` describe fixed-layout
+local numerical materials for constant search and structural observation;
+they own no fitness, budgets or optimization state.
 """
 module Programs
 
@@ -20,8 +23,10 @@ using TestItems
 
 using ..ASTs.NodeASTs: AstTree, ConstNode, copy_occurrences
 using ..TypeSystem: TyLike
+import ..TypeSystem
 
 export Program, with_constants, ConstSymbolFactory, new_constant!
+export numeric_parameter_schema, numeric_parameter_blocks
 
 """
     ConstSymbolFactory(; prefix=:c)
@@ -172,6 +177,8 @@ function with_constants(program::Program, updates; copy_values=_copy_local_value
     merge!(merged, owned_updates)
     return _publish_program(program.tree, merged, program.local_consts_ty)
 end
+
+include("numeric_parameters.jl")
 
 @testitem "Program owns syntax and local value materials" begin
     using Test

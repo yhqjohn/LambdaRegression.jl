@@ -1,6 +1,99 @@
 # Counterexample-led contract checks for StructureDiversity. The parent module
 # includes this file after defining and exporting the descriptor API.
 
+@testitem "Numeric diversity collapses zero-port scalar payloads without claiming equality" begin
+    using LambdaRegression.ASTs.NodeASTs
+    using LambdaRegression.Programs: Program
+    using LambdaRegression.StructureDiversity
+    using LambdaRegression.TypeSystem
+    using LambdaRegression.TypeSystem: FloatTy
+    using LambdaRegression.Primitives: FCOS, FADD
+    array_ty = TyArray(TyNat(4), FloatTy)
+    world = StructureWorld(Dict{Symbol,TyLike}(
+        :FCOS => TyFun(FloatTy, FloatTy), :FADD => TyFun(FloatTy, TyFun(FloatTy, FloatTy)));
+        values=Dict(:FCOS => FCOS, :FADD => FADD), target_ty=TyFun(array_ty, FloatTy))
+    make(body, c) = Program(AstTree(AbsNode(:X, body));
+        local_consts=Dict(:c => c), local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy))
+    bare = make(ConstNode(:c), 0.45)
+    cosine = make(AppNode(ConstNode(:FCOS), ConstNode(:c)), 0.49)
+    addition = make(AppNode(AppNode(ConstNode(:FADD), ConstNode(:c)), ConstNode(:c)), 2.0)
+    descriptions = describe_structure.([bare, cosine, addition], Ref(world))
+    @test length(bucket_counts(descriptions)) == 1
+    @test all(d -> isempty(only(d.holes).available_ports), descriptions)
+    @test all(d -> isempty(d.canonical_key.resources), descriptions)
+    @test hash(descriptions[1].canonical_key) == hash(descriptions[2].canonical_key)
+    raw = StructureBoundaryPolicy(view=:bindings)
+    @test describe_structure(bare, world; boundary_policy=raw).canonical_key !=
+        describe_structure(cosine, world; boundary_policy=raw).canonical_key
+    # No optimizer is run by describing or bucketing these actual programs.
+    @test bare.local_consts[:c] == 0.45
+    @test cosine.local_consts[:c] == 0.49
+end
+
+@testitem "Numeric diversity separates tensor layout and aliasing from parameter values" begin
+    using Random: MersenneTwister
+    using LambdaRegression.ASTs.NodeASTs
+    using LambdaRegression.Programs: Program, with_constants
+    using LambdaRegression.StructureDiversity
+    using LambdaRegression.TypeSystem
+    using LambdaRegression.TypeSystem: FloatTy
+    using LambdaRegression.Regression: search_constants, GaussianConstantSearch, ConstantSearchBudget
+    matrix_ty = TyArray(TyNat(2), TyArray(TyNat(3), FloatTy))
+    make(value) = Program(AstTree(ConstNode(:A)); local_consts=Dict(:A => value),
+        local_consts_ty=Dict{Symbol,TyLike}(:A => matrix_ty))
+    world = StructureWorld(Dict{Symbol,TyLike}(); target_ty=matrix_ty)
+    key(p) = describe_structure(p, world).canonical_key
+    parent = make(zeros(2, 3))
+    desc = describe_structure(parent, world)
+    @test only(desc.parameters).kind === :tensor
+    @test only(desc.parameters).shape == (2, 3)
+    @test only(desc.parameters).edit_modes == (:constant_values,)
+    @test isempty(desc.holes)
+    @test key(parent) == key(make(fill(3.0, 2, 3)))
+    @test key(parent) != key(make(zeros(Float32, 2, 3)))
+    @test key(parent) != key(make([zeros(3), zeros(3)]))
+    raw_scalar = StructureBoundaryPolicy(view=:scalar_masked)
+    @test describe_structure(parent, world; boundary_policy=raw_scalar).canonical_key !=
+        describe_structure(make(ones(2, 3)), world; boundary_policy=raw_scalar).canonical_key
+    refined = search_constants(GaussianConstantSearch(σ=0.2, tensor_modes=(:rank1,)),
+        parent, p -> -sum(abs2, p.local_consts[:A]); rng=MersenneTwister(2000),
+        budget=ConstantSearchBudget(max_proposals=1, max_objective_evals=2))
+    @test refined.status === :improved
+    @test key(refined.program) == key(parent)
+    @test refined.loss < 0.0
+    @test parent.local_consts[:A] == zeros(2, 3)
+
+    consume = a -> b -> 0.0
+    pair_world = StructureWorld(Dict{Symbol,TyLike}(
+        :consume => TyFun(matrix_ty, TyFun(matrix_ty, FloatTy)));
+        values=Dict(:consume => consume), target_ty=FloatTy)
+    function pair(a, b; names=(:a, :b))
+        x, y = names
+        Program(AstTree(AppNode(AppNode(ConstNode(:consume), ConstNode(x)), ConstNode(y)));
+            local_consts=Dict(x => a, y => b), local_consts_ty=Dict{Symbol,TyLike}(x => matrix_ty, y => matrix_ty))
+    end
+    pairkey(p) = describe_structure(p, pair_world).canonical_key
+    shared = zeros(2, 3)
+    tied = pair(shared, shared)
+    @test pairkey(tied) != pairkey(pair(copy(shared), copy(shared)))
+    renamed = ones(2, 3)
+    @test pairkey(tied) == pairkey(pair(renamed, renamed; names=(:left, :right)))
+    split = with_constants(tied, Dict(:a => ones(2, 3)))
+    @test pairkey(split) != pairkey(tied)
+    @test tied.local_consts[:a] === tied.local_consts[:b]
+    @test split.local_consts[:a] !== split.local_consts[:b]
+    row = zeros(3)
+    @test key(make([row, row])) != key(make([copy(row), copy(row)]))
+
+    empty_ty = TyArray(TyNat(2), TyArray(TyNat(0), FloatTy))
+    empty_world = StructureWorld(Dict{Symbol,TyLike}(); target_ty=empty_ty)
+    empty_program() = Program(AstTree(ConstNode(:e)); local_consts=Dict(:e => zeros(2, 0)),
+        local_consts_ty=Dict{Symbol,TyLike}(:e => empty_ty))
+    empty_desc = describe_structure(empty_program(), empty_world)
+    @test isempty(only(empty_desc.parameters).edit_modes)
+    @test empty_desc.canonical_key == describe_structure(empty_program(), empty_world).canonical_key
+end
+
 @testitem "Structure diversity alias spines, grammar changes and opaque mu boundaries" begin
     using LambdaRegression.ASTs.NodeASTs
     using LambdaRegression.Programs: Program

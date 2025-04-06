@@ -2,7 +2,12 @@
     Workflows
 
 Composes a resumable complete-program search state with bounded typed and
-scalar refinement sessions, material migration, and compact phase accounting.
+scalar refinement sessions, numerical-constant search, material migration, and
+compact phase accounting. Constant search edits typed local numeric payloads;
+it is an independent action from scalar structural search. Scalar zero-input
+sessions are disabled by default; set `scalar.allow_zero_input=true` to opt in.
+Action enablement does not alter numeric-block or structural descriptions; an
+ineligible payload is not a new structure merely because an optimizer is off.
 `run_mixed_alternation!` borrows an initialized `AgeSearchState`; callers
 remain responsible for task construction, data splits, and reporting.
 
@@ -12,7 +17,7 @@ result = run_mixed_alternation!(state; rng=MersenneTwister(1), cycles=2,
     scalar=scalar_options, sampling=sampling_options)
 ```
 
-All four layer policies are supplied by the caller; this library module does
+Layer policies are supplied by the caller; this library module does
 not prescribe a task-specific profile.
 
 `run_continuous_search!` is the alternative serial action composition: bounded
@@ -20,7 +25,9 @@ outer and local work publish material immediately, with an optional bounded
 `StructurePolicy` for family opportunities and survival. Action weights count
 actions rather than CPU share; local source selection includes an explicit
 exploration fraction over deduplicated archive/live/recent/representative material.
-Exact local-state resume and multicore execution remain active extensions.
+An opt-in `scalar.session` retains one fixed-context multi-island search across
+actions within the call. Its configuration budgets cover the whole session;
+outer actions do not reset it. Cross-call resume and multicore remain extensions.
 `StructurePolicy(world)` connects a stable `StructureDiversity.StructureWorld`
 directly; its scalar named-input policy must match the local scalar options.
 
@@ -31,6 +38,10 @@ world = StructureDiversity.StructureWorld(reg.components.global_consts_ty;
 result = run_continuous_search!(state; rng=MersenneTwister(1),
     config=ContinuousSearchConfig(max_actions=16),
     outer=outer_options, typed=typed_options, scalar=scalar_options,
+    constant=(enabled=true,
+        strategy=LambdaRegression.Regression.GaussianConstantSearch(σ=0.1),
+        budget=LambdaRegression.Regression.ConstantSearchBudget(
+            max_proposals=8, max_objective_evals=9)),
     policy=StructurePolicy(world))
 ```
 
@@ -48,9 +59,9 @@ using TestItems
 using Random: AbstractRNG, MersenneTwister, rand, shuffle!
 using ..Utils: Err
 using ..ASTs.NodeASTs: AstNode, children
-using ..Programs: Program
+using ..Programs: Program, numeric_parameter_blocks
 using ..TypeSystem: Ty, TyLike
-using ..ScalarSearch: ScalarSearchConfig, scalar_complexity, search_multi_scalar
+using ..ScalarSearch: ScalarSearchConfig, scalar_complexity, search_scalar, search_multi_scalar
 using ..StructureDiversity: StructureWorld, StructureBoundaryPolicy, describe_structure
 import ..Regression
 using ..Regression: Regressor, SupervisedDataset, AgeSearchState,
@@ -267,7 +278,9 @@ function _scalar_config(scalar)
         constant_refinement_interval=Int(scalar.constant_refinement_interval),
         constant_refinement_start_generation=Int(scalar.constant_refinement_start_generation),
         constant_refinement_probability=scalar.constant_refinement_probability,
+        constant_refinement_timing=get(scalar, :constant_refinement_timing, :cycle),
         max_constant_refinement_evaluations=Int(scalar.max_constant_refinement_evaluations),
+        max_total_evaluations=get(scalar, :max_total_evaluations, nothing),
         evolution_strategy=:regularized,
     )
 end
@@ -642,6 +655,7 @@ function run_mixed_alternation!(state::AgeSearchState;
                             rng=MersenneTwister(rand(rng, UInt64)),
                             max_return=Int(scalar_cfg.max_return),
                             stop_loss=nothing,
+                            allow_zero_input=get(scalar_cfg, :allow_zero_input, false),
                             search_backend=scalar_backend)
                         summary = _refinement_summary(result)
                         result isa Err || (scalar_successful_search_count += 1)
@@ -768,6 +782,7 @@ function run_mixed_alternation!(state::AgeSearchState;
 end
 
 include("continuous.jl")
+include("continuous_session_tests.jl")
 
 @testitem "Mixed workflow outer-only run borrows initialized state" begin
     using Random: MersenneTwister

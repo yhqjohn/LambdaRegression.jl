@@ -12,13 +12,31 @@ DynamicExpressions bridge, bounded generational search, and node-native
 regularized evolution with age replacement, rank tournaments, annealing,
 adaptive complexity frequencies, and a best-per-complexity archive. The
 `search_multi_scalar` coordinator advances persistent regularized islands with
-bounded inter-island migration.
+bounded inter-island migration. Its `initialize_multi_scalar`,
+`advance_multi_scalar!`, and `multi_scalar_result` APIs retain a fixed-context
+session across complete coordinator rounds. Its default `hof_donor_policy=:local_best`
+draws from bounded per-island archive leaders and excludes the destination;
+`:global_pareto` instead draws from the global loss-complexity frontier,
+including the destination's own history. Both retain the same migration clock,
+without-replacement donor sampling and random-slot replacement with fresh ages.
 The public strategies share scalar configuration and independently bounded
-constant polishing while retaining their own search loops. Initial candidates
-are not deeply polished; after structural search, remaining refinement budget
-may polish evolved candidates on the training loss–complexity frontier. The
-module also provides direct shape-preserving `MapPlan` and ordered `FoldPlan`
-adapters. A minimal evaluation path is:
+constant polishing while retaining their own search loops. Constant polishing
+stops at its evaluation cap and keeps the best valid trial already scored;
+resource exhaustion is not treated as an infinite objective value. Initial
+candidates are not deeply polished. After structural search, the generational
+strategy may spend its remaining refinement budget on evolved candidates from
+the training loss–complexity frontier. The regularized strategy defaults to
+probabilistic cycle-end refinements of live members and can instead refine
+scored offspring before archive/admission. Its optional `max_total_evaluations`
+cap counts structural and constant-refinement scores together while excluding
+each island's baseline callback. Its best-per-complexity archive is retained and
+returned within that search state, not reused by a later search call. Results
+retain scored expression forms without implicit report-time simplification.
+Regularized cycle simplification proposes a new expression and scores it against
+the current structural and total budgets; its finite score may enter the archive,
+and it replaces a live member only when its loss is no worse, retaining its age.
+The module also provides direct shape-preserving `MapPlan` and
+ordered `FoldPlan` adapters. A minimal evaluation path is:
 
 ```julia
 expr = scalar_binary(:*, scalar_input(1),
@@ -28,9 +46,11 @@ y = evaluate_scalar(expr, X) # X is features × samples
 
 Use `search_scalar(X, y; config=ScalarSearchConfig(...))` for independent
 scalar teachers, set `evolution_strategy=:regularized` for the steady-state
-path, or pass a contextual objective for a fixed program scaffold. Expected
-input-shape, numeric-domain, conversion, scaffold, and plan-shape failures are
-returned as `Err`; unsupported AST regions remain on the general program path.
+path, or pass a contextual objective for a fixed program scaffold. Set
+`constant_refinement_timing=:offspring` to compare pre-admission polishing.
+Expected input-shape, numeric-domain, conversion, scaffold, and plan-shape
+failures are returned as `Err`; unsupported AST regions remain on the general
+program path.
 """
 module ScalarSearch
 
@@ -49,6 +69,8 @@ export evaluate_scalar_reference, scalar_from_ast, scalar_to_ast
 export PreparedScalarProgram, ScalarWorkspace, prepare_scalar, evaluate_scalar, evaluate_scalar!
 export ScalarSearchConfig, ScalarSearchResult, scalar_complexity
 export scalar_structure_similarity, search_scalar
+export MultiScalarSession, initialize_multi_scalar, advance_multi_scalar!, multi_scalar_result
+export multi_scalar_progress
 export search_multi_scalar
 export FixedScalarCall, FixedScalarScaffold, ScalarMaterialization, materialize_scalar_scaffold
 export ScalarScaffoldErr
@@ -666,7 +688,9 @@ end
     @test config.constant_refinement_interval == 25
     @test config.constant_refinement_start_generation == 25
     @test config.constant_refinement_probability == 0.0
+    @test config.constant_refinement_timing === :cycle
     @test config.max_constant_refinement_evaluations == 10_000
+    @test config.max_total_evaluations === nothing
     @test config.constant_refinement_optimizer == :bfgs
     @test config.complexity_balanced_tournament
     @test config.mutation_probability == 0.9

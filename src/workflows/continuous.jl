@@ -1,4 +1,4 @@
-"""One managed family's real witnesses and development history; never a shared score."""
+"""One managed family's real witnesses and accounting history; never a shared score."""
 mutable struct StructureFamily
     representatives::Vector{AgeSearchIndividual}
     admissions::Int
@@ -16,7 +16,7 @@ end
     using Random: MersenneTwister
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode, ConstNode
     using LambdaRegression.Programs: Program
-    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, TyFun, TyLike
     using LambdaRegression.Mutations: AbstractMutation
     using LambdaRegression.Regression: default_components, default_config,
         default_regressor, SupervisedDataset, initialize_age_search
@@ -192,6 +192,72 @@ end
     @test maximum(r.loss for r in pool if r.id in chosen) > minimum(r.loss for r in pool)
 end
 
+@testitem "Continuous constant source filtering survives family selection" setup=[ContinuousWorkflowFixture] begin
+    using LambdaRegression.Programs: numeric_parameter_blocks
+    using LambdaRegression.Regression: ConstantSearchBudget, GaussianConstantSearch
+
+    state = continuous_fixture(size=2)
+    policy = StructurePolicy(continuous_key; capacity=2, representatives=2,
+        family_probability=1.0)
+    CW._seed_structure_policy!(policy, state)
+    eligible_ids = [record.id for record in state.populations[1]
+        if !isempty(numeric_parameter_blocks(record.program))]
+    @test length(eligible_ids) == 1
+    eligible_id = only(eligible_ids)
+
+    # A scored, same-family representative is fed back by family selection.
+    # The source filter must still exclude it after that feedback expansion.
+    rejected = CR._age_score_record!(state, continuous_constant(4.0), (), :test, :advance)
+    @test !isempty(numeric_parameter_blocks(rejected.program))
+    push!(policy.families[:constant].representatives, rejected)
+    rejected_filter_calls = Ref(0)
+    source_filter = function (record)
+        if record.id == rejected.id
+            rejected_filter_calls[] += 1
+        end
+        return record.id == eligible_id
+    end
+    result = run_continuous_search!(state; rng=MersenneTwister(2000), policy,
+        config=ContinuousSearchConfig(max_actions=1, constant_weight=100.0,
+            source_exploration_probability=0.0),
+        outer=(attempts=0, evaluations=0, max_nodes=16, max_depth=4),
+        typed=(enabled=false,), scalar=(enabled=false,),
+        constant=(enabled=true, strategy=GaussianConstantSearch(),
+            budget=ConstantSearchBudget(max_proposals=1, max_objective_evals=1),
+            source_filter))
+
+    entry = only(result.ledger)
+    @test entry.kind === :constant
+    @test entry.source_id == eligible_id
+    @test entry.source_id != rejected.id
+    @test rejected_filter_calls[] >= 2
+end
+
+@testitem "Continuous constant source filter can refuse every source" setup=[ContinuousWorkflowFixture] begin
+    using LambdaRegression.Regression: ConstantSearchBudget, GaussianConstantSearch
+
+    state = continuous_fixture(size=2)
+    calls_before = state.counters.objective_calls
+    filter_calls = Ref(0)
+    source_filter = record -> (filter_calls[] += 1; false)
+    result = run_continuous_search!(state; rng=MersenneTwister(1),
+        config=ContinuousSearchConfig(max_actions=1, constant_weight=100.0),
+        outer=(attempts=0, evaluations=0, max_nodes=16, max_depth=4),
+        typed=(enabled=false,), scalar=(enabled=false,),
+        constant=(enabled=true, strategy=GaussianConstantSearch(),
+            budget=ConstantSearchBudget(max_proposals=1, max_objective_evals=1),
+            source_filter))
+
+    entry = only(result.ledger)
+    @test entry.kind === :constant
+    @test entry.refused
+    @test entry.report.reason === :no_eligible_constant_source
+    @test filter_calls[] > 0
+    @test entry.report.constant_calls == 0
+    @test result.counts.constant.calls == 0
+    @test state.counters.objective_calls == calls_before
+end
+
 @testitem "Continuous workflow local publication and accounting" setup=[ContinuousWorkflowFixture] begin
     using LambdaRegression.ScalarSearch: ScalarSearchConfig
     state = continuous_fixture()
@@ -210,6 +276,8 @@ end
     @test length(observed) == length(result.ledger) == 4
     @test count(e -> e.kind === :outer, observed) == 1
     @test count(e -> e.kind === :scalar, observed) == 3
+    @test [e.kind for e in observed] == [:scalar, :outer, :scalar, :scalar]
+    @test result.counts.constant.calls == 0
     @test result.counts.scalar.calls > 0
     @test sum(e.development_objective_calls for e in observed) == result.counts.scalar.calls
     @test sum(f.development_evaluations for f in values(policy.families)) == result.counts.scalar.calls
@@ -217,6 +285,167 @@ end
     @test all(e -> e.elapsed_seconds >= 0, observed)
     @test length(policy.keys) <= length(state.populations[1]) +
         policy.capacity * policy.representative_capacity
+end
+
+@testitem "Continuous workflow forwards contextual scalar backend without changing defaults" setup=[ContinuousWorkflowFixture] begin
+    using LambdaRegression.ScalarSearch: ScalarSearchConfig, search_scalar
+    cfg = ScalarSearchConfig(population_size=2, max_evaluations=4,
+        max_complexity=6, initial_depth=0, tournament_size=1, elite_count=1,
+        unary_operators=(:square,), binary_operators=(),
+        constant_refinement_iterations=0, max_constant_refinement_evaluations=0,
+        evolution_strategy=:regularized)
+    backend_calls = Ref(0)
+    backend = function (X, y; kwargs...)
+        backend_calls[] += 1
+        @test kwargs[:config] === cfg
+        @test kwargs[:stop_loss] === nothing
+        @test length(kwargs[:initial_population]) == 1
+        @test applicable(kwargs[:objective], first(kwargs[:initial_population]))
+        return search_scalar(X, y; kwargs...)
+    end
+    function run_with(options)
+        run_continuous_search!(continuous_fixture(); rng=MersenneTwister(1),
+            config=ContinuousSearchConfig(max_actions=4, scalar_weight=3.0),
+            outer=(attempts=0, evaluations=0, max_nodes=32, max_depth=8),
+            typed=(enabled=false,),
+            scalar=merge((enabled=true, config=cfg, max_return=1,
+                material_return=1), options))
+    end
+    ordinary = run_with((;))
+    supplied = run_with((; search_backend=backend))
+    @test backend_calls[] > 0
+    @test backend_calls[] == count(e -> e.kind === :scalar && !e.refused, supplied.ledger)
+    @test supplied.counts.scalar.calls == ordinary.counts.scalar.calls
+    @test supplied.best.loss == ordinary.best.loss
+    @test CW._same_program(supplied.best.program, ordinary.best.program)
+    @test [(e.kind, e.path, e.refused, e.returned) for e in supplied.ledger] ==
+        [(e.kind, e.path, e.refused, e.returned) for e in ordinary.ledger]
+end
+
+@testitem "Continuous workflow keeps zero-input scalar search opt-in" setup=[ContinuousWorkflowFixture] begin
+    using LambdaRegression.ScalarSearch: ScalarSearchConfig
+
+    source_program = Program(AstTree(AbsNode(:x, ConstNode(:c)));
+        local_consts=Dict{Symbol,Any}(:c => 1.0),
+        local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy))
+    components = default_components(
+        global_consts=Dict{Symbol,Any}(),
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        input_slots=[:x], input_types=Dict{Symbol,TyLike}(:x => BoolTy),
+        mutations=AbstractMutation[], crossover_op=nothing,
+        init_population=(reg, data; N, seed, global_type_ctx) ->
+            [source_program for _ in 1:N])
+    reg = default_regressor(TyFun(BoolTy, FloatTy);
+        rng=MersenneTwister(2000), components,
+        config=default_config(population_size=1, tournament_size=1))
+    state = initialize_age_search(reg, SupervisedDataset([true], [1.0]);
+        population_count=1, population_size=1, seed=17)
+    scalar_config = ScalarSearchConfig(population_size=2, max_evaluations=2,
+        max_complexity=4, initial_depth=0, tournament_size=1, elite_count=1,
+        constant_refinement_iterations=0, max_constant_refinement_evaluations=0,
+        evolution_strategy=:regularized)
+    calls_before = state.counters.objective_calls
+    result = run_continuous_search!(state; rng=MersenneTwister(1),
+        config=ContinuousSearchConfig(max_actions=1, scalar_weight=100.0),
+        outer=(attempts=0, evaluations=0, max_nodes=16, max_depth=4),
+        typed=(enabled=false,),
+        scalar=(enabled=true, config=scalar_config, max_return=1,
+            material_return=0))
+
+    @test result.ledger[1].kind === :scalar
+    @test result.ledger[1].refused
+    @test any(r -> r.reason === :disabled_zero_input, result.ledger[1].refusals)
+    @test result.counts.scalar.calls == 0
+    @test state.counters.objective_calls == calls_before
+end
+
+@testitem "Continuous workflow constant action scores and reclassifies matrix material" setup=[ContinuousWorkflowFixture] begin
+    using LambdaRegression.TypeSystem: TyArray, TyNat
+    using LambdaRegression.Programs: numeric_parameter_blocks
+
+    matrix_ty = TyArray(TyNat(2), TyArray(TyNat(2), FloatTy))
+    source_values = zeros(2, 2)
+    source_program = Program(AstTree(AbsNode(:x, ConstNode(:A)));
+        local_consts=Dict{Symbol,Any}(:A => source_values),
+        local_consts_ty=Dict{Symbol,TyLike}(:A => matrix_ty))
+    components = merge(default_components(
+        global_consts=Dict{Symbol,Any}(),
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        input_slots=[:x], input_types=Dict{Symbol,TyLike}(:x => FloatTy),
+        mutations=AbstractMutation[], crossover_op=nothing,
+        init_population=(reg, data; N, seed, global_type_ctx) ->
+            [source_program for _ in 1:N]),
+        (; loss=(prediction, target) -> -sum(abs2, prediction)))
+    reg = default_regressor(TyFun(FloatTy, matrix_ty);
+        rng=MersenneTwister(8000), components,
+        config=default_config(population_size=2, tournament_size=1))
+    state = initialize_age_search(reg,
+        SupervisedDataset([1.0], [zeros(2, 2)]);
+        population_count=1, population_size=2, seed=21)
+    source = state.populations[1][1]
+    original_value = source.program.local_consts[:A]
+    policy = StructurePolicy(p -> all(iszero, p.local_consts[:A]) ? :zero : :nonzero;
+        capacity=3, representatives=2, development_evaluations=0)
+    strategy = CR.GaussianConstantSearch(σ=0.25, tensor_modes=(:global_bias,))
+    budget = CR.ConstantSearchBudget(max_proposals=1, max_objective_evals=2)
+    result = run_continuous_search!(state; rng=MersenneTwister(42), policy,
+        config=ContinuousSearchConfig(max_actions=1, constant_weight=100.0),
+        outer=(attempts=0, evaluations=0, max_nodes=16, max_depth=4),
+        typed=(enabled=false,), scalar=(enabled=false,),
+        constant=(enabled=true, strategy, budget))
+
+    entry = only(result.ledger)
+    @test entry.kind === :constant
+    @test !entry.refused
+    @test entry.returned == entry.incoming == 1
+    @test entry.development_objective_calls == 2
+    @test entry.objective_calls == 3 # two search scores and one migrant rescore
+    @test entry.report.status === :improved
+    @test entry.report.constant_calls == 2
+    @test entry.report.constant_stats.tensor_proposals == 1
+    @test entry.report.constant_stats.objective_evaluations == result.counts.constant.calls == 2
+    @test result.counts.constant.samples == 2
+    @test numeric_parameter_blocks(source.program) == [:A => :tensor]
+    @test source.program.local_consts[:A] === original_value
+    @test source.program.local_consts[:A] == zeros(2, 2)
+    @test source.loss == 0.0
+    candidate_index = findfirst(record -> record.id != source.id &&
+        !CW._same_program(record.program, source.program), state.populations[1])
+    @test candidate_index !== nothing
+    candidate = state.populations[1][candidate_index]
+    @test candidate.loss < source.loss
+    @test size(candidate.program.local_consts[:A]) == (2, 2)
+    @test candidate.program.local_consts_ty[:A] == matrix_ty
+    @test candidate.program.local_consts[:A] !== original_value
+    @test CW._structure_key(policy, source) === :zero
+    @test CW._structure_key(policy, candidate) === :nonzero
+    @test any(record -> CW._same_program(record.program, source.program) &&
+        record.loss == source.loss, policy.families[:zero].representatives)
+    @test any(record -> record.id == candidate.id && record.loss == candidate.loss,
+        policy.families[:nonzero].representatives)
+end
+
+@testitem "Continuous workflow constant action refuses sources without numeric blocks" setup=[ContinuousWorkflowFixture] begin
+    using LambdaRegression.Programs: numeric_parameter_blocks
+    using LambdaRegression.Regression: ConstantSearchBudget, GaussianConstantSearch
+    state = continuous_fixture(size=1)
+    @test isempty(numeric_parameter_blocks(state.populations[1][1].program))
+    calls_before = state.counters.objective_calls
+    result = run_continuous_search!(state; rng=MersenneTwister(1),
+        config=ContinuousSearchConfig(max_actions=1, constant_weight=100.0),
+        outer=(attempts=0, evaluations=0, max_nodes=16, max_depth=4),
+        typed=(enabled=false,), scalar=(enabled=false,),
+        constant=(enabled=true, strategy=GaussianConstantSearch(),
+            budget=ConstantSearchBudget(max_proposals=1, max_objective_evals=2)))
+
+    entry = only(result.ledger)
+    @test entry.kind === :constant
+    @test entry.refused
+    @test entry.report.reason === :no_numeric_blocks
+    @test entry.report.constant_calls == 0
+    @test entry.report.constant_stats === nothing
+    @test result.counts.constant.calls == 0
+    @test state.counters.objective_calls == calls_before
 end
 
 """
@@ -462,11 +691,13 @@ end
 
 function Regression.age_select_parent(policy::StructurePolicy, state::AgeSearchState,
         island::Int, candidates::Vector{AgeSearchIndividual}, rng::AbstractRNG,
-        tournament_size::Int, role::Symbol)
+        tournament_size::Int, role::Symbol; eligible=nothing)
     _seed_structure_policy!(policy, state)
     live_ids = Set(record.id for record in state.populations[island])
     selected = if rand(rng) < policy.family_probability
-        pool = _structure_candidates(policy, candidates)
+        expanded = _structure_candidates(policy, candidates)
+        pool = eligible === nothing ? expanded : filter(eligible, expanded)
+        isempty(pool) && return nothing
         groups = Dict{Any,Vector{AgeSearchIndividual}}()
         for record in pool
             key = _structure_key(policy, record)
@@ -479,7 +710,9 @@ function Regression.age_select_parent(policy::StructurePolicy, state::AgeSearchS
         Regression._age_tournament(rng, groups[group_keys[rand(rng, eachindex(group_keys))]],
             tournament_size)
     else
-        Regression._age_tournament(rng, candidates, tournament_size)
+        pool = eligible === nothing ? candidates : filter(eligible, candidates)
+        isempty(pool) && return nothing
+        Regression._age_tournament(rng, pool, tournament_size)
     end
     family = get(policy.families, _structure_key(policy, selected), nothing)
     if family !== nothing && role !== :development
@@ -495,6 +728,9 @@ function _credit_development!(policy::StructurePolicy, state, source, evaluation
     family = _manage_family!(policy, state, key)
     family === nothing && return nothing
     family.development_actions += 1
+    # A retained session can outlive its source family's managed residence.
+    # Reintroducing its accounting also needs a real witness for snapshots.
+    isempty(family.representatives) && _retain_representative!(policy, family, source)
     family.development_evaluations += evaluations
     family.development_seconds += seconds
     refused && (family.refused_actions += 1)
@@ -516,15 +752,20 @@ structure_snapshot(::Nothing) = nothing
 
 """
     ContinuousSearchConfig(; max_actions=100, outer_weight=1, typed_weight=1,
-        scalar_weight=2, max_seconds=Inf, max_migrants=3, path_attempts=8)
+        scalar_weight=2, constant_weight=1, max_seconds=Inf, max_migrants=3,
+        path_attempts=8)
 
 Finite serial action schedule, with complete search plus independently bounded
-typed/scalar actions. Weights govern action count rather than CPU share; the
-ledger measures actual end-to-end costs. Positive outer weight is required.
+typed, scalar and numerical-constant actions. The constant action searches
+program-local numeric payloads without changing syntax; it is separate from
+scalar structural search and remains disabled unless enabled in its runner
+options. Weights govern action count rather than CPU share; the ledger measures
+actual end-to-end costs. Positive outer weight is required.
 `max_seconds` is checked between actions and cannot interrupt a primitive or
 bridge. Per-engine attempt/evaluation limits are supplied separately. No global
-barrier requires every enabled layer to execute. Multicore and exact local-state
-resume are active, revisable extensions, not supported by this first entry.
+barrier requires every enabled layer to execute. Optional scalar sessions retain
+local state between actions within one call. Multicore and cross-call resume
+remain active, revisable extensions.
 `source_exploration_probability` reserves local-source draws for uniformly
 sampled, ID-deduplicated material; remaining draws use quality/family selection.
 """
@@ -533,6 +774,7 @@ Base.@kwdef struct ContinuousSearchConfig
     outer_weight::Float64 = 1.0
     typed_weight::Float64 = 1.0
     scalar_weight::Float64 = 2.0
+    constant_weight::Float64 = 1.0
     max_seconds::Float64 = Inf
     max_migrants::Int = 3
     path_attempts::Int = 8
@@ -551,20 +793,35 @@ function _continuous_material_pool(state, policy)
     return policy === nothing ? candidates : _structure_candidates(policy, candidates)
 end
 
-function _continuous_source(state, policy, rng, exploration_probability)
+function _continuous_source(state, policy, rng, exploration_probability; eligible=nothing)
     candidates = _continuous_material_pool(state, policy)
+    eligible === nothing || filter!(eligible, candidates)
     isempty(candidates) && return nothing
     rand(rng) < exploration_probability && return candidates[rand(rng, eachindex(candidates))]
     if policy === nothing
         return Regression._age_tournament(rng, candidates,
             Int(get(state.reg.config, :tournament_size, 2)))
     end
+    tournament_size = Int(get(state.reg.config, :tournament_size, 2))
     return Regression.age_select_parent(policy, state, 1, candidates, rng,
-        Int(get(state.reg.config, :tournament_size, 2)), :development)
+        tournament_size, :development; eligible)
+end
+
+function _constant_source_eligible(record::AgeSearchIndividual, source_filter)
+    isempty(numeric_parameter_blocks(record.program)) && return false
+    source_filter === nothing && return true
+    applicable(source_filter, record) || throw(ArgumentError(
+        "constant.source_filter must accept an AgeSearchIndividual",
+    ))
+    accepted = source_filter(record)
+    accepted isa Bool || throw(ArgumentError(
+        "constant.source_filter must return Bool",
+    ))
+    return accepted
 end
 
 function _continuous_local(state, source, kind, options, outer, counts, rng,
-        path_attempts, scalar_config)
+        path_attempts, scalar_config; session_options=nothing)
     reg = state.reg
     global_types = Dict{Symbol,TyLike}(reg.components.global_consts_ty)
     input_types = Dict{Symbol,TyLike}(reg.components.input_types)
@@ -589,10 +846,19 @@ function _continuous_local(state, source, kind, options, outer, counts, rng,
                 region
             elseif scalar_complexity(region.expr) > scalar_config.max_complexity
                 Err(Regression.ScalarRegionError(:scalar_size))
+            elseif session_options !== nothing
+                Regression.initialize_scalar_region_session(region, scorer;
+                    config=scalar_config, rng,
+                    max_return=Int(options.max_return),
+                    material_return=Int(get(options, :material_return, 1)),
+                    allow_zero_input=get(options, :allow_zero_input, false),
+                    backend_options=session_options.backend_options)
             else
                 search_scalar_region(region, scorer; config=scalar_config, rng,
                     max_return=Int(options.max_return),
-                    material_return=Int(get(options, :material_return, 1)), stop_loss=nothing)
+                    material_return=Int(get(options, :material_return, 1)), stop_loss=nothing,
+                    allow_zero_input=get(options, :allow_zero_input, false),
+                    search_backend=get(options, :search_backend, search_scalar))
             end
         end
         if result isa Err
@@ -604,9 +870,51 @@ function _continuous_local(state, source, kind, options, outer, counts, rng,
     return (; result=nothing, path=Int[], refusals)
 end
 
+function _continuous_session_options(scalar, scalar_config)
+    options = get(scalar, :session, nothing)
+    options === nothing && return nothing
+    scalar.enabled || throw(ArgumentError("scalar.session requires enabled scalar search"))
+    options isa NamedTuple || throw(ArgumentError("scalar.session must be a NamedTuple or nothing"))
+    all(key -> key in (:rounds_per_action, :backend_options), keys(options)) ||
+        throw(ArgumentError("unknown scalar.session option"))
+    hasproperty(scalar, :search_backend) && throw(ArgumentError(
+        "scalar.session uses the retained multi-island backend; omit search_backend"))
+    rounds_per_action = get(options, :rounds_per_action, 1)
+    rounds_per_action isa Integer && rounds_per_action > 0 ||
+        throw(ArgumentError("scalar.session.rounds_per_action must be a positive integer"))
+    backend_options = get(options, :backend_options, (;))
+    backend_options isa NamedTuple || throw(ArgumentError("backend_options must be a NamedTuple"))
+    all(key -> key in (:island_count, :rounds, :migrant_count, :top_migrant_count,
+        :ncycles_per_iteration, :frequency_window, :top_migration_rate, :donor_limit,
+        :hof_donor_policy, :round_observer), keys(backend_options)) ||
+        throw(ArgumentError("unknown or reserved scalar session backend option"))
+    scalar_config.evolution_strategy === :regularized ||
+        throw(ArgumentError("scalar.session requires evolution_strategy=:regularized"))
+    for key in (:island_count, :rounds, :ncycles_per_iteration, :frequency_window)
+        value = get(backend_options, key, 1)
+        value isa Integer && value > 0 || throw(ArgumentError("$key must be a positive integer"))
+    end
+    islands = get(backend_options, :island_count, 2)
+    scalar_config.max_evaluations ÷ islands >= scalar_config.population_size ||
+        throw(ArgumentError("scalar session budget must initialize every island"))
+    return (; rounds_per_action=Int(rounds_per_action), backend_options)
+end
+
+const _EMPTY_SESSION_COUNTS = (objective_calls=0, structural_evaluations=0,
+	constant_refinement_evaluations=0, total_evaluations=0,
+	baseline_objective_calls=0)
+
+function _continuous_session_summary(slot, previous; event)
+    progress = Regression.scalar_region_progress(slot.session)
+    delta = map(-, progress.cumulative, previous)
+    return (; id=slot.id, source_id=slot.source.id, path=copy(slot.path), event,
+        progress..., delta)
+end
+
 """
     run_continuous_search!(state; rng, config=ContinuousSearchConfig(),
-        outer, typed, scalar, policy=nothing, on_action=nothing)
+        outer, typed, scalar, constant=(enabled=false,), policy=nothing,
+        on_action=nothing)
 
 Compose complete-program evolution and immediately published bounded local
 refinement actions over one stable task. A `StructurePolicy` optionally changes
@@ -614,11 +922,60 @@ opportunity and survival. All migrants are validated and rescored in this task;
 family scores are never substituted for individual scores. Local development
 cost belongs to the selected source family even when the result changes family.
 Callbacks observe a compact action record synchronously; mutable state/policy
-must remain exclusively owned. Local calls restart their bounded backend state.
+must remain exclusively owned. By default local calls restart their bounded backend state.
+Optional `scalar.search_backend` follows `search_scalar_region`'s contextual
+backend contract, including the supplied objective, RNG, initial population and
+budgets. It defaults to `search_scalar`; family membership never permits sharing
+local backend state or scores between different contexts.
+
+Opt into one retained scalar session with `scalar.session=(rounds_per_action=1,
+backend_options=(island_count=2, rounds=4))`. `scalar.config` budgets cover the
+whole session, not each action. The first action selects an ordinary source and
+eligible hole; later scalar actions advance that same owned context. Outer,
+typed and constant actions still publish independently. They never retarget or
+reset the scalar session. Each publication is an owned full program and passes
+ordinary migrant rescoring. All task data, primitive values and scoring settings
+must remain stable. A completed session releases the slot for a new selection.
+`search_backend` cannot be combined with this option. Each ledger's
+`report.session.delta` counts only that action; `cumulative` and ordinary bridge
+diagnostics cover the session so far. Objective counters include initialization
+baselines and hot materialization refusals; development calls count actual whole
+program scoring, and migrant rescoring is charged separately to the outer engine.
+At the run's action/time limit an unfinished session is discarded and explicitly
+reported in `scalar_sessions.unfinished`; a subsequent call starts afresh.
+This is bounded in-memory scheduling, not cross-call or disk resume.
+
+`scalar.allow_zero_input` defaults to `false`; set it to `true` to run a scalar
+session over a region with no dependencies. A constant action is separate:
+`constant=(enabled=true, strategy, budget)` requires an
+`AbstractConstantSearch` strategy and `ConstantSearchBudget`. It first filters
+the source pool to programs with `numeric_parameter_blocks`, then applies the
+usual exploration/family selection. Optional `constant.source_filter` defaults
+to `nothing`; when supplied, it receives each numerically eligible
+`AgeSearchIndividual` and must return `Bool`. Family representatives added
+during selection pass through the same
+filter. When no source remains, the refusal reason is `:no_numeric_blocks`
+without a filter and `:no_eligible_constant_source` when one is supplied. It
+returns at most the search's best improved program through ordinary migrant
+validation, rescoring, and structure classification. Enablement flags do not
+alter `numeric_parameter_blocks` or a structural description; leaving a
+payload out of one optimizer is never a new structure on its own.
 """
 function run_continuous_search!(state::AgeSearchState; rng::AbstractRNG,
         config::ContinuousSearchConfig=ContinuousSearchConfig(), outer, typed,
-        scalar, policy=nothing, on_action=nothing)
+        scalar, constant=(enabled=false,), policy=nothing, on_action=nothing)
+    constant isa NamedTuple && hasproperty(constant, :enabled) ||
+        throw(ArgumentError("constant options must include enabled"))
+    constant.enabled isa Bool ||
+        throw(ArgumentError("constant.enabled must be Bool"))
+    if constant.enabled
+        hasproperty(constant, :strategy) && hasproperty(constant, :budget) ||
+            throw(ArgumentError("enabled constant search requires strategy and budget"))
+        constant.strategy isa Regression.AbstractConstantSearch ||
+            throw(ArgumentError("constant.strategy must implement AbstractConstantSearch"))
+        constant.budget isa Regression.ConstantSearchBudget ||
+            throw(ArgumentError("constant.budget must be ConstantSearchBudget"))
+    end
     if policy isa StructurePolicy && policy.describe isa _StructureClassifier && scalar.enabled
         get(scalar, :named_input_policy, :used) === policy.describe.boundary_policy.named_input_policy ||
             throw(ArgumentError("descriptor and scalar action named-input policies must match"))
@@ -630,7 +987,8 @@ function run_continuous_search!(state::AgeSearchState; rng::AbstractRNG,
         throw(ArgumentError("source_exploration_probability must lie in [0,1]"))
     config.outer_weight > 0 || throw(ArgumentError("outer exploration weight must be positive"))
     all(w -> isfinite(w) && w >= 0,
-        (config.outer_weight, config.typed_weight, config.scalar_weight)) ||
+        (config.outer_weight, config.typed_weight, config.scalar_weight,
+            config.constant_weight)) ||
         throw(ArgumentError("action weights must be finite and nonnegative"))
     kinds = Symbol[:outer]
     weights = Float64[config.outer_weight]
@@ -638,16 +996,27 @@ function run_continuous_search!(state::AgeSearchState; rng::AbstractRNG,
         (push!(kinds, :typed); push!(weights, config.typed_weight))
     scalar.enabled && config.scalar_weight > 0 &&
         (push!(kinds, :scalar); push!(weights, config.scalar_weight))
+    constant.enabled && config.constant_weight > 0 &&
+        (push!(kinds, :constant); push!(weights, config.constant_weight))
     # Deterministic weighted deficit scheduling gives positive-weight outer
     # exploration opportunities without a stochastic starvation interval.
+    scalar_config = scalar.enabled ? _scalar_config(scalar) : nothing
+    session_options = _continuous_session_options(scalar, scalar_config)
     deficits = zeros(length(kinds))
     _seed_structure_policy!(policy, state)
-    scalar_config = scalar.enabled ? _scalar_config(scalar) : nothing
-    typed_counts, scalar_counts = ObjectiveCounts(), ObjectiveCounts()
+    active_session = nothing
+    sessions_started = 0
+    sessions_completed = 0
+    termination = :max_actions
+    typed_counts, scalar_counts, constant_counts =
+        ObjectiveCounts(), ObjectiveCounts(), ObjectiveCounts()
     ledger = NamedTuple[]
     started = time_ns()
     for action in 1:config.max_actions
-        (time_ns() - started) / 1e9 >= config.max_seconds && break
+        if (time_ns() - started) / 1e9 >= config.max_seconds
+            termination = :max_seconds
+            break
+        end
         deficits .+= weights
         selected = argmax(deficits)
         deficits[selected] -= sum(weights)
@@ -661,13 +1030,58 @@ function run_continuous_search!(state::AgeSearchState; rng::AbstractRNG,
         refused = false
         refusals = NamedTuple[]
         local_calls = 0
-        before_objectives = state.counters.objective_calls + typed_counts.calls + scalar_counts.calls
+        before_objectives = state.counters.objective_calls + typed_counts.calls +
+            scalar_counts.calls + constant_counts.calls
         if kind === :outer
             report = advance_age_search!(state;
                 max_attempts=Int(outer.attempts), max_evaluations=Int(outer.evaluations), policy)
             refused = report isa Err
+        elseif kind === :constant
+            source_filter = get(constant, :source_filter, nothing)
+            source = _continuous_source(state, policy, rng,
+                config.source_exploration_probability;
+                eligible=record -> _constant_source_eligible(record, source_filter))
+            if source === nothing
+                refused = true
+                reason = if source_filter === nothing
+                    :no_numeric_blocks
+                else
+                    :no_eligible_constant_source
+                end
+                refusals = [(; reason)]
+                report = (; status=:refused, reason,
+                    constant_calls=0, constant_stats=nothing)
+            else
+                source_id = source.id
+                before_calls = constant_counts.calls
+                result = Regression.search_constants(constant.strategy,
+                    source.program,
+                    program -> score_candidate!(constant_counts, program,
+                        state.reg, state.data);
+                    rng,
+                    budget=constant.budget)
+                local_calls = constant_counts.calls - before_calls
+                refused = result.status in (:ineligible, :invalid_source)
+                refused && push!(refusals, (; reason=result.status))
+                _credit_development!(policy, state, source, local_calls,
+                    (time_ns() - action_started) / 1e9, refused)
+                report = (; status=result.status, loss=result.loss,
+                    constant_calls=local_calls, constant_stats=result.stats)
+                if result.status === :improved
+                    returned = 1
+                    migration = inject_age_migrants!(state,
+                        [AgeSearchMigration(result.program, (source.id,))];
+                        population=mod1(action, length(state.populations)),
+                        max_migrants=config.max_migrants, policy)
+                    incoming = migration.accepted
+                    report = merge(report, (; migration))
+                end
+            end
         else
-            source = _continuous_source(state, policy, rng, config.source_exploration_probability)
+            retained = kind === :scalar && session_options !== nothing
+            continuing = retained && active_session !== nothing
+            source = continuing ? active_session.source :
+                _continuous_source(state, policy, rng, config.source_exploration_probability)
             if source === nothing
                 refused = true
             else
@@ -675,16 +1089,46 @@ function run_continuous_search!(state::AgeSearchState; rng::AbstractRNG,
                 counts = kind === :typed ? typed_counts : scalar_counts
                 before_calls = counts.calls
                 options = kind === :typed ? typed : scalar
-                local_result = _continuous_local(state, source, kind, options,
-                    outer, counts, rng, config.path_attempts, scalar_config)
+                local_result = if continuing
+                    (; result=active_session.session, path=copy(active_session.path),
+                        refusals=NamedTuple[])
+                else
+                    _continuous_local(state, source, kind, options,
+                        outer, counts, rng, config.path_attempts, scalar_config;
+                        session_options=retained ? session_options : nothing)
+                end
                 path, refusals = local_result.path, local_result.refusals
+                result = local_result.result
+                session_report = nothing
+                if retained && result !== nothing
+                    previous = continuing ?
+                        Regression.scalar_region_progress(result).cumulative : _EMPTY_SESSION_COUNTS
+                    if !continuing
+                        sessions_started += 1
+                        active_session = (; session=result, source, path=copy(path),
+                            id=sessions_started)
+                    end
+                    Regression.advance_scalar_region!(result;
+                        max_rounds=session_options.rounds_per_action)
+                    session_report = _continuous_session_summary(active_session, previous;
+                        event=continuing ? :resumed : :started)
+                    result = Regression.scalar_region_result(result)
+                    if session_report.completed
+                        sessions_completed += 1
+                        active_session = nothing
+                    end
+                end
                 local_calls = counts.calls - before_calls
-                refused = local_result.result === nothing
+                refused = result === nothing || result isa Err
                 _credit_development!(policy, state, source, local_calls,
                     (time_ns() - action_started) / 1e9, refused)
+                if result !== nothing
+                    report = _refinement_summary(result)
+                    session_report === nothing || (report = merge(report, (; session=session_report)))
+                    result isa Err && push!(refusals, (; path=copy(path), reason=report.reason))
+                end
                 if !refused
-                    report = _refinement_summary(local_result.result)
-                    candidates = local_result.result.candidates
+                    candidates = result.candidates
                     returned = length(candidates)
                     migration = inject_age_migrants!(state,
                         [AgeSearchMigration(c.program, (source.id,)) for c in candidates];
@@ -699,13 +1143,20 @@ function run_continuous_search!(state::AgeSearchState; rng::AbstractRNG,
         entry = (; action, kind, source_id, path, returned, incoming, refused,
             refusals, development_objective_calls=local_calls,
             objective_calls=state.counters.objective_calls + typed_counts.calls +
-                scalar_counts.calls - before_objectives, report,
+                scalar_counts.calls + constant_counts.calls - before_objectives, report,
             elapsed_seconds=(time_ns() - action_started) / 1e9,
             best_loss=state.best === nothing ? Inf : state.best.loss)
         push!(ledger, entry)
         on_action === nothing || on_action(entry)
     end
+    unfinished = active_session === nothing ? nothing : merge(
+        _continuous_session_summary(active_session,
+            Regression.scalar_region_progress(active_session.session).cumulative;
+            event=:run_end), (; status=:discarded_at_run_end))
     return (; state, best=state.best, ledger, structure=structure_snapshot(policy),
-        counts=(; outer=state.counters, typed=typed_counts, scalar=scalar_counts),
+        termination,
+        scalar_sessions=(; started=sessions_started, completed=sessions_completed, unfinished),
+        counts=(; outer=state.counters, typed=typed_counts, scalar=scalar_counts,
+            constant=constant_counts),
         elapsed_seconds=(time_ns() - started) / 1e9)
 end

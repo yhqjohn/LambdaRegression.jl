@@ -8,6 +8,8 @@ classified counters; they never overwrite the source individual.
 """
 abstract type AbstractConstantSearch end
 
+using ..Programs: numeric_parameter_blocks
+
 """Finite proposal and objective-evaluation budget for one constant search."""
 struct ConstantSearchBudget
     max_proposals::Int
@@ -48,7 +50,10 @@ struct ConstantSearchResult
 end
 
 """
-Gaussian search over scalar and dense real-tensor parameter blocks.
+Gaussian search over scalar and dense/nested real-tensor parameter blocks.
+Admission is shared with structural observation through `Programs`' numerical
+schema. Updates retain layout/type/shape; updating one symbol can split an
+alias with another symbol. Published children must be reclassified.
 
 Tensor modes are sampled uniformly from `tensor_modes`. The default is
 structured and excludes elementwise full-rank noise; callers may explicitly
@@ -78,27 +83,6 @@ GaussianConstantSearch(;
     σ::Real=0.1,
     tensor_modes::Tuple{Vararg{Symbol}}=(:global_bias, :global_scale, :rank1, :sparse),
 ) = GaussianConstantSearch(σ, tensor_modes)
-
-function _float_tensor_ty(ty::Ty)
-    current = ty
-    current isa TyArray || return false
-    while current isa TyArray
-        current = current.elem
-    end
-    return current == FloatTy
-end
-
-function _tensor_type_shape(ty::Ty)
-    dims = Int[]
-    current = ty
-    while current isa TyArray
-        current.len isa TyNat || return nothing
-        push!(dims, current.len.value)
-        current = current.elem
-    end
-    current == FloatTy || return nothing
-    return Tuple(dims)
-end
 
 function _runtime_tensor_shape(value)
     if value isa AbstractArray{<:AbstractFloat}
@@ -165,25 +149,6 @@ end
 function _restore_tensor(template, dense)
     destination = deepcopy(template)
     return _copy_dense_to_tensor!(destination, dense)
-end
-
-function _constant_blocks(individual::Program)
-    blocks = Pair{Symbol,Symbol}[]
-    for name in keys(individual.local_consts)
-        haskey(individual.local_consts_ty, name) || continue
-        value = individual.local_consts[name]
-        ty = TypeSystem.prune(individual.local_consts_ty[name])
-        if value isa AbstractFloat && ty == FloatTy
-            push!(blocks, name => :scalar)
-        elseif value isa AbstractArray && ty isa Ty && _float_tensor_ty(ty)
-            runtime_shape = _runtime_tensor_shape(value)
-            runtime_shape === nothing && continue
-            runtime_shape == _tensor_type_shape(ty) || continue
-            push!(blocks, name => :tensor)
-        end
-    end
-    sort!(blocks; by=block -> String(first(block)))
-    return blocks
 end
 
 function _rank1_gaussian(rng::AbstractRNG, value::AbstractArray{T}, σ::Float64) where {T<:AbstractFloat}
@@ -264,7 +229,7 @@ function search_constants(
     rng::AbstractRNG,
     budget::ConstantSearchBudget=ConstantSearchBudget(),
 )
-    blocks = _constant_blocks(individual)
+    blocks = numeric_parameter_blocks(individual)
     if isempty(blocks)
         return ConstantSearchResult(
             individual,

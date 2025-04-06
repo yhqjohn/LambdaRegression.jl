@@ -323,12 +323,10 @@ function scalar_region_index(
         seeds[occurrence] = seed
         seed === nothing && continue
 
-        binder_ports = _visible_float_ports!(
-            binder_cache, analysis, index.env_head[occurrence])
-        has_binder_port = !isempty(binder_ports)
-        has_named_port = named_input_policy === :declared ? !isempty(named_ports) :
-            any(key -> key > named_base, used[occurrence])
-        admissible[occurrence] = has_binder_port || has_named_port
+        # A supported constant-only seed is a valid zero-input scalar region.
+        # Port leaves already carry their dependency in `used`; they are still
+        # projected and checked when facts are requested.
+        admissible[occurrence] = true
     end
 
     return ScalarRegionIndex(
@@ -418,14 +416,6 @@ function _has_supported_seed(index::ScalarRegionIndex, occurrence::Int)
     return 1 <= occurrence <= length(index.seeds) && index.seeds[occurrence] !== nothing
 end
 
-function _available_port_count(index::ScalarRegionIndex, occurrence::Int)
-    1 <= occurrence <= length(index.seeds) || return 0
-    binder_count = length(_binder_ports(index, occurrence))
-    return binder_count + (index.named_input_policy === :declared ?
-        length(index.named_ports) : Base.count(key -> key > length(index.analysis.index.bindings),
-            index.used_keys[occurrence]))
-end
-
 @testitem "scalar-region facts preserve typed admission and ordered ports" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs:
@@ -482,7 +472,7 @@ end
     using LambdaRegression.ProgramAnalysis: analyze_program
     using LambdaRegression.Regression: ScalarRegion, prepare_scalar_region
     using LambdaRegression.ScalarRegions: scalar_region_index, is_scalar_region,
-        scalar_region_facts
+        scalar_region_facts, instantiate_scalar_expression
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, get_type
 
     add(left, right) = AppNode(AppNode(ConstNode(:FADD), left), right)
@@ -515,8 +505,19 @@ end
         type_context=context, input_types=inputs)
     declared_index = scalar_region_index(constant, constant_analysis;
         type_context=context, input_types=inputs, named_input_policy=:declared)
-    @test !is_scalar_region(default_index, 1)
-    @test scalar_region_facts(default_index, 1) === nothing
+    @test is_scalar_region(default_index, 1)
+    default_facts = scalar_region_facts(default_index, 1)
+    @test default_facts !== nothing
+    @test isempty(default_facts.available_ports)
+    @test isempty(default_facts.used_port_ids)
+    @test instantiate_scalar_expression(default_facts) isa
+        LambdaRegression.ScalarSearch._ScalarConstant
+    default_prepared = prepare_scalar_region(
+        constant, FloatTy, context, Int[]; input_types=inputs)
+    @test default_prepared isa ScalarRegion
+    @test isempty(default_prepared.dependencies)
+    @test isempty(default_prepared.named_dependencies)
+    @test default_prepared.expr isa LambdaRegression.ScalarSearch._ScalarConstant
     declared = scalar_region_facts(declared_index, 1)
     @test declared !== nothing
     @test [port.name for port in declared.available_ports] == [:u, :unused]

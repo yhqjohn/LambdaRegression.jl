@@ -86,8 +86,9 @@ Configuration for bounded real scalar population search. The search anchors on
 the supplied feature count, uses caller-owned randomness, and stops before
 scoring more than `max_evaluations` candidates. Expected domain failures count
 as invalid evaluations. Constant-polishing objective calls have an independent
-hard budget and are reported separately; shallow finite-difference BFGS is the
-default, with Nelder–Mead retained as an explicit option. `parsimony_coefficient`
+hard budget and are reported separately; BFGS uses Optim's BackTracking line
+search with central finite differences, with Nelder–Mead retained as an
+explicit option. `parsimony_coefficient`
 affects tournament and elite ordering without changing the reported raw MSE,
 while complexity-balanced tournament sampling controls which size classes get
 to compete. The loss-complexity archive is observational and supports held-out
@@ -98,6 +99,12 @@ it uses the same feature matrix, operator world, budgets, and expected-domain
 failure classification, but interprets a reported generation as one completed
 annealing/search cycle rather than one offspring proposal. Unsupported strategy
 names and malformed operator worlds are rejected before search starts.
+For regularized search, `constant_refinement_timing` chooses between the
+existing probabilistic cycle-end polishing and probabilistic pre-admission
+polishing of scored offspring. `max_total_evaluations`, when set, caps the sum
+of structural and constant-refinement objective calls; multi-island sessions
+split that cap across islands. Per-island baseline callbacks are reported
+separately and are excluded from the cap.
 Malformed configuration is rejected immediately.
 """
 struct ScalarSearchConfig
@@ -120,7 +127,9 @@ struct ScalarSearchConfig
     constant_refinement_interval::Int
     constant_refinement_start_generation::Int
     constant_refinement_probability::Float64
+    constant_refinement_timing::Symbol
     max_constant_refinement_evaluations::Int
+    max_total_evaluations::Union{Nothing,Int}
     constant_refinement_optimizer::Symbol
     parsimony_coefficient::Float64
     initial_pool_multiplier::Int
@@ -148,7 +157,9 @@ function ScalarSearchConfig(;
         constant_refinement_interval::Int=25,
         constant_refinement_start_generation::Int=25,
         constant_refinement_probability::Real=0.0,
+        constant_refinement_timing::Symbol=:cycle,
         max_constant_refinement_evaluations::Int=max(0, max_evaluations ÷ 5),
+        max_total_evaluations::Union{Nothing,Int}=nothing,
         constant_refinement_optimizer::Symbol=:bfgs,
         parsimony_coefficient::Real=1.0e-4,
         initial_pool_multiplier::Int=4,
@@ -194,6 +205,9 @@ function ScalarSearchConfig(;
         throw(ArgumentError("constant_refinement_probability must be in [0, 1]"))
     max_constant_refinement_evaluations >= 0 ||
         throw(ArgumentError("max_constant_refinement_evaluations cannot be negative"))
+    constant_refinement_timing in (:cycle, :offspring) ||
+        throw(ArgumentError(
+            "constant_refinement_timing must be :cycle or :offspring"))
     constant_refinement_optimizer in (:bfgs, :nelder_mead) ||
         throw(ArgumentError(
             "constant_refinement_optimizer must be :bfgs or :nelder_mead"))
@@ -203,6 +217,15 @@ function ScalarSearchConfig(;
         throw(ArgumentError("initial_pool_multiplier must be positive"))
     evolution_strategy in (:generational, :regularized) || throw(ArgumentError(
         "evolution_strategy must be :generational or :regularized"))
+    if evolution_strategy === :generational
+        constant_refinement_timing === :cycle || throw(ArgumentError(
+            "constant_refinement_timing=:offspring requires evolution_strategy=:regularized"))
+        max_total_evaluations === nothing || throw(ArgumentError(
+            "max_total_evaluations requires evolution_strategy=:regularized"))
+    end
+    max_total_evaluations === nothing || max_total_evaluations >= population_size ||
+        throw(ArgumentError(
+            "max_total_evaluations must cover the initial population"))
     return ScalarSearchConfig(
         population_size,
         max_evaluations,
@@ -223,7 +246,9 @@ function ScalarSearchConfig(;
         constant_refinement_interval,
         constant_refinement_start_generation,
         Float64(constant_refinement_probability),
+        constant_refinement_timing,
         max_constant_refinement_evaluations,
+        max_total_evaluations,
         constant_refinement_optimizer,
         Float64(parsimony_coefficient),
         initial_pool_multiplier,
@@ -266,6 +291,8 @@ _selection_key(candidate::_ScalarCandidate, config::ScalarSearchConfig) = (
 )
 
 function _random_leaf(rng::AbstractRNG, feature_count::Int, config::ScalarSearchConfig)
+    feature_count == 0 &&
+        return scalar_constant(randn(rng) * config.constant_scale)
     if rand(rng) < config.constant_probability
         return scalar_constant(randn(rng) * config.constant_scale)
     end
@@ -669,6 +696,10 @@ end
 
 _constant_paths(expr::ScalarExpr) = _constant_paths!(Tuple{Vararg{Int}}[], expr)
 
+# Resource exhaustion is not an objective value; only our optimizer boundary
+# catches this signal. Callback and numerical-programming errors still propagate.
+struct _ConstantRefinementBudgetExhausted <: Exception end
+
 function _refine_constants(expr::ScalarExpr, loss::Float64, score_expression,
         config::ScalarSearchConfig, max_evaluations::Int)
     paths = _constant_paths(expr)
@@ -683,6 +714,9 @@ function _refine_constants(expr::ScalarExpr, loss::Float64, score_expression,
     end
     evaluations = Ref(0)
     invalid_evaluations = Ref(0)
+    best_expr = Ref(expr)
+    best_loss = Ref(loss)
+    best_trial_valid = Ref(false)
     function rebuild(values)
         candidate = expr
         for (path, value) in zip(paths, values)
@@ -692,36 +726,49 @@ function _refine_constants(expr::ScalarExpr, loss::Float64, score_expression,
         return candidate
     end
     function objective(values)
-        evaluations[] >= max_evaluations && return Inf
+        evaluations[] >= max_evaluations &&
+            throw(_ConstantRefinementBudgetExhausted())
         candidate = rebuild(values)
         candidate === nothing && return Inf
         candidate_loss, invalid = score_expression(candidate)
         evaluations[] += 1
         invalid_evaluations[] += invalid
-        return candidate_loss
+        if !invalid && isfinite(candidate_loss) &&
+                (!best_trial_valid[] || candidate_loss < best_loss[])
+            best_expr[] = candidate
+            best_loss[] = candidate_loss
+            best_trial_valid[] = true
+        end
+        return !invalid && isfinite(candidate_loss) ? candidate_loss : Inf
     end
     options = Optim.Options(
         iterations=config.constant_refinement_iterations,
         show_trace=false,
         store_trace=false,
     )
-    result = if config.constant_refinement_optimizer === :bfgs
-        Optim.optimize(
-            objective,
-            initial,
-            Optim.BFGS(),
-            options;
-            autodiff=Optim.ADTypes.AutoFiniteDiff(),
-        )
-    else
-        Optim.optimize(objective, initial, Optim.NelderMead(), options)
+    function optimize_from(start)
+        if config.constant_refinement_optimizer === :bfgs
+            method = Optim.BFGS(linesearch=Optim.LineSearches.BackTracking())
+            Optim.optimize(
+                objective,
+                start,
+                method,
+                options;
+                autodiff=Optim.ADTypes.AutoFiniteDiff(fdtype=Val(:central)),
+            )
+        else
+            Optim.optimize(objective, start, Optim.NelderMead(), options)
+        end
     end
-    refined_loss = Optim.minimum(result)
-    refined_expr = rebuild(Optim.minimizer(result))
-    if refined_expr === nothing || !(refined_loss < loss)
-        return (expr, loss, evaluations[], invalid_evaluations[])
+    try
+        optimize_from(initial)
+    catch exception
+        exception isa _ConstantRefinementBudgetExhausted || rethrow()
     end
-    return (refined_expr, refined_loss, evaluations[], invalid_evaluations[])
+    if best_trial_valid[] && best_loss[] < loss
+        return (best_expr[], best_loss[], evaluations[], invalid_evaluations[])
+    end
+    return (expr, loss, evaluations[], invalid_evaluations[])
 end
 
 function _complexity_buckets(population)
@@ -752,8 +799,9 @@ end
                   stop_loss=1e-12) -> ScalarSearchResult
 
 Run a bounded multi-generation scalar genetic search on `features × samples`
-data. Initial populations may be supplied for calibration or scaffold reuse;
-callers may leave them unset. Candidate evaluation attempts,
+data. A zero-row feature matrix defines a constant-only search domain. Initial
+populations may be supplied for calibration or scaffold reuse; callers
+may leave them unset. Candidate evaluation attempts,
 including domain failures, consume the evaluation budget. A contextual
 `objective(expr)` may replace row-wise MSE for fixed-scaffold/mystery tasks; it
 must return a finite real loss or `Err`, and is also used by constant refinement.
@@ -767,7 +815,6 @@ function search_scalar(X::AbstractMatrix{<:Real}, y::AbstractVector{<:Real};
         objective=nothing,
         stop_loss::Union{Nothing,Real}=1.0e-12)
     feature_count = size(X, 1)
-    feature_count >= 1 || throw(ArgumentError("scalar search requires at least one feature"))
     size(X, 2) == length(y) || throw(DimensionMismatch("target length must match samples"))
     isempty(y) && throw(ArgumentError("scalar search requires at least one sample"))
     all(isfinite, X) || throw(ArgumentError("scalar search inputs must be finite"))
@@ -781,6 +828,9 @@ function search_scalar(X::AbstractMatrix{<:Real}, y::AbstractVector{<:Real};
             throw(ArgumentError("initial_population must contain ScalarExpr values"))
         all(expr -> scalar_complexity(expr) <= config.max_complexity, initial_population) ||
             throw(ArgumentError("initial_population exceeds max_complexity"))
+        all(expr -> _required_features(expr) <= feature_count,
+            initial_population) || throw(ArgumentError(
+                "initial_population references a feature outside the input matrix"))
     end
 
     if config.evolution_strategy === :regularized
@@ -998,7 +1048,6 @@ function search_scalar(X::AbstractMatrix{<:Real}, y::AbstractVector{<:Real};
         end
     end
     termination = should_stop() ? :solved : :evaluation_cap
-    best_expr = _simplify_scalar(best_expr)
     report_candidates = copy(population)
     push!(report_candidates, _ScalarCandidate(best_expr, best_loss, 0, true))
     sort!(report_candidates; by=_candidate_key)
@@ -1074,4 +1123,97 @@ function search_scalar(X::AbstractMatrix{<:Real}, y::AbstractVector{<:Real};
         complexity_archive,
         variation,
     )
+end
+
+@testitem "scalar backends support zero-input matrices and check supplied feature ids" begin
+    using Test
+    using Random: MersenneTwister
+    using LambdaRegression.ScalarSearch
+
+    Xzero = zeros(Float64, 0, 3)
+    yzero = fill(2.0, 3)
+    Xpositive = reshape(Float64[-1.0, 0.0, 1.0], 1, :)
+    ypositive = vec(Xpositive)
+    for strategy in (:generational, :regularized)
+        config = ScalarSearchConfig(
+            population_size=2,
+            max_evaluations=2,
+            max_complexity=4,
+            initial_depth=1,
+            tournament_size=1,
+            elite_count=1,
+            unary_operators=(:square,),
+            binary_operators=(:+,),
+            constant_probability=0.0,
+            constant_refinement_iterations=0,
+            evolution_strategy=strategy,
+        )
+        zero_result = search_scalar(Xzero, yzero; config,
+            rng=MersenneTwister(42),
+            initial_population=[scalar_constant(0.5)], stop_loss=nothing)
+        @test zero_result isa ScalarSearchResult
+        @test zero_result.evaluations <= config.max_evaluations
+        @test isfinite(zero_result.best_loss)
+        @test ScalarSearch._required_features(zero_result.best) == 0
+        @test_throws ArgumentError search_scalar(Xzero, yzero; config,
+            rng=MersenneTwister(42),
+            initial_population=[scalar_input(1)], stop_loss=nothing)
+
+        positive_result = search_scalar(Xpositive, ypositive; config,
+            rng=MersenneTwister(42),
+            initial_population=[scalar_input(1)], stop_loss=nothing)
+        @test isfinite(positive_result.best_loss)
+        @test positive_result.best_loss <= 1.0e-12
+        @test ScalarSearch._required_features(positive_result.best) <= 1
+    end
+end
+
+@testitem "scalar constant refinement stops cleanly at budget boundary" begin
+    using Test
+    using LambdaRegression.ScalarSearch
+
+    config = ScalarSearchConfig(constant_refinement_iterations=24,
+        constant_refinement_optimizer=:bfgs)
+    source = ScalarSearch.scalar_constant(0.0)
+    score_calls = Ref(0)
+    seen_losses = Float64[]
+    score = expr -> begin
+        score_calls[] += 1
+        score_loss = (expr.value - 2.0)^2
+        push!(seen_losses, score_loss)
+        return (score_loss, false)
+    end
+
+    cap_one, loss_one, evals_one, invalid_one =
+        ScalarSearch._refine_constants(source, 4.0, score, config, 1)
+    @test cap_one === source
+    @test loss_one == 4.0
+    @test evals_one == score_calls[] == 1
+    @test invalid_one == 0
+
+    score_calls[] = 0
+    empty!(seen_losses)
+    cap_three, loss_three, evals_three, invalid_three =
+        ScalarSearch._refine_constants(source, 4.0, score, config, 3)
+    @test loss_three == min(4.0, minimum(seen_losses))
+    @test (cap_three.value - 2.0)^2 == loss_three
+    @test evals_three == score_calls[] <= 3
+    @test invalid_three == 0
+
+    empty!(seen_losses)
+    improved, improved_loss, _, _ =
+        ScalarSearch._refine_constants(source, 4.0, score, config, 16)
+    @test improved_loss < 4.0
+    @test improved_loss == minimum(seen_losses)
+    @test (improved.value - 2.0)^2 == improved_loss
+
+    no_improvement = _ -> (0.0, false)
+    unchanged, unchanged_loss, _, _ = ScalarSearch._refine_constants(
+        source, 0.0, no_improvement, config, 8)
+    @test unchanged === source
+    @test unchanged_loss == 0.0
+
+    failing_score = _ -> error("scalar refinement callback failure")
+    @test_throws ErrorException ScalarSearch._refine_constants(
+        source, 4.0, failing_score, config, 3)
 end

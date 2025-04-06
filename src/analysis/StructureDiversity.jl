@@ -3,7 +3,7 @@
 
 Describe editable higher-order structure without changing a program or its score.
 `StructureWorld` fixes the analysis environment; `describe_structure` masks maximal
-admitted scalar regions and normalizes lexical binder names. Descriptions retain
+scalar regions and numerical parameter payloads, and normalizes lexical binder names. Descriptions retain
 call wiring, available hole ports, actual material use, sharing and uncertainty.
 
 ```julia
@@ -22,6 +22,7 @@ module StructureDiversity
 using TestItems
 using ..Utils: Err
 using ..Programs: Program
+using ..Programs: numeric_parameter_schema
 using ..ASTs.NodeASTs: AstNode, AppNode, AbsNode, FunctionDefNode, IndexNode,
     VarNode, ConstNode
 using ..ProgramAnalysis: TypedAnalysis, analyze_program
@@ -32,12 +33,15 @@ include("dependency_profiles.jl")
 
 export StructureWorld, StructureBoundaryPolicy, StructureKey, StructureDescription
 export StructureNode, StructureEdge, HoleDescription, CallDependency
+export ParameterDescription
 export describe_structure, bucket_counts, structural_features, feature_distance, explain_structure
 
 """
-    StructureBoundaryPolicy(; view=:scalar_masked, named_input_policy=:used)
+    StructureBoundaryPolicy(; view=:numeric_masked, named_input_policy=:used)
 
-Select maximal admitted scalar holes, or `:bindings` for an unmasked control.
+`:numeric_masked` hides maximal scalar regions (including zero-port regions)
+and local numerical parameter payloads admitted by `Programs`' shared schema.
+`:scalar_masked` hides only scalar regions; `:bindings` is an unmasked control.
 `:used` preserves the scalar editor's current named-input boundary; `:declared`
 offers every unshadowed declared Float input. Both retain all legal Float binders.
 This selects observation/edit capability, not an anchoring or generation algorithm.
@@ -46,9 +50,9 @@ Invalid policy names throw `ArgumentError`.
 struct StructureBoundaryPolicy
     view::Symbol
     named_input_policy::Symbol
-    function StructureBoundaryPolicy(; view::Symbol=:scalar_masked,
+    function StructureBoundaryPolicy(; view::Symbol=:numeric_masked,
                                       named_input_policy::Symbol=:used)
-        view in (:scalar_masked, :bindings) || throw(ArgumentError("unknown structure view"))
+        view in (:numeric_masked, :scalar_masked, :bindings) || throw(ArgumentError("unknown structure view"))
         named_input_policy in (:used, :declared) || throw(ArgumentError("unknown input policy"))
         return new(view, named_input_policy)
     end
@@ -136,6 +140,19 @@ struct HoleDescription
     available_ports::Vector{String}
     used_slots::Vector{Int}
 end
+"""A retained numerical block: values are hidden, layout/sharing remain in the key.
+
+`edit_modes` records supported material operations, not scheduled work or a
+promise of improvement. Empty tensors have no constant-value search mode.
+"""
+struct ParameterDescription
+    node::Int
+    occurrence::Int
+    slot::Int
+    kind::Symbol
+    shape::Tuple
+    edit_modes::Tuple{Vararg{Symbol}}
+end
 """Finite may-dependency annotation for a retained application spine."""
 struct CallDependency
     node::Int
@@ -149,6 +166,7 @@ struct StructureDescription
     edges::Vector{StructureEdge}
     material_edges::Vector{StructureEdge}
     holes::Vector{HoleDescription}
+    parameters::Vector{ParameterDescription}
     calls::Vector{CallDependency}
     uncertainty::Vector{Symbol}
     source_node_count::Int
@@ -184,6 +202,29 @@ function _resource_slot!(resources, slots, value)
         push!(resources, value)
         length(resources)
     end
+end
+
+# Per-description IDs encode alias topology without encoding object addresses
+# or reading dense numerical elements. Nested containers retain their layers.
+function _parameter_storage_token(io, value, arrays)
+    _token(io, typeof(value))
+    value isa AbstractFloat && return nothing
+    slot = get(arrays, value, 0)
+    if slot != 0
+        _token(io, :alias)
+        _token(io, slot)
+        return nothing
+    end
+    slot = length(arrays) + 1
+    arrays[value] = slot
+    _token(io, :array)
+    _token(io, slot)
+    _token(io, size(value))
+    value isa Array{<:AbstractFloat} && return nothing
+    for child in value
+        _parameter_storage_token(io, child, arrays)
+    end
+    return nothing
 end
 
 function _context(program, world)
@@ -225,13 +266,17 @@ function describe_structure(program::Program, world::StructureWorld;
         end
     end
     index = analysis.index
-    scalar = boundary_policy.view === :scalar_masked ? scalar_region_index(
+    scalar = boundary_policy.view !== :bindings ? scalar_region_index(
         program, analysis; type_context=context, input_types=world.input_types,
         named_input_policy=boundary_policy.named_input_policy) : nothing
     nodes = StructureNode[]
     edges = StructureEdge[]
     material_edges = StructureEdge[]
     holes = HoleDescription[]
+    parameters = ParameterDescription[]
+    parameter_slots = Dict{Symbol,Int}()
+    parameter_arrays = IdDict{Any,Int}()
+    parameter_schemas = Dict{Symbol,Any}()
     uncertainty = Symbol[]
     resources = Any[]
     resource_slots = IdDict{Any,Int}()
@@ -313,7 +358,23 @@ function describe_structure(program::Program, world::StructureWorld;
             (:unresolved_index, string(node.index))
         elseif node isa Union{ConstNode,VarNode}
             known, value = _host_value(program, world, node.name)
-            if known
+            schema = if known && boundary_policy.view === :numeric_masked &&
+                    haskey(program.local_consts, node.name)
+                get!(parameter_schemas, node.name) do
+                    numeric_parameter_schema(value, program.local_consts_ty[node.name])
+                end
+            else
+                nothing
+            end
+            if schema !== nothing
+                slot = get!(parameter_slots, node.name, length(parameter_slots) + 1)
+                _token(io, schema.kind)
+                _token(io, schema.shape)
+                _parameter_storage_token(io, value, parameter_arrays)
+                push!(parameters, ParameterDescription(id, occurrence, slot,
+                    schema.kind, schema.shape, schema.edit_modes))
+                (:parameter, string(slot))
+            elseif known
                 (:resource, string(_resource_slot!(resources, resource_slots, value)))
             elseif haskey(world.input_types, node.name)
                 (:input, string(node.name))
@@ -419,9 +480,9 @@ function describe_structure(program::Program, world::StructureWorld;
         summary.callee_dependency && push!(edges,
             StructureEdge(retained.id, head, :callee_dependency, 0))
     end
-    key = StructureKey(boundary_policy.view, 1, boundary_policy.named_input_policy,
+    key = StructureKey(boundary_policy.view, 2, boundary_policy.named_input_policy,
         world.anchor, String(take!(io)), resources)
-    return StructureDescription(key, nodes, edges, material_edges, holes, calls,
+    return StructureDescription(key, nodes, edges, material_edges, holes, parameters, calls,
         sort!(unique!(uncertainty); by=String), length(index))
 end
 
@@ -475,6 +536,11 @@ function explain_structure(io::IO, description::StructureDescription)
     for hole in description.holes
         println(io, "  hole ", hole.node, " available=", hole.available_ports,
             " used_slots=", hole.used_slots)
+    end
+    for parameter in description.parameters
+        println(io, "  parameter ", parameter.node, " slot=", parameter.slot,
+            " kind=", parameter.kind, " shape=", parameter.shape,
+            " edit_modes=", parameter.edit_modes)
     end
     for call in description.calls
         summary = call.summary

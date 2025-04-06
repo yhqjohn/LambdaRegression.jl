@@ -75,7 +75,12 @@ _afoldl_outer(op, init, xs::AbstractArray) =
     foldl((acc, x) -> op(acc)(x), eachslice(xs; dims=1); init=init)
 AFOLDL(op) = init -> xs -> _afoldl_outer(op, init, xs)
 
-LENF(xs) = float(length(xs))
+"""
+Return the current logical array layer's length as a floating-point value.
+A dense array represents nested layers, so only its first dimension is counted;
+inner dimensions, including empty inner layers, do not change this length.
+"""
+LENF(xs) = float(size(xs, 1))
 
 FSIN(x) = sin(x)
 FCOS(x) = cos(x)
@@ -150,6 +155,32 @@ get_type(::typeof(FDIV)) = FloatOp
     matrix = [1.0 2.0; 3.0 4.0]
     @test AMAP(x -> x .+ 1)(matrix) == [2.0 3.0; 4.0 5.0]
     @test AFOLDL(acc -> row -> acc + sum(row))(0.0)(matrix) == 10.0
+end
+
+@testitem "Primitives LENF observes one logical array layer" begin
+    using Test
+    using LambdaRegression.Primitives: AMAP, AFOLDL, LENF
+
+    matrix = reshape(collect(1.0:6.0), 2, 3)
+    nested = [collect(row) for row in eachslice(matrix; dims=1)]
+    @test LENF(matrix) === 2.0
+    @test LENF(nested) === 2.0
+    @test AMAP(LENF)(matrix) == [3.0, 3.0]
+    @test AFOLDL(acc -> row -> acc + LENF(row))(0.0)(matrix) === 6.0
+    @test LENF([1.0, 2.0, 3.0]) === 3.0
+    @test LENF(Float64[]) === 0.0
+    @test LENF(zeros(2, 0)) === 2.0
+    @test LENF(zeros(0, 3)) === 0.0
+
+    tensor = reshape(collect(1.0:24.0), 2, 3, 4)
+    @test LENF(tensor) === 2.0
+    @test AMAP(AMAP(LENF))(tensor) == fill(4.0, 2, 3)
+
+    # Mapping can change inner lengths or remove a layer, but keeps the outer one.
+    @test LENF(AMAP(row -> vcat(row, row))(matrix)) === 2.0
+    @test LENF(AMAP(row -> sum(row))(matrix)) === 2.0
+    @test LENF(AMAP(row -> Float64[])(matrix)) === 2.0
+    @test LENF(AMAP(row -> vcat(row, row))(nested)) === 2.0
 end
 
 end # module Primitives

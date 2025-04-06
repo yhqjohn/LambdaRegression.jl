@@ -8,18 +8,24 @@ feature boundary, and one parsed `ScalarExpr`; it is a disposable view rather
 than a second program representation. `search_scalar_region` uses the
 existing scalar population search as a bounded session. Its low-level `X/y`
 arguments are one-column zero placeholders required by that API only; the
-contextual objective never reads them. Hot candidates path-copy only the
+contextual objective never reads them, but the backend uses `mean(y)=0` to
+construct its normalization baseline, which is scored in the full context.
+`initialize_scalar_region_session` captures an owned region for the existing
+multi-island coordinator; `advance_scalar_region!` preserves its populations,
+shared frequencies and budgets between whole coordinator rounds. The caller
+must keep the captured scorer/task stable. Hot candidates path-copy only the
 changed occurrence's ancestors and borrow untouched syntax read-only. Their
 type is certified from the source hole and a closed set of Float operators;
 only final `Program` publication makes a deep, independently owned copy.
 
-The first boundary admits only exact `Float` regions and finite real local
-constants. Non-floating external binders, unsupported syntax, recursive
-scalar regions, and zero-feature expressions stay on the complete typed
-program path and are returned as classified `Err` values. Operator admission
-uses recognized syntax and type signatures; it does not certify that a
-same-named host callable has the matching mathematical behavior. Candidate
-objectives evaluate the complete program in their actual execution world.
+The first boundary admits exact `Float` regions, including constant-only
+regions with no feature ports, and finite real local constants. Non-floating
+external binders, unsupported syntax, and recursive scalar regions stay on
+the complete typed program path and are returned as classified `Err` values.
+Operator admission uses recognized syntax and type signatures; it does not
+certify that a same-named host callable has the matching mathematical
+behavior. Candidate objectives evaluate the complete program in their actual
+execution world.
 """
 
 using Random: AbstractRNG, default_rng
@@ -43,6 +49,9 @@ import ..TypeSystem
 
 export ScalarRegion, ScalarRegionError
 export prepare_scalar_region, materialize_scalar_region, search_scalar_region
+export ScalarRegionSession, initialize_scalar_region_session
+export advance_scalar_region!, scalar_region_result
+export scalar_region_progress
 
 """Expected refusal at the automatic scalar-region boundary."""
 struct ScalarRegionError
@@ -242,8 +251,8 @@ all declared Float inputs in stable name order. Supplying `analysis` reuses a
 caller-owned `TypedAnalysis`; the caller must have analyzed this exact program
 tree in the same merged type world. Tree identity, target type, and whole-
 source bounds are checked, while context equivalence is a caller contract.
-Unsupported source/seed boundaries and zero-feature regions return
-`Err(ScalarRegionError(...))`.
+Unsupported source/seed boundaries return `Err(ScalarRegionError(...))`.
+Supported constant-only seeds produce regions with an empty dependency list.
 """
 function prepare_scalar_region(
     program::Program,
@@ -298,8 +307,6 @@ function prepare_scalar_region(
     if facts === nothing
         ScalarRegions._has_supported_seed(region_index, hole.occurrence) ||
             return _region_error(:unsupported_seed)
-        ScalarRegions._available_port_count(region_index, hole.occurrence) == 0 &&
-            return _region_error(:zero_features, (path=Int[path...],))
         return _region_error(:unsupported_seed)
     end
     facts.occurrence == hole.occurrence ||
@@ -651,57 +658,7 @@ function _material_entries(result, quality_entries, limit::Int)
     return _select_material_entries(entries, limit)
 end
 
-"""
-    search_scalar_region(region, score; config, rng, max_return=4,
-        material_return=0, stop_loss=nothing, search_backend=search_scalar)
-
-Run one bounded scalar-search session seeded by the ordinary parent region.
-Every structural or constant-refinement objective entrance builds a restricted
-borrowed `Program` by replacing the selected subtree and copying only its
-ancestors. Its unchanged subtrees and value payloads are read-only borrows;
-`score(program)` must be synchronous and must not mutate or retain the
-candidate. The production workflow honors this contract and prepares its
-evaluator with `copy_tree=false`. Whole enclosing semantics remain scored, so
-folds, recursion, and all other context stay in `C[e′]`. Type, binding, name,
-and tree-bound checks use the captured `TypedAnalysis` plus the finite scalar
-operator language; no full W/`prepare_source` is run per hot candidate.
-Materialisation refusals remain charged objective entrances but do not call
-`score`; `diagnostics.objective_calls` counts these entrances, not just
-successful calls through to the scorer. The backend keyword follows the
-`search_scalar(X, y; config, rng,
-initial_population, objective, stop_loss)` contract and lets a caller
-coordinator provide its persistent multi-island implementation later.
-
-The return value is `(candidates, diagnostics)`; each returned candidate has
-an independently owned `program`, `expr`, `loss`, `complexity`, and `role`.
-`role=:quality` marks entries from the best/complexity archive output;
-`role=:material` marks a bounded, deterministic coverage sample from the
-backend's exposed `leaders` projection of its final live population. The
-material limit is independent of `max_return` and does not score or consume
-search randomness. Final candidates cross the ordinary `Program` ownership
-boundary and are reported separately from structural and constant-refinement
-calls.
-"""
-function search_scalar_region(
-    region::ScalarRegion,
-    score;
-    config::ScalarSearchConfig=ScalarSearchConfig(evolution_strategy=:regularized),
-    rng::AbstractRNG=default_rng(),
-    max_return::Int=4,
-    material_return::Int=0,
-    stop_loss=nothing,
-    search_backend=search_scalar,
-)
-    max_return > 0 || throw(ArgumentError("max_return must be positive"))
-    material_return >= 0 || throw(ArgumentError("material_return cannot be negative"))
-    feature_count = length(region.dependencies)
-    feature_count > 0 || return _region_error(:zero_features, nothing)
-    valid = _validate_scalar_region(region)
-    valid === nothing || return valid
-    # ScalarSearch's ordinary matrix API is retained as a backend contract.
-    # These placeholders are never read by contextual_objective or score.
-    X = zeros(Float64, feature_count, 1)
-    y = zeros(Float64, 1)
+function _scalar_region_objective(region::ScalarRegion, score)
     objective_calls = Ref(0)
     hot_materialization_failures = Ref(0)
     function contextual_objective(expression::ScalarExpr)
@@ -718,15 +675,82 @@ function search_scalar_region(
         ))
         return value
     end
+    return (; contextual_objective, objective_calls, hot_materialization_failures)
+end
+
+"""
+    search_scalar_region(region, score; config, rng, max_return=4,
+        material_return=0, stop_loss=nothing, allow_zero_input=true,
+        search_backend=search_scalar)
+
+Run one bounded scalar-search session seeded by the ordinary parent region.
+Every structural or constant-refinement objective entrance builds a restricted
+borrowed `Program` by replacing the selected subtree and copying only its
+ancestors. Its unchanged subtrees and value payloads are read-only borrows;
+`score(program)` must be synchronous and must not mutate or retain the
+candidate. The production workflow honors this contract and prepares its
+evaluator with `copy_tree=false`. Whole enclosing semantics remain scored, so
+folds, recursion, and all other context stay in `C[e′]`. Type, binding, name,
+and tree-bound checks use the captured `TypedAnalysis` plus the finite scalar
+operator language; no full W/`prepare_source` is run per hot candidate.
+Materialisation refusals remain charged objective entrances but do not call
+`score`; `diagnostics.objective_calls` counts these entrances, not just
+successful calls through to the scorer. The backend keyword follows the
+`search_scalar(X, y; config, rng,
+initial_population, objective, stop_loss)` contract and lets a caller
+coordinator provide a multi-island backend. For state retained across calls,
+use `initialize_scalar_region_session` and `advance_scalar_region!`.
+
+The return value is `(candidates, diagnostics)`; each returned candidate has
+an independently owned `program`, `expr`, `loss`, `complexity`, and `role`.
+`role=:quality` marks entries from the best/complexity archive output;
+`role=:material` marks a bounded, deterministic coverage sample from the
+backend's exposed `leaders` projection of its final live population. The
+material limit is independent of `max_return` and does not score or consume
+search randomness. Final candidates cross the ordinary `Program` ownership
+boundary and are reported separately from structural and constant-refinement
+calls. Set `allow_zero_input=false` to disable sessions whose dependency list
+is empty. This applies to actual zero-port regions; a constant seed with
+visible ports remains eligible even when it uses none of those ports.
+"""
+function search_scalar_region(
+    region::ScalarRegion,
+    score;
+    config::ScalarSearchConfig=ScalarSearchConfig(evolution_strategy=:regularized),
+    rng::AbstractRNG=default_rng(),
+    max_return::Int=4,
+    material_return::Int=0,
+    stop_loss=nothing,
+    allow_zero_input::Bool=true,
+    search_backend=search_scalar,
+)
+    max_return > 0 || throw(ArgumentError("max_return must be positive"))
+    material_return >= 0 || throw(ArgumentError("material_return cannot be negative"))
+    feature_count = length(region.dependencies)
+    valid = _validate_scalar_region(region)
+    valid === nothing || return valid
+    feature_count == 0 && !allow_zero_input &&
+        return _region_error(:disabled_zero_input, nothing)
+    # ScalarSearch's ordinary matrix API is retained as a backend contract.
+    # These placeholders are never read by contextual_objective or score.
+    X = zeros(Float64, feature_count, 1)
+    y = zeros(Float64, 1)
+    tracked = _scalar_region_objective(region, score)
     initial = [deepcopy(region.expr)]
     result = search_backend(X, y;
         config,
         rng,
         initial_population=initial,
-        objective=contextual_objective,
+        objective=tracked.contextual_objective,
         stop_loss,
     )
     result isa Err && return result
+    return _scalar_region_result(region, result, tracked.objective_calls[],
+        tracked.hot_materialization_failures[]; max_return, material_return)
+end
+
+function _scalar_region_result(region, result, objective_calls,
+        hot_materialization_failures; max_return, material_return)
     entries = _search_entries(result, max_return)
     quality_candidates = NamedTuple[]
     boundary_rechecks = 0
@@ -787,8 +811,8 @@ function search_scalar_region(
         evaluations=structural_evaluations,
         constant_refinement_evaluations=refinement_evaluations,
         constant_refinement_invalid_evaluations=refinement_invalid,
-        objective_calls=objective_calls[],
-        hot_materialization_failures=hot_materialization_failures[],
+        objective_calls,
+        hot_materialization_failures,
         boundary_rechecks,
         boundary_failures,
         returned_quality_candidates=length(quality_candidates),
@@ -799,6 +823,164 @@ function search_scalar_region(
         backend_result=result,
     )
     return (; candidates, diagnostics)
+end
+
+"""An exclusively owned multi-island search over one fixed contextual objective.
+
+The region is copied at initialization. The score callback and any task data it
+captures must remain stable and read-only for this session's entire lifetime.
+Neither family membership nor an equal hole type permits transferring this
+state or its scores to a different context. Published programs are independent
+copies; the session continues to develop its original context.
+Use only the initialize/advance/result API. All fields are internal borrowed
+state: mutating them invalidates stored scores and is unsupported. The session
+does not fingerprint arbitrary user mutations to internal values or callbacks.
+"""
+struct ScalarRegionSession{S}
+    _region::ScalarRegion
+    _backend::S
+    _objective_calls::Base.RefValue{Int}
+    _hot_materialization_failures::Base.RefValue{Int}
+    _max_return::Int
+    _material_return::Int
+end
+
+"""
+    initialize_scalar_region_session(region, score; config, rng,
+        max_return=4, material_return=0, allow_zero_input=true,
+        stop_loss=nothing, backend_options=(;))
+
+Initialize the existing multi-island scalar coordinator once. `backend_options`
+sets coordinator options such as `island_count`, total `rounds` and migration;
+`config` supplies the lifetime structural and constant budgets. Preparation
+refusals return `Err`; invalid options and unexpected objective errors propagate.
+The callback has the same synchronous borrowed-program contract as
+`search_scalar_region`. No intermediate teacher labels are supplied.
+"""
+function initialize_scalar_region_session(region::ScalarRegion, score;
+        config::ScalarSearchConfig=ScalarSearchConfig(evolution_strategy=:regularized),
+        rng::AbstractRNG=default_rng(), max_return::Int=4,
+        material_return::Int=0, allow_zero_input::Bool=true,
+        stop_loss=nothing, backend_options::NamedTuple=(;))
+    max_return > 0 || throw(ArgumentError("max_return must be positive"))
+    material_return >= 0 || throw(ArgumentError("material_return cannot be negative"))
+    any(key -> key in (:config, :rng, :initial_population, :objective, :stop_loss),
+        keys(backend_options)) && throw(ArgumentError(
+            "backend_options cannot override the captured scalar-region contract"))
+    valid = _validate_scalar_region(region)
+    valid === nothing || return valid
+    feature_count = length(region.dependencies)
+    feature_count == 0 && !allow_zero_input &&
+        return _region_error(:disabled_zero_input, nothing)
+    owned = deepcopy(region)
+    tracked = _scalar_region_objective(owned, score)
+    backend = ScalarSearch.initialize_multi_scalar(
+        zeros(Float64, feature_count, 1), zeros(Float64, 1);
+        config, rng, initial_population=[deepcopy(owned.expr)],
+        objective=tracked.contextual_objective, stop_loss, backend_options...)
+    backend isa Err && return backend
+    return ScalarRegionSession(owned, backend, tracked.objective_calls,
+        tracked.hot_materialization_failures, max_return, material_return)
+end
+
+"""Advance at most `max_rounds` existing coordinator rounds, retaining all state.
+
+This is a work-slice limit, not a fresh evaluation budget. Returns the session;
+use `scalar_region_result` to publish detached candidates and cumulative counts.
+An unexpected objective or observer exception propagates; discard that session
+because a partially advanced round is not transactional.
+"""
+function advance_scalar_region!(session::ScalarRegionSession; max_rounds::Int=1)
+    ScalarSearch.advance_multi_scalar!(session._backend; max_rounds)
+    return session
+end
+
+"""Publish owned candidates and cumulative diagnostics without scoring or RNG draws."""
+function scalar_region_result(session::ScalarRegionSession)
+    result = ScalarSearch.multi_scalar_result(session._backend)
+    return _scalar_region_result(session._region, result, session._objective_calls[],
+        session._hot_materialization_failures[];
+        max_return=session._max_return, material_return=session._material_return)
+end
+
+"""Read cumulative coordinator progress even when no valid candidate can be published.
+Counters cover the full captured-context objective, including materialization
+refusals; they do not include later migrant rescoring in the outer population.
+"""
+scalar_region_progress(session::ScalarRegionSession) =
+    ScalarSearch.multi_scalar_progress(session._backend)
+
+@testitem "scalar region sessions retain fixed context and detached publication" begin
+    using Test
+    using Random: MersenneTwister
+    using LambdaRegression.ASTs.NodeASTs
+    using LambdaRegression.Programs: Program
+    using LambdaRegression.Regression: ScalarRegionSession, prepare_scalar_region,
+        search_scalar_region, initialize_scalar_region_session,
+        advance_scalar_region!, scalar_region_result
+    using LambdaRegression.ScalarSearch: ScalarSearchConfig, scalar_from_ast,
+        evaluate_scalar_reference, search_multi_scalar
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
+    using LambdaRegression.Utils: Err
+
+    parent = Program(AstTree(AbsNode(:x,
+        AppNode(AppNode(ConstNode(:FADD), IndexNode(0)), ConstNode(:offset))));
+        local_consts=Dict{Symbol,Any}(:offset => 2.0),
+        local_consts_ty=Dict{Symbol,TyLike}(:offset => FloatTy))
+    types = Dict{Symbol,TyLike}(
+        :FADD => TyFun(FloatTy, TyFun(FloatTy, FloatTy)))
+    region = prepare_scalar_region(parent, TyFun(FloatTy, FloatTy), types, [1, 1, 2])
+    X = reshape([-1.0, 0.0, 1.0], 1, :)
+    y = [3.0, 2.0, 3.0]
+    function scorer(trace)
+        return program -> begin
+            expression = scalar_from_ast(program.tree.root.body, AstNode[IndexNode(0)];
+                constant_values=program.local_consts)
+            expression isa Err && return expression
+            prediction = evaluate_scalar_reference(expression, X)
+            prediction isa Err && return prediction
+            push!(trace, copy(prediction))
+            sum(abs2, prediction .- y) / length(y)
+        end
+    end
+    config = ScalarSearchConfig(population_size=3, max_evaluations=24,
+        max_complexity=6, initial_depth=1, tournament_size=2, elite_count=1,
+        unary_operators=(), binary_operators=(:+,),
+        constant_refinement_iterations=0, evolution_strategy=:regularized)
+    options = (; island_count=2, rounds=3, ncycles_per_iteration=1)
+    full_trace, split_trace = Any[], Any[]
+    backend = (X, y; kwargs...) -> search_multi_scalar(X, y; kwargs..., options...)
+    full = search_scalar_region(region, scorer(full_trace); config,
+        rng=MersenneTwister(1), search_backend=backend, max_return=2, material_return=1)
+    session = initialize_scalar_region_session(region, scorer(split_trace); config,
+        rng=MersenneTwister(1), backend_options=options, max_return=2, material_return=1)
+    @test session isa ScalarRegionSession
+    @test session._region !== region
+    # The caller's old context and a published candidate cannot mutate the session.
+    region.program.local_consts[:offset] = 99.0
+    calls_before = length(split_trace)
+    initial_result = scalar_region_result(session)
+    @test length(split_trace) == calls_before
+    initial_result.candidates[1].program.local_consts[:offset] = -99.0
+    @test session._region.program.local_consts[:offset] == 2.0
+    @test advance_scalar_region!(session; max_rounds=0) === session
+    @test length(split_trace) == calls_before
+    for _ in 1:3
+        advance_scalar_region!(session)
+        scalar_region_result(session)
+    end
+    result = scalar_region_result(session)
+    @test full_trace == split_trace
+    @test result.diagnostics.objective_calls == full.diagnostics.objective_calls
+    @test result.diagnostics.backend_result.diagnostics.rounds_completed == 3
+    @test [(c.loss, c.complexity, c.role) for c in result.candidates] ==
+        [(c.loss, c.complexity, c.role) for c in full.candidates]
+    @test all(c.program.local_consts[:offset] == 2.0 for c in result.candidates)
+    calls_done = length(split_trace)
+    advance_scalar_region!(session; max_rounds=10)
+    @test length(split_trace) == calls_done
+    @test_throws ArgumentError initialize_scalar_region_session(region, scorer(Any[]);
+        config, backend_options=(objective=identity,))
 end
 
 @testitem "scalar region certificates preserve structural equality without shape specialisation" begin
@@ -1245,11 +1427,14 @@ end
     @test rand(default_rng) == rand(default_control_rng)
 end
 
-@testitem "scalar region refuses unsupported and zero-feature seeds" begin
+@testitem "scalar region refuses unsupported seeds and admits constant-only regions" begin
     using Test
+    using Random: MersenneTwister
     using LambdaRegression.ASTs.NodeASTs
     using LambdaRegression.Programs: Program
-    using LambdaRegression.Regression: ScalarRegion, prepare_scalar_region
+    using LambdaRegression.Regression:
+        ScalarRegion, prepare_scalar_region, search_scalar_region
+    using LambdaRegression.ScalarSearch: ScalarSearchConfig
     using LambdaRegression.Utils: Err
     using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
 
@@ -1264,12 +1449,15 @@ end
     constant = Program(AstTree(ConstNode(:c));
         local_consts=Dict{Symbol,Any}(:c => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy))
-    zero_region = prepare_scalar_region(constant, FloatTy, Dict{Symbol,TyLike}(), Int[])
-    @test zero_region isa Err
-    @test zero_region.value.reason == :zero_features
+    zero_region = prepare_scalar_region(
+        constant, FloatTy, Dict{Symbol,TyLike}(), Int[])
+    @test zero_region isa ScalarRegion
+    @test isempty(zero_region.dependencies)
+    @test isempty(zero_region.named_dependencies)
+    @test zero_region.expr isa LambdaRegression.ScalarSearch._ScalarConstant
 
-    # A constant seed remains eligible when a visible Float binder can supply
-    # a later mutation; only a region with no available dependency is refused.
+    # A visible Float binder remains available to mutations even when the seed
+    # itself is a constant.
     reachable = Program(AstTree(AbsNode(:x, ConstNode(:c)));
         local_consts=Dict{Symbol,Any}(:c => 1.0),
         local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy))
@@ -1277,6 +1465,94 @@ end
         reachable, target, Dict{Symbol,TyLike}(), [1])
     @test reachable_region isa ScalarRegion
     @test reachable_region.dependencies == [IndexNode(0)]
+    score_calls = Ref(0)
+    reachable_search = search_scalar_region(reachable_region, _ -> begin
+        score_calls[] += 1
+        return 1.0
+    end; config=ScalarSearchConfig(
+        population_size=2, max_evaluations=2, initial_depth=0,
+        tournament_size=1, elite_count=1,
+        constant_refinement_iterations=0, evolution_strategy=:regularized),
+        rng=MersenneTwister(2000), stop_loss=nothing,
+        allow_zero_input=false)
+    @test reachable_search isa NamedTuple
+    @test score_calls[] > 0
+end
+
+@testitem "zero-input contextual scalar search improves constants within budget" begin
+    using Test
+    using Random: MersenneTwister
+    using LambdaRegression.ASTs.NodeASTs
+    using LambdaRegression.Programs: Program
+    using LambdaRegression.Regression:
+        ScalarRegion, prepare_scalar_region, search_scalar_region
+    using LambdaRegression.ScalarSearch:
+        ScalarSearchConfig, evaluate_scalar_reference, scalar_from_ast
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
+    using LambdaRegression.Utils: Err
+
+    parent = Program(AstTree(ConstNode(:c));
+        local_consts=Dict{Symbol,Any}(:c => 1.0),
+        local_consts_ty=Dict{Symbol,TyLike}(:c => FloatTy))
+    original_tree = deepcopy(parent.tree)
+    original_constants = copy(parent.local_consts)
+    context = Dict{Symbol,TyLike}(
+        :FADD => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
+        :SQR => TyFun(FloatTy, FloatTy),
+    )
+    region = prepare_scalar_region(
+        parent, FloatTy, context, Int[])
+    @test region isa ScalarRegion
+    @test isempty(region.dependencies)
+
+    X = zeros(Float64, 0, 4)
+    y = fill(3.0, 4)
+    score = program -> begin
+        expression = scalar_from_ast(program.tree.root, AstNode[];
+            constant_values=program.local_consts)
+        expression isa Err && return Inf
+        prediction = evaluate_scalar_reference(expression, X)
+        prediction isa Err && return Inf
+        sum(abs2, prediction .- y) / length(y)
+    end
+    config = ScalarSearchConfig(
+        population_size=4,
+        max_evaluations=8,
+        max_complexity=6,
+        initial_depth=0,
+        tournament_size=2,
+        elite_count=1,
+        unary_operators=(:square,),
+        binary_operators=(:+,),
+        constant_probability=0.0,
+        constant_refinement_iterations=24,
+        constant_refinement_probability=1.0,
+        constant_refinement_start_generation=1,
+        max_constant_refinement_evaluations=16,
+        constant_refinement_optimizer=:nelder_mead,
+        initial_pool_multiplier=1,
+        evolution_strategy=:generational,
+    )
+    disabled_objective_calls = Ref(0)
+    disabled = search_scalar_region(region, _ -> begin
+        disabled_objective_calls[] += 1
+        return 0.0
+    end; config, rng=MersenneTwister(42), max_return=1,
+        stop_loss=nothing, allow_zero_input=false)
+    @test disabled isa Err
+    @test disabled.value.reason == :disabled_zero_input
+    @test disabled_objective_calls[] == 0
+
+    result = search_scalar_region(region, score; config,
+        rng=MersenneTwister(42), max_return=1, stop_loss=nothing)
+    @test result isa NamedTuple
+    @test only(result.candidates).loss < 4.0
+    @test result.diagnostics.structural_evaluations <= config.max_evaluations
+    @test result.diagnostics.refinement_evaluations > 0
+    @test result.diagnostics.refinement_evaluations <=
+        config.max_constant_refinement_evaluations
+    @test parent.tree == original_tree
+    @test parent.local_consts == original_constants
 end
 
 @testitem "scalar region score exceptions propagate" begin

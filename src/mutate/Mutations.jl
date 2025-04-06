@@ -110,7 +110,12 @@ The public knobs are intentionally small and composable:
 - `replacement_generator`: owns replacement construction. The default
   `CanonicalReplacementGenerator(include_local_consts=false)` uses
   `generate_canonical_scoped` and treats old local constants as reserved
-  context rather than preferred source heads. Implement
+  context rather than preferred source heads. Its neutral-by-default
+  `root_constant_weight` changes only direct constants at the complete tree
+  root or the output body below a leading `AbsNode` chain; ordinary subtree
+  replacements retain their supplied generation weights. A non-neutral value
+  cannot be combined with `generation_kwargs.config`, because that config owns
+  and overrides `weights`. Implement
   `generate_replacement(::MyGenerator, site, env, ctx, generation_kwargs)` to
   inject another generator, or wrap any compatible scoped callable with
   `ScopedReplacementGenerator(callable)`.
@@ -425,7 +430,8 @@ using ..ProgramAnalysis:
     UnsupportedSyntaxError,
     visible_binder_ids
 using ..Transforms: eliminate_node!, occurrence_id, repeated_nodes
-using ..CanonicalGeneration: generate_canonical_scoped, GenerationResult
+using ..CanonicalGeneration:
+    generate_canonical_scoped, GenerationResult, GenerationWeights
 using ..Programs: Program, _publish_program
 import ..ASTs.NodeASTs: apply_node!, shift_free_variables!
 using ..Programs: new_constant!, ConstSymbolFactory
@@ -1129,7 +1135,7 @@ Selection model:
 - `LetPruneMutation => 0.02`
 - `SourceBindingInsertionMutation => 0.015`
 - `cache_eligibility::Bool=false`: cache eligible site lists per mutation within
-  one `mutate_tree` call (Milestone C).
+  one `mutate_tree` call.
 
 Notes
 - Uniform selection is intentionally not the default because SR mutation operators
@@ -1339,15 +1345,39 @@ end
 PathSiteSelectionPolicy(path::AbstractVector{<:Integer}) = PathSiteSelectionPolicy(Int[path...])
 
 """
-    CanonicalReplacementGenerator()
+    CanonicalReplacementGenerator(; include_local_consts=false,
+                                  root_constant_weight=1.0)
 
 Replacement generator adapter that calls `generate_canonical_scoped` with the
-selected site's type and visible binder types.
+selected site's type and visible binder types. It requires the ordinary
+mutation context fields `global_consts_ty`, `local_consts`, and
+`local_consts_ty`; `mutate_tree` supplies these. `root_constant_weight` is
+applied only at the complete root or a path prefix that stays on the leading
+`AbsNode` body chain, so canonical generation can carry the weight through
+remaining lambdas to the output root. Non-neutral weighting with an explicit
+`generation_kwargs.config` raises `ArgumentError`, since that config owns and
+overrides the per-call weights.
 """
 struct CanonicalReplacementGenerator <: AbstractReplacementGenerator
     include_local_consts::Bool
+    root_constant_weight::Float64
 end
-CanonicalReplacementGenerator(; include_local_consts::Bool=false) = CanonicalReplacementGenerator(include_local_consts)
+
+function _checked_root_constant_weight(value::Real)
+    weight = Float64(value)
+    isfinite(weight) && weight >= 0 || throw(ArgumentError(
+        "root_constant_weight must be finite and nonnegative",
+    ))
+    return weight
+end
+
+function CanonicalReplacementGenerator(;
+    include_local_consts::Bool=false,
+    root_constant_weight::Real=1.0,
+)
+    weight = _checked_root_constant_weight(root_constant_weight)
+    return CanonicalReplacementGenerator(include_local_consts, weight)
+end
 
 """
     ScopedReplacementGenerator(generate_scoped; include_local_consts=false)
@@ -1426,6 +1456,27 @@ end
 
 site_selection_weight(::AbstractSiteSelectionPolicy, ::Site, ::MutationEnv, ::NamedTuple) = 1.0
 
+"""Whether `site` lies on the complete root's leading lambda chain.
+
+The complete-root path and every prefix following body edges of leading
+`AbsNode`s qualify. This includes intermediate lambda nodes whose bounded
+canonical generation carries root weights into its output body. Any path that
+crosses an application, RHS, callback, or `FunctionDefNode` is excluded even
+when its length happens to match binder depth.
+"""
+function _is_complete_output_root(tree::Union{Nothing,AstTree}, site::Site)
+    path = site.path
+    isempty(path) && return true
+    tree isa AstTree || return false
+    node = tree.root
+    for edge in path
+        node isa AbsNode || return false
+        edge == 1 || return false
+        node = node.body
+    end
+    return true
+end
+
 function _global_consts(ctx::NamedTuple)
     return haskey(ctx, :global_consts) ? ctx.global_consts : Dict{Symbol,Any}()
 end
@@ -1480,7 +1531,7 @@ function _replacement_generation_kwargs(
     return merge(defaults, generation_kwargs)
 end
 
-function generate_replacement(
+function _canonical_replacement_kwargs(
     generator::CanonicalReplacementGenerator,
     site::Site,
     env::MutationEnv,
@@ -1494,6 +1545,33 @@ function generate_replacement(
         ctx,
         generation_kwargs,
     )
+    if generator.root_constant_weight != 1.0 &&
+            _is_complete_output_root(env.tree, site)
+        haskey(kwargs, :config) && throw(ArgumentError(
+            "non-neutral root_constant_weight cannot be combined with generation_kwargs.config",
+        ))
+        weights = get(kwargs, :weights, GenerationWeights())
+        weights isa GenerationWeights || throw(ArgumentError(
+            "canonical replacement weights must be a GenerationWeights value",
+        ))
+        overrides = copy(weights.overrides)
+        overrides[:root_constant] = generator.root_constant_weight
+        kwargs = merge(kwargs, (; weights=GenerationWeights(
+            default=weights.default,
+            overrides=overrides,
+        )))
+    end
+    return kwargs
+end
+
+function generate_replacement(
+    generator::CanonicalReplacementGenerator,
+    site::Site,
+    env::MutationEnv,
+    ctx::NamedTuple,
+    generation_kwargs::NamedTuple,
+)
+    kwargs = _canonical_replacement_kwargs(generator, site, env, ctx, generation_kwargs)
     return generate_canonical_scoped(site.ty; kwargs...)
 end
 
@@ -1553,7 +1631,8 @@ site_weight(m::SubtreeReplacementMutation, site::Site, env::MutationEnv, ctx::Na
     site_selection_weight(m.site_selection, site, env, ctx)
 
 """
-    ParameterIntroductionMutation(; σ=1.0, site_lock, site_selection)
+    ParameterIntroductionMutation(; σ=1.0, site_lock, site_selection,
+                                  root_constant_weight=1.0)
 
 Introduce a fresh mutable real parameter at a typed expression site.
 
@@ -1565,11 +1644,16 @@ site is replaced transactionally with a new local constant, so final inference
 and bloat validation remain owned by `mutate_tree`. The default site policy
 does not penalize lexical depth: numeric sites in an ordinary function body
 must not become unreachable merely because they are enclosed by lambdas.
+`root_constant_weight` multiplies the site weight only at the complete AST root
+or a prefix of the leading `AbsNode` chain. This lets canonical generation
+carry the root factor through intermediate lambda nodes; nested body sites do
+not receive it.
 """
 struct ParameterIntroductionMutation <: AbstractMutation
     σ::Float64
     site_lock::AbstractSiteLockPolicy
     site_selection::AbstractSiteSelectionPolicy
+    root_constant_weight::Float64
 end
 
 function ParameterIntroductionMutation(;
@@ -1578,12 +1662,18 @@ function ParameterIntroductionMutation(;
     site_selection::AbstractSiteSelectionPolicy=ExponentialSiteSelectionPolicy(
         scope_bias=0.0,
     ),
+    root_constant_weight::Real=1.0,
 )
     scale = Float64(σ)
     isfinite(scale) && scale > 0 || throw(ArgumentError(
         "parameter introduction σ must be finite and positive",
     ))
-    return ParameterIntroductionMutation(scale, site_lock, site_selection)
+    return ParameterIntroductionMutation(
+        scale,
+        site_lock,
+        site_selection,
+        _checked_root_constant_weight(root_constant_weight),
+    )
 end
 
 required_site_kinds(::ParameterIntroductionMutation) = Symbol[:any]
@@ -1611,7 +1701,7 @@ function is_site_eligible(
 )
     is_site_locked(mutation.site_lock, site, env, ctx) && return false
     _real_parameter_shape(site.ty) === nothing && return false
-    return site_selection_weight(mutation.site_selection, site, env, ctx) > 0
+    return site_weight(mutation, site, env, ctx) > 0
 end
 
 site_weight(
@@ -1619,7 +1709,8 @@ site_weight(
     site::Site,
     env::MutationEnv,
     ctx::NamedTuple,
-) = site_selection_weight(mutation.site_selection, site, env, ctx)
+) = site_selection_weight(mutation.site_selection, site, env, ctx) *
+    (_is_complete_output_root(env.tree, site) ? mutation.root_constant_weight : 1.0)
 
 function apply(
     mutation::ParameterIntroductionMutation,
@@ -3221,6 +3312,88 @@ include("Population.jl")
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, ConstNode
     using LambdaRegression.Programs: ConstSymbolFactory
     using LambdaRegression.Mutations: mutate_tree, BoolConstMutation, WeightedPairChooser, IndexedProvider, MutationAttemptRecorder, mutation_recorder_summary
+end
+
+@testitem "Mutations root constant weight follows only complete leading lambda roots" setup=[MutBaseImports] begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: FunctionDefNode
+    using LambdaRegression.CanonicalGeneration: GenerationConfig, GenerationWeights
+    using LambdaRegression.Mutations:
+        AdaptivePolicy, BloatPolicy, CanonicalReplacementGenerator,
+        ExponentialSiteSelectionPolicy, MutationEnv, MutationStat,
+        ParameterIntroductionMutation, Site, _canonical_replacement_kwargs,
+        _is_complete_output_root, site_weight
+    using LambdaRegression.TypeSystem: FloatTy
+
+    body = AppNode(AppNode(ConstNode(:ADD), IndexNode(1)), IndexNode(0))
+    tree = AstTree(AbsNode(:x, AbsNode(:y, body)))
+    at(path, node) = Site(
+        Int[path...], node, nothing, 1, length(path), :any, FloatTy, TyLike[],
+    )
+    root_site = at(Int[], tree.root)
+    middle_lambda_site = at([1], tree.root.body)
+    output_site = at([1, 1], body)
+    nested_site = at([1, 1, 1], body.func)
+
+    @test _is_complete_output_root(tree, root_site)
+    @test _is_complete_output_root(tree, middle_lambda_site)
+    @test _is_complete_output_root(tree, output_site)
+    @test !_is_complete_output_root(tree, nested_site)
+
+    callback_tree = AstTree(AbsNode(:x,
+        AppNode(ConstNode(:MAP), AbsNode(:y, IndexNode(0)))))
+    @test !_is_complete_output_root(callback_tree,
+        at([1, 2], callback_tree.root.body.arg))
+    rhs_tree = AstTree(AppNode(ConstNode(:ADD), ConstNode(:rhs)))
+    @test !_is_complete_output_root(rhs_tree, at([2], rhs_tree.root.arg))
+    functiondef_tree = AstTree(AbsNode(:x,
+        FunctionDefNode(AbsNode(:f, IndexNode(0)))))
+    @test !_is_complete_output_root(functiondef_tree,
+        at([1, 1], functiondef_tree.root.body))
+
+    env = MutationEnv(
+        MersenneTwister(1), FloatTy, Dict{Symbol,TyLike}(), tree, nothing,
+        false, IdDict{Any,Any}(), AdaptivePolicy(),
+        IdDict{DataType,MutationStat}(), BloatPolicy(),
+    )
+    ctx = (
+        global_consts_ty=Dict{Symbol,TyLike}(),
+        local_consts=Dict{Symbol,Any}(),
+        local_consts_ty=Dict{Symbol,TyLike}(),
+    )
+    weights = GenerationWeights(default=2, variable=3)
+    generator = CanonicalReplacementGenerator(root_constant_weight=0.1)
+    for site in (root_site, middle_lambda_site, output_site)
+        kwargs = _canonical_replacement_kwargs(generator, site, env, ctx, (; weights))
+        @test kwargs.weights.overrides[:root_constant] == 0.1
+        @test kwargs.weights.default == 2
+        @test kwargs.weights.overrides[:variable] == 3
+    end
+    local_kwargs = _canonical_replacement_kwargs(
+        generator, nested_site, env, ctx, (; weights),
+    )
+    @test local_kwargs.weights === weights
+    @test !haskey(weights.overrides, :root_constant)
+    neutral_kwargs = _canonical_replacement_kwargs(
+        CanonicalReplacementGenerator(), root_site, env, ctx, (; weights),
+    )
+    @test neutral_kwargs.weights === weights
+    @test_throws ArgumentError _canonical_replacement_kwargs(
+        generator, root_site, env, ctx, (; config=GenerationConfig()),
+    )
+
+    policy = ExponentialSiteSelectionPolicy(
+        scope_bias=0, path_bias=0, root_weight=1,
+    )
+    parameter_mutation = ParameterIntroductionMutation(
+        site_selection=policy, root_constant_weight=0.1,
+    )
+    @test site_weight(parameter_mutation, root_site, env, ctx) == 0.1
+    @test site_weight(parameter_mutation, middle_lambda_site, env, ctx) == 0.1
+    @test site_weight(parameter_mutation, output_site, env, ctx) == 0.1
+    @test site_weight(parameter_mutation, nested_site, env, ctx) == 1.0
+    @test site_weight(ParameterIntroductionMutation(site_selection=policy),
+        root_site, env, ctx) == 1.0
 end
 
 @testitem "Mutations fresh binder names suffix once per suggestion" setup=[MutBaseImports] begin

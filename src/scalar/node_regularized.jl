@@ -109,12 +109,17 @@ end
 
 """Construct one finite node leaf from the feature and constant context.
 
-`feature_count` supplies one-based feature ids and `config` supplies the
-constant probability/scale. Invalid feature counts are rejected by the public
-search interface; generated constants are finite for the supported RNGs.
+`feature_count` supplies one-based feature ids when positive; zero selects a
+constant-only leaf. `config` supplies the constant probability/scale for the
+positive-feature case, and generated constants are finite for the supported
+RNGs.
 """
 function _node_random_leaf(rng::AbstractRNG, feature_count::Int,
         config::ScalarSearchConfig)
+    if feature_count == 0
+        return DynamicExpressions.Node(Float64;
+            val=randn(rng) * config.constant_scale)
+    end
     if rand(rng) < config.constant_probability
         return DynamicExpressions.Node(Float64;
             val=randn(rng) * config.constant_scale)
