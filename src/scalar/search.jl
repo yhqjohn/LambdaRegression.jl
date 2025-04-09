@@ -796,7 +796,7 @@ end
 """
     search_scalar(X, y; config=ScalarSearchConfig(), rng=default_rng(),
                   initial_population=nothing, objective=nothing,
-                  stop_loss=1e-12) -> ScalarSearchResult
+                  stop_loss=objective === nothing ? 1e-12 : nothing) -> ScalarSearchResult
 
 Run a bounded multi-generation scalar genetic search on `features × samples`
 data. A zero-row feature matrix defines a constant-only search domain. Initial
@@ -805,22 +805,25 @@ may leave them unset. Candidate evaluation attempts,
 including domain failures, consume the evaluation budget. A contextual
 `objective(expr)` may replace row-wise MSE for fixed-scaffold/mystery tasks; it
 must return a finite real loss or `Err`, and is also used by constant refinement.
-Pass `stop_loss=nothing` when the caller must spend the declared structural
-budget before selecting from the loss-complexity archive.
+The default objective stops at loss `1e-12`; a custom objective has no default
+stop threshold because its valid losses may be negative. Pass `stop_loss=nothing`
+when the caller must spend the declared structural budget before selecting from
+the loss-complexity archive.
 """
 function search_scalar(X::AbstractMatrix{<:Real}, y::AbstractVector{<:Real};
         config::ScalarSearchConfig=ScalarSearchConfig(),
         rng::AbstractRNG=default_rng(),
         initial_population=nothing,
         objective=nothing,
-        stop_loss::Union{Nothing,Real}=1.0e-12)
+        stop_loss::Union{Nothing,Real}=
+            objective === nothing ? 1.0e-12 : nothing)
     feature_count = size(X, 1)
     size(X, 2) == length(y) || throw(DimensionMismatch("target length must match samples"))
     isempty(y) && throw(ArgumentError("scalar search requires at least one sample"))
     all(isfinite, X) || throw(ArgumentError("scalar search inputs must be finite"))
     all(isfinite, y) || throw(ArgumentError("scalar search targets must be finite"))
-    stop_loss === nothing || (isfinite(stop_loss) && stop_loss >= 0) ||
-        throw(ArgumentError("stop_loss must be nothing or finite and nonnegative"))
+    stop_loss === nothing || isfinite(stop_loss) ||
+        throw(ArgumentError("stop_loss must be nothing or finite"))
     objective === nothing || applicable(objective, scalar_input(1)) ||
         throw(ArgumentError("objective must accept one ScalarExpr"))
     if initial_population !== nothing
@@ -887,7 +890,7 @@ function search_scalar(X::AbstractMatrix{<:Real}, y::AbstractVector{<:Real};
         value isa Err && return (Inf, true)
         value isa Real || throw(ArgumentError("objective must return a real loss or Err"))
         loss = Float64(value)
-        return isfinite(loss) && loss >= 0 ? (loss, false) : (Inf, true)
+        return isfinite(loss) ? (loss, false) : (Inf, true)
     end
 
     function score_and_record(expr, generation)
@@ -1216,4 +1219,39 @@ end
     failing_score = _ -> error("scalar refinement callback failure")
     @test_throws ErrorException ScalarSearch._refine_constants(
         source, 4.0, failing_score, config, 3)
+end
+
+@testitem "finite negative objectives and stop thresholds work on both scalar backends" begin
+    using Test
+    using Random: MersenneTwister
+    using LambdaRegression.ScalarSearch
+
+    X = zeros(Float64, 0, 2)
+    y = zeros(2)
+    initial = [scalar_constant(0.0), scalar_constant(1.0)]
+    objective = _ -> -2.0
+    for strategy in (:generational, :regularized)
+        config = ScalarSearchConfig(evolution_strategy=strategy,
+            population_size=2, max_evaluations=4, max_complexity=1,
+            initial_depth=0, tournament_size=1, elite_count=1,
+            unary_operators=(), binary_operators=(:+,), constant_probability=0.0,
+            initial_pool_multiplier=1, mutation_probability=0.0,
+            crossover_probability=0.0, constant_refinement_iterations=0,
+            max_constant_refinement_evaluations=0)
+        default_result = search_scalar(X, y; config,
+            rng=MersenneTwister(1111), initial_population=initial, objective)
+        @test default_result.best_loss == -2.0
+        @test default_result.invalid_evaluations == 0
+        @test default_result.termination != :solved
+        if strategy === :generational
+            @test default_result.evaluations == config.max_evaluations
+        end
+
+        negative_threshold = search_scalar(X, y; config,
+            rng=MersenneTwister(1111), initial_population=initial,
+            objective, stop_loss=-1.0)
+        @test negative_threshold.best_loss == -2.0
+        @test negative_threshold.termination == :solved
+        @test negative_threshold.invalid_evaluations == 0
+    end
 end

@@ -31,6 +31,19 @@ outer actions do not reset it. Cross-call resume and multicore remain extensions
 `StructurePolicy(world)` connects a stable `StructureDiversity.StructureWorld`
 directly; its scalar named-input policy must match the local scalar options.
 
+`run_joint_search!` keeps a complete-program joint population alive across
+bounded windows while the existing age search continues to explore. It imports
+each direction through the receiving engine's scorer and reports separate
+joint, outer, bridge, and total costs. The configured scalar population size
+applies per joint island; seed-program count does not create subpopulations.
+
+```julia
+joint = run_joint_search!(state; rng=MersenneTwister(1),
+    config=LambdaRegression.ScalarSearch.ScalarSearchConfig(
+        evolution_strategy=:regularized),
+    windows=4, outer=(attempts=128, evaluations=32))
+```
+
 ```julia
 world = StructureDiversity.StructureWorld(reg.components.global_consts_ty;
     values=reg.components.global_consts, input_types=reg.components.input_types,
@@ -72,6 +85,7 @@ using ..Regression: Regressor, SupervisedDataset, AgeSearchState,
 
 export run_mixed_alternation!, ObjectiveCounts, score_candidate!
 export StructurePolicy, structure_snapshot, ContinuousSearchConfig, run_continuous_search!
+export run_joint_search!
 
 mutable struct ObjectiveCounts
     calls::Int
@@ -783,6 +797,7 @@ end
 
 include("continuous.jl")
 include("continuous_session_tests.jl")
+include("joint.jl")
 
 @testitem "Mixed workflow outer-only run borrows initialized state" begin
     using Random: MersenneTwister

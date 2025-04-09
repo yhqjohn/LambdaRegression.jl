@@ -39,6 +39,10 @@ Capabilities
   `Workflows` module composes these operations for mixed phases.
 - `prepare_scalar_region` and `search_scalar_region` expose the automatic
   scalar-region entry while keeping complete ASTs authoritative.
+- `initialize_joint_search`, `advance_joint_search!`, `inject_joint_programs!`
+  and `joint_search_result` evolve complete multi-region configurations using
+  the regularized maintenance engine, atomic region exchange and complete-task
+  scalar-constant adaptation. Capacity is per task, not per hole or template.
 - Thread-safe primitives for SR paths live in `Execution.EvalContext` and
   `TypeSystem.make_tyvar_factory`.
 """
@@ -1135,6 +1139,7 @@ include("ConstantSearch.jl")
 include("TaskSchemas.jl")
 include("age_search.jl")
 include("scalar_refinement.jl")
+include("joint_search.jl")
 include("typed_refinement.jl")
 
 @testsnippet RegBaseImports begin

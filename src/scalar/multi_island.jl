@@ -359,8 +359,8 @@ function initialize_multi_scalar(
     config.evolution_strategy === :regularized || throw(ArgumentError(
         "search_multi_scalar requires evolution_strategy=:regularized"))
     stop_loss === nothing || (stop_loss isa Real &&
-        isfinite(Float64(stop_loss)) && Float64(stop_loss) >= 0) ||
-        throw(ArgumentError("stop_loss must be nothing or finite and nonnegative"))
+        isfinite(Float64(stop_loss))) ||
+        throw(ArgumentError("stop_loss must be nothing or finite"))
     objective === nothing || applicable(objective, scalar_input(1)) ||
         throw(ArgumentError("objective must accept one ScalarExpr"))
 
@@ -1224,4 +1224,30 @@ end
     @test repr(split_result) == repr(whole_result)
     @test split_log == whole_log
     @test rng_preview(split) == rng_preview(whole)
+end
+
+@testitem "multi-island accepts finite negative losses and thresholds" setup=[MultiIslandSearchImports] begin
+    config = ScalarSearchConfig(evolution_strategy=:regularized,
+        population_size=2, max_evaluations=2, max_complexity=1,
+        initial_depth=0, tournament_size=1, elite_count=1,
+        unary_operators=(), binary_operators=(:+,),
+        constant_refinement_iterations=0,
+        max_constant_refinement_evaluations=0)
+    X = zeros(Float64, 0, 2)
+    y = zeros(2)
+    initial = [scalar_constant(0.0), scalar_constant(1.0)]
+    objective = _ -> -2.0
+    make_session(; stop_loss=nothing) = initialize_multi_scalar(
+        X, y; config, rng=MersenneTwister(1111), initial_population=initial,
+        objective, stop_loss, island_count=1, rounds=1, migrant_count=0)
+
+    default_session = make_session()
+    negative_threshold_session = make_session(stop_loss=-1.0)
+    state = only(negative_threshold_session.progress.states)
+
+    @test default_session.stop_loss === nothing
+    @test negative_threshold_session.stop_loss == -1.0
+    @test state.invalid_evaluations == 0
+    @test state.best.loss == -2.0
+    @test state.loss_normalization == 2.0
 end

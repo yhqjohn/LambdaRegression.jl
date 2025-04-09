@@ -1,21 +1,19 @@
-"""Node-native steady-state search behind the existing scalar-search interface.
+"""Shared steady-state regularized search policies and scalar-domain adapters.
 
-This is the node-native loop for the internal representation change. It owns
-mutable DynamicExpressions trees and one evaluation workspace, while returning
-the established `ScalarSearchResult` with rebuildable `ScalarExpr` values. The
-public objective contract remains `ScalarExpr`-compatible; objectives that also
-accept `(ScalarExpr, node)` can reuse the owned node without converting it back.
+The scalar caller retains its established `ScalarSearchResult` and rebuildable
+`ScalarExpr` values. Internal value hooks let a domain reuse the same persistent
+population, archive, and variation lifecycle with its own complete candidate.
 """
 
-struct _NodeSearchCandidate
-    value::_NodeScalarCandidate
+struct _NodeSearchCandidate{V}
+    value::V
     loss::Float64
     serial::Int
     evolved::Bool
 end
 
-mutable struct _NodeRegularizedMember
-    candidate::_NodeSearchCandidate
+mutable struct _NodeRegularizedMember{V}
+    candidate::_NodeSearchCandidate{V}
     born::Int
 end
 
@@ -62,8 +60,9 @@ function _regularized_poisson(rng::AbstractRNG, mean::Real)
     return count - 1
 end
 
-function _node_pareto_candidates(archive::Dict{Int,_NodeSearchCandidate})
-    result = _NodeSearchCandidate[]
+function _node_pareto_candidates(archive::AbstractDict{Int,<:_NodeSearchCandidate})
+    result = collect(values(archive))
+    empty!(result)
     best_loss = Inf
     for complexity in sort!(collect(keys(archive)))
         candidate = archive[complexity]
@@ -73,6 +72,50 @@ function _node_pareto_candidates(archive::Dict{Int,_NodeSearchCandidate})
     end
     return result
 end
+
+_regularized_copy_value(::Nothing, value::_NodeScalarCandidate) =
+    _node_scalar_candidate(copy(value.node; break_sharing=Val(true)))
+
+_regularized_has_constants(::Nothing, value::_NodeScalarCandidate) =
+    !isempty(_node_constant_paths(value.node))
+
+function _regularized_refine_value(::Nothing, value::_NodeScalarCandidate,
+        loss::Real, score, config::ScalarSearchConfig, remaining::Int;
+        rng::AbstractRNG, restarts::Int=2)
+    score_node = node -> score(_NodeScalarCandidate(node, value.complexity))
+    return _node_refine_constants(value, loss, score_node, config, remaining;
+        rng, restarts)
+end
+
+function _regularized_simplify_value(::Nothing, value::_NodeScalarCandidate)
+    expr = _node_scalar_materialize(value)
+    expr isa Err && return nothing
+    simplified = _simplify_scalar(expr)
+    _same_scalar_expression(simplified, expr) && return nothing
+    return _node_scalar_candidate(simplified)
+end
+
+_regularized_sample_mutation(::Nothing, rng::AbstractRNG,
+        value::_NodeScalarCandidate, config::ScalarSearchConfig) =
+    _node_scalar_sample_mutation(rng, value, config)
+
+_regularized_crossover_pair(::Nothing, rng::AbstractRNG,
+        first::_NodeScalarCandidate, second::_NodeScalarCandidate,
+        config::ScalarSearchConfig) =
+    _node_scalar_crossover_pair(rng, first, second, config)
+
+function _regularized_named_child(::Nothing, rng::AbstractRNG,
+        first::_NodeScalarCandidate, second::_NodeScalarCandidate,
+        feature_count::Int, config::ScalarSearchConfig, kind::Symbol;
+        temperature::Real=1.0)
+    return _node_regularized_named_child(rng, first, second, feature_count,
+        config, kind; temperature)
+end
+
+_regularized_replacement_index(domain, state, parent, child) =
+    _node_oldest_index(state.population)
+
+_regularized_observe(domain, state, event, parent, child, admitted) = nothing
 
 function _node_oldest_index(population)
     best = firstindex(population)
@@ -119,8 +162,9 @@ function _node_tournament(rng, candidates, config, frequency;
         cost = _regularized_cost(candidate.loss, complexity,
             loss_normalization, config.parsimony_coefficient)
         if use_frequency_in_tournament
-            cost *= exp(adaptive_parsimony_scaling *
-                _regularized_frequency(frequency, complexity))
+            pressure = adaptive_parsimony_scaling *
+                _regularized_frequency(frequency, complexity)
+            cost *= exp(cost < 0 ? -pressure : pressure)
         end
         costs[index] = cost
     end
@@ -249,6 +293,35 @@ end
     using Test
     using Random
     using LambdaRegression.ScalarSearch
+end
+
+@testitem "frequency pressure penalizes common negative-loss candidates" setup=[NodeRegularizedSearchImports] begin
+    config = ScalarSearchConfig(population_size=2, max_evaluations=2,
+        max_complexity=2, initial_depth=0, tournament_size=2, elite_count=1,
+        unary_operators=(:sin,), binary_operators=(),
+        parsimony_coefficient=0.1, constant_refinement_iterations=0,
+        evolution_strategy=:regularized)
+    simple = ScalarSearch._node_scalar_candidate(scalar_constant(0.0))
+    larger = ScalarSearch._node_scalar_candidate(
+        scalar_unary(:sin, scalar_constant(0.0)))
+    frequency = ScalarSearch._RegularizedFrequency(10, 2)
+    frequency.normalized_frequencies .= [0.9, 0.1]
+    choose = candidates -> ScalarSearch._node_tournament(
+        MersenneTwister(1111), candidates, config, frequency;
+        loss_normalization=1.0, selection_p=1.0,
+        use_frequency_in_tournament=true, adaptive_parsimony_scaling=1.0)
+
+    negative = [
+        ScalarSearch._NodeSearchCandidate(simple, -1.0, 1, true),
+        ScalarSearch._NodeSearchCandidate(larger, -1.0, 2, true),
+    ]
+    @test choose(negative).value.complexity == 2
+
+    positive = [
+        ScalarSearch._NodeSearchCandidate(simple, 1.0, 1, true),
+        ScalarSearch._NodeSearchCandidate(larger, 1.0, 2, true),
+    ]
+    @test choose(positive).value.complexity == 2
 end
 
 @testitem "scalar reports retain scored trees under floating-point cancellation" setup=[NodeRegularizedSearchImports] begin

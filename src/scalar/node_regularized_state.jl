@@ -1,4 +1,4 @@
-"""Persistent node-native island state for SR-style multi-population flow."""
+"""Persistent regularized island state for scalar and domain-backed search."""
 
 struct _NodeRegularizedFlow
     stop_loss::Union{Nothing,Float64}
@@ -13,22 +13,23 @@ struct _NodeRegularizedFlow
     adaptive_parsimony_scaling::Float64
 end
 
-mutable struct _NodeRegularizedState{R<:AbstractRNG,F}
+mutable struct _NodeRegularizedState{R<:AbstractRNG,F,V,D}
     config::ScalarSearchConfig
     rng::R
     feature_count::Int
     score::F
     flow::_NodeRegularizedFlow
-    population::Vector{_NodeRegularizedMember}
-    archive::Dict{Int,_NodeSearchCandidate}
+    population::Vector{_NodeRegularizedMember{V}}
+    archive::Dict{Int,_NodeSearchCandidate{V}}
     frequency::_RegularizedFrequency
+    domain::D
     evaluations::Int
     invalid_evaluations::Int
     constant_refinement_evaluations::Int
     constant_refinement_invalid_evaluations::Int
     serial::Int
     birth_clock::Int
-    best::_NodeSearchCandidate
+    best::_NodeSearchCandidate{V}
     improvements::Vector{NamedTuple}
     mutation_attempts::Int
     crossover_attempts::Int
@@ -72,7 +73,7 @@ function _node_state_record!(state::_NodeRegularizedState,
 end
 
 function _node_state_score_candidate!(state::_NodeRegularizedState,
-        value::_NodeScalarCandidate, evolved::Bool, evaluation_limit::Int)
+        value, evolved::Bool, evaluation_limit::Int)
     state.evaluations >= evaluation_limit && return nothing
     _node_state_total_remaining(state) <= 0 && return nothing
     loss, invalid = state.score(value)
@@ -93,11 +94,9 @@ function _node_state_refine_candidate!(state::_NodeRegularizedState,
         _node_state_total_remaining(state),
     )
     remaining <= 0 && return candidate
-    isempty(_node_constant_paths(candidate.value.node)) && return candidate
-    complexity = candidate.value.complexity
-    refined, refined_loss, count, invalid = _node_refine_constants(
-        candidate.value, candidate.loss,
-        node -> state.score(_NodeScalarCandidate(node, complexity)),
+    _regularized_has_constants(state.domain, candidate.value) || return candidate
+    refined, refined_loss, count, invalid = _regularized_refine_value(
+        state.domain, candidate.value, candidate.loss, state.score,
         config, remaining; rng=state.rng, restarts=2)
     state.constant_refinement_evaluations += count
     state.constant_refinement_invalid_evaluations += invalid
@@ -123,6 +122,8 @@ function _node_state_refine!(state::_NodeRegularizedState,
     refined === previous && return member
     member.candidate = refined
     _node_state_record!(state, member.candidate; source=:constant_refinement)
+    _regularized_observe(state.domain, state, :constant_refinement,
+        previous, refined, true)
     return member
 end
 
@@ -141,9 +142,13 @@ function _node_state_refine_offspring!(state::_NodeRegularizedState,
     config.max_constant_refinement_evaluations -
         state.constant_refinement_evaluations > 0 || return candidate
     _node_state_total_remaining(state) > 0 || return candidate
-    isempty(_node_constant_paths(candidate.value.node)) && return candidate
+    _regularized_has_constants(state.domain, candidate.value) || return candidate
     rand(state.rng) < config.constant_refinement_probability || return candidate
-    return _node_state_refine_candidate!(state, candidate, generation, :offspring)
+    refined = _node_state_refine_candidate!(
+        state, candidate, generation, :offspring)
+    refined === candidate || _regularized_observe(state.domain, state,
+        :constant_refinement, candidate, refined, true)
+    return refined
 end
 
 function _node_state_maintain_cycle!(state::_NodeRegularizedState,
@@ -153,20 +158,26 @@ function _node_state_maintain_cycle!(state::_NodeRegularizedState,
         _regularized_cycle_temperature(max(1, state.offspring_attempts),
             state.config.population_size, state.config.tournament_size,
             state.flow.ncycles_per_iteration)[2])
-    for member in state.population
+    for member_index in eachindex(state.population)
+        member = state.population[member_index]
         state.config.max_total_evaluations !== nothing &&
             _node_state_total_remaining(state) <= 0 && return state
-        expr = _node_scalar_materialize(member.candidate.value)
-        expr isa Err && continue
-        simplified = _simplify_scalar(expr)
-        if !_same_scalar_expression(simplified, expr)
-            candidate = _node_state_score_candidate!(state,
-                _node_scalar_candidate(simplified), member.candidate.evolved,
-                evaluation_limit)
-            if candidate !== nothing && isfinite(candidate.loss)
+        simplified = _regularized_simplify_value(
+            state.domain, member.candidate.value)
+        if simplified !== nothing
+            candidate = _node_state_score_candidate!(
+                state, simplified, member.candidate.evolved, evaluation_limit)
+            if candidate !== nothing
                 _node_state_record!(state, candidate; source=:simplification)
-                candidate.loss <= member.candidate.loss &&
-                    (member.candidate = candidate)
+                parent = member.candidate
+                if isfinite(candidate.loss) && candidate.loss <= parent.loss
+                    state.population[member_index].candidate = candidate
+                    _regularized_observe(state.domain, state, :simplification,
+                        parent, candidate, true)
+                else
+                    _regularized_observe(state.domain, state, :simplification,
+                        parent, candidate, false)
+                end
             end
         end
         state.config.constant_refinement_timing === :cycle || continue
@@ -187,21 +198,22 @@ end
 """Copy one same-objective training candidate into a persistent island.
 
 The source loss is reusable only because the coordinator anchors all islands
-to the same training data/objective. The copied node receives fresh age and
+to the same training data/objective. The copied value receives fresh age and
 serial metadata. An invalid destination index fails at the vector boundary.
 """
 function _node_inject_candidate!(state::_NodeRegularizedState,
         source::_NodeSearchCandidate; destination=nothing)
     state.serial += 1
     state.birth_clock += 1
-    copied_value = _node_scalar_candidate(
-        copy(source.value.node; break_sharing=Val(true)))
+    copied_value = _regularized_copy_value(state.domain, source.value)
     copied = _NodeSearchCandidate(
         copied_value, source.loss, state.serial, true)
     index = destination === nothing ?
         rand(state.rng, eachindex(state.population)) : destination
+    parent = state.population[index].candidate
     state.population[index] = _NodeRegularizedMember(copied, state.birth_clock)
     state.hof_migrations += 1
+    _regularized_observe(state.domain, state, :migration, parent, copied, true)
     return copied
 end
 
@@ -226,6 +238,24 @@ function _node_state_accept!(state::_NodeRegularizedState,
     return rand(state.rng) < probability
 end
 
+function _node_state_replace_offspring!(state::_NodeRegularizedState,
+        parent::_NodeSearchCandidate, child::_NodeSearchCandidate)
+    oldest = _node_oldest_index(state.population)
+    index = _regularized_replacement_index(
+        state.domain, state, parent, child)
+    if index === nothing
+        state.rejected_offspring += 1
+        return false
+    end
+    state.birth_clock += 1
+    state.population[index] =
+        _NodeRegularizedMember(child, state.birth_clock)
+    state.accepted_offspring += 1
+    index == oldest && (state.oldest_replacements += 1)
+    _node_state_record!(state, child)
+    return true
+end
+
 function _node_state_offspring_variation!(state::_NodeRegularizedState,
         evaluation_limit::Int)
     candidates = [member.candidate for member in state.population]
@@ -246,8 +276,9 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
         first_value, second_value, changed =
             first_parent.value, second_parent.value, false
         for _ in 1:10
-            first_value, second_value, changed = _node_scalar_crossover_pair(
-                state.rng, first_parent.value, second_parent.value, state.config)
+            first_value, second_value, changed = _regularized_crossover_pair(
+                state.domain, state.rng, first_parent.value,
+                second_parent.value, state.config)
             changed && break
         end
         state.changed_variations += changed
@@ -263,27 +294,26 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
             (first_child = _node_state_refine_offspring!(state, first_child))
         second_child === nothing ||
             (second_child = _node_state_refine_offspring!(state, second_child))
-        for child in (first_child, second_child)
+        for (parent, child) in ((first_parent, first_child),
+                (second_parent, second_child))
             child === nothing && continue
-            state.accepted_offspring += 1
-            index = _node_oldest_index(state.population)
-            state.birth_clock += 1
-            state.population[index] =
-                _NodeRegularizedMember(child, state.birth_clock)
-            state.oldest_replacements += 1
             _node_state_record!(state, child)
+            admitted = _node_state_replace_offspring!(state, parent, child)
+            _regularized_observe(state.domain, state, :crossover,
+                parent, child, admitted)
         end
         return state
     end
 
     kind = draw < state.config.mutation_probability ?
-        _node_scalar_sample_mutation(state.rng, first_parent.value, state.config) :
+        _regularized_sample_mutation(state.domain, state.rng,
+            first_parent.value, state.config) :
         :compose
     cycle_temperature, _ = _regularized_cycle_temperature(
         state.offspring_attempts, state.config.population_size,
         state.config.tournament_size, state.flow.ncycles_per_iteration)
-    child_value, changed = _node_regularized_named_child(
-        state.rng, first_parent.value, second_parent.value,
+    child_value, changed = _regularized_named_child(
+        state.domain, state.rng, first_parent.value, second_parent.value,
         state.feature_count, state.config, kind;
         temperature=cycle_temperature)
     if kind === :compose
@@ -298,12 +328,9 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
         state.serial += 1
         child = _NodeSearchCandidate(
             first_parent.value, first_parent.loss, state.serial, true)
-        state.accepted_offspring += 1
-        index = _node_oldest_index(state.population)
-        state.birth_clock += 1
-        state.population[index] = _NodeRegularizedMember(child, state.birth_clock)
-        state.oldest_replacements += 1
-        _node_state_record!(state, child)
+        admitted = _node_state_replace_offspring!(state, first_parent, child)
+        _regularized_observe(state.domain, state, kind,
+            first_parent, child, admitted)
     elseif !changed
         state.skipped_variations += 1
     else
@@ -315,15 +342,71 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
         # at its complexity and the global loss best.
         _node_state_record!(state, child)
         if _node_state_accept!(state, first_parent, child)
-            state.accepted_offspring += 1
-            index = _node_oldest_index(state.population)
-            state.birth_clock += 1
-            state.population[index] = _NodeRegularizedMember(child, state.birth_clock)
-            state.oldest_replacements += 1
+            admitted = _node_state_replace_offspring!(state, first_parent, child)
         else
             state.rejected_offspring += 1
+            admitted = false
         end
+        _regularized_observe(state.domain, state, kind,
+            first_parent, child, admitted)
     end
+    return state
+end
+
+"""Build and score one persistent regularized population from ready values.
+
+`score(value)` returns `(loss, invalid)`. Values must share one concrete type
+and expose positive integer `complexity`; a supplied frequency object controls
+its own complexity capacity, while the default covers both configured and
+initial-value complexity. Domain hooks own local proposal limits.
+"""
+function _initialize_regularized_values(values, score;
+        config::ScalarSearchConfig, rng::AbstractRNG,
+        flow::_NodeRegularizedFlow, feature_count::Int=0,
+        frequency=nothing, frequency_window::Int=100000,
+        loss_normalization::Real=0.01, domain=nothing)
+    initial_values = collect(values)
+    length(initial_values) > config.population_size &&
+        resize!(initial_values, config.population_size)
+    length(initial_values) == config.population_size ||
+        throw(ArgumentError("initial values must fill population_size"))
+    all(value -> hasproperty(value, :complexity), initial_values) ||
+        throw(ArgumentError("regularized values must expose complexity"))
+    value_type = typeof(first(initial_values))
+    all(value -> typeof(value) === value_type, initial_values) ||
+        throw(ArgumentError("regularized values must share one concrete type"))
+    all(value -> value.complexity isa Integer && value.complexity > 0,
+        initial_values) ||
+        throw(ArgumentError("regularized value complexity must be a positive integer"))
+    loss_normalization > 0 ||
+        throw(ArgumentError("loss_normalization must be positive"))
+    positive_complexity = maximum(value.complexity for value in initial_values)
+    shared_frequency = frequency === nothing ?
+        _RegularizedFrequency(frequency_window,
+            max(config.max_complexity, positive_complexity)) : frequency
+    first_value = first(initial_values)
+    candidate_type = typeof(_NodeSearchCandidate(first_value, Inf, 0, false))
+    member_type = typeof(_NodeRegularizedMember(
+        _NodeSearchCandidate(first_value, Inf, 0, false), 0))
+    state = _NodeRegularizedState(config, rng, feature_count, score, flow,
+        member_type[], Dict{Int,candidate_type}(), shared_frequency, domain,
+        0, 0, 0, 0, 0, 0,
+        _NodeSearchCandidate(first_value, Inf, 0, false), NamedTuple[],
+        0, 0, 0, 0, 0, 0, 0, 0, 0, Dict{Symbol,Int}(), 0,
+        Float64(loss_normalization), 0, 0)
+    for value in initial_values
+        candidate = _node_state_score_candidate!(
+            state, value, false, config.max_evaluations)
+        candidate === nothing && break
+        _node_state_record!(state, candidate)
+        state.birth_clock += 1
+        push!(state.population,
+            _NodeRegularizedMember(candidate, state.birth_clock))
+        _regularized_observe(state.domain, state, :initial_population,
+            nothing, candidate, true)
+    end
+    length(state.population) == config.population_size ||
+        throw(ArgumentError("initial population did not fill population_size"))
     return state
 end
 
@@ -354,7 +437,8 @@ objectives, or an unfillable initial population fail before the state escapes.
 function _initialize_node_regularized_state(X::AbstractMatrix{<:Real},
         y::AbstractVector{<:Real}; config::ScalarSearchConfig=ScalarSearchConfig(),
         rng::AbstractRNG=default_rng(), initial_population=nothing,
-        objective=nothing, stop_loss::Union{Nothing,Real}=1.0e-12,
+        objective=nothing, stop_loss::Union{Nothing,Real}=
+            objective === nothing ? 1.0e-12 : nothing,
         annealing::Bool=true, temperature::Real=1.0, alpha::Real=3.17,
         ncycles_per_iteration::Int=380, use_frequency::Bool=true,
         frequency_window::Int=100000, hof_migration_fraction::Real=0.0614,
@@ -395,7 +479,7 @@ function _initialize_node_regularized_state(X::AbstractMatrix{<:Real},
         result isa Err && return (Inf, true)
         result isa Real || throw(ArgumentError("objective must return a real loss or Err"))
         loss = Float64(result)
-        return isfinite(loss) && loss >= 0 ? (loss, false) : (Inf, true)
+        return isfinite(loss) ? (loss, false) : (Inf, true)
     end
     values = _NodeScalarCandidate[]
     if initial_population !== nothing
@@ -426,29 +510,14 @@ function _initialize_node_regularized_state(X::AbstractMatrix{<:Real},
     end
     shared_frequency = frequency === nothing ?
         _RegularizedFrequency(frequency_window, config.max_complexity) : frequency
-    first_value = first(values)
-    dummy = _NodeSearchCandidate(first_value, Inf, 0, false)
-    state = _NodeRegularizedState(config, rng, feature_count, score, flow,
-        _NodeRegularizedMember[], Dict{Int,_NodeSearchCandidate}(),
-        shared_frequency, 0, 0, 0, 0, 0, 0, dummy, NamedTuple[],
-        0, 0, 0, 0, 0, 0, 0, 0, 0, Dict{Symbol,Int}(), 0, 0.01,
-        0, 0)
     baseline = _node_scalar_candidate(scalar_constant(sum(y) / length(y)))
     baseline_loss, baseline_invalid = score(baseline)
-    state.loss_normalization = baseline_invalid || !isfinite(baseline_loss) ?
-        0.01 : max(0.01, baseline_loss)
-    for value in values
-        candidate = _node_state_score_candidate!(state,
-            value, false, config.max_evaluations)
-        candidate === nothing && break
-        _node_state_record!(state, candidate)
-        state.birth_clock += 1
-        push!(state.population,
-            _NodeRegularizedMember(candidate, state.birth_clock))
-    end
-    length(state.population) == config.population_size ||
-        throw(ArgumentError("initial population did not fill population_size"))
-    return state
+    loss_normalization = baseline_invalid || !isfinite(baseline_loss) ?
+        0.01 : max(0.01, abs(baseline_loss))
+    return _initialize_regularized_values(values, score; config, rng, flow,
+        feature_count, frequency=shared_frequency, frequency_window,
+        loss_normalization,
+        domain=nothing)
 end
 
 """Advance an island without rebuilding its population or lifecycle state.
@@ -510,7 +579,8 @@ function _search_scalar_regularized_node(X::AbstractMatrix{<:Real},
         y::AbstractVector{<:Real};
         config::ScalarSearchConfig=ScalarSearchConfig(),
         rng::AbstractRNG=default_rng(), initial_population=nothing,
-        objective=nothing, stop_loss::Union{Nothing,Real}=1.0e-12,
+        objective=nothing, stop_loss::Union{Nothing,Real}=
+            objective === nothing ? 1.0e-12 : nothing,
         annealing::Bool=true, temperature::Real=1.0, alpha::Real=3.17,
         ncycles_per_iteration::Int=380, use_frequency::Bool=true,
         frequency_window::Int=100000, hof_migration_fraction::Real=0.0614,
@@ -531,6 +601,34 @@ end
     using Test
     using Random
     using LambdaRegression.ScalarSearch
+end
+
+@testitem "regularized search accepts finite negative objective losses" setup=[NodeRegularizedStateImports] begin
+    config = ScalarSearchConfig(population_size=2, max_evaluations=4,
+        max_complexity=1, initial_depth=0, tournament_size=1, elite_count=1,
+        unary_operators=(), binary_operators=(:+,), mutation_probability=0.0,
+        crossover_probability=0.0, constant_refinement_iterations=0,
+        constant_refinement_probability=0.0,
+        max_constant_refinement_evaluations=0,
+        evolution_strategy=:regularized)
+    objective = _ -> -2.0
+    X = zeros(Float64, 0, 2)
+    y = zeros(2)
+    initial = [scalar_constant(0.0), scalar_constant(1.0)]
+    state = ScalarSearch._initialize_node_regularized_state(
+        X, y; config, rng=MersenneTwister(1111), initial_population=initial,
+        objective)
+
+    @test state.evaluations == 2
+    @test state.invalid_evaluations == 0
+    @test state.best.loss == -2.0
+    @test state.loss_normalization == 2.0
+    @test state.flow.stop_loss === nothing
+
+    threshold_state = ScalarSearch._initialize_node_regularized_state(
+        X, y; config, rng=MersenneTwister(1111),
+        initial_population=initial, objective, stop_loss=-1.0)
+    @test threshold_state.flow.stop_loss == -1.0
 end
 
 @testsnippet SimplificationScoreContractSetup begin

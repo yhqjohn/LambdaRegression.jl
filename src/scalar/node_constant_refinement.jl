@@ -69,30 +69,49 @@ function _node_refine_constants(candidate::_NodeScalarCandidate, loss::Real,
         score_node, config::ScalarSearchConfig, max_evaluations::Integer;
         rng::AbstractRNG=default_rng(), restarts::Int=2)
     paths = _node_constant_paths(candidate.node)
+    initial = Float64[_node_at_path(candidate.node, path).val for path in paths]
+    function score_parameters(values)
+        node = DynamicExpressions.copy_node(candidate.node; break_sharing=Val(true))
+        _node_set_constants!(node, paths, values) || return (Inf, true)
+        return _node_refinement_score(score_node, node)
+    end
+    parameters, refined_loss, count, invalid = _refine_parameter_vector(initial,
+        loss, score_parameters, config, max_evaluations; rng, restarts)
+    refined_loss < loss || return (candidate, Float64(loss), count, invalid)
+    node = DynamicExpressions.copy_node(candidate.node; break_sharing=Val(true))
+    _node_set_constants!(node, paths, parameters) || error("invalid retained refinement")
+    return (_NodeScalarCandidate(node, candidate.complexity), refined_loss, count, invalid)
+end
+
+"""Bounded Optim adaptation shared by scalar nodes and complete configurations.
+
+`initial` is one entry per independent parameter. The synchronous callback
+returns `(loss, invalid)`. Keep the best actually scored vector on exhaustion;
+unexpected errors escape. This helper owns no syntax, aliases or search state.
+"""
+function _refine_parameter_vector(initial::Vector{Float64}, loss::Real,
+        score_parameters, config::ScalarSearchConfig, max_evaluations::Integer;
+        rng::AbstractRNG=default_rng(), restarts::Int=2)
     evaluations = Ref(0)
     invalid_evaluations = Ref(0)
-    max_evaluations <= 0 && return (candidate, Float64(loss), 0, 0)
-    isempty(paths) && return (candidate, Float64(loss), 0, 0)
+    max_evaluations <= 0 && return (initial, Float64(loss), 0, 0)
+    isempty(initial) && return (initial, Float64(loss), 0, 0)
     config.constant_refinement_iterations == 0 &&
-        return (candidate, Float64(loss), 0, 0)
+        return (initial, Float64(loss), 0, 0)
     restarts >= 0 || throw(ArgumentError("constant-refinement restarts cannot be negative"))
 
-    initial = Float64[_node_at_path(candidate.node, path).val for path in paths]
-    best_trial_node = Ref{Union{Nothing,DynamicExpressions.Node{Float64}}}(nothing)
+    best_trial_values = Ref{Union{Nothing,Vector{Float64}}}(nothing)
     best_trial_loss = Ref(Inf)
     function trial(values)
         evaluations[] >= max_evaluations &&
             throw(_ConstantRefinementBudgetExhausted())
-        node = DynamicExpressions.copy_node(candidate.node;
-            break_sharing=Val(true))
-        _node_set_constants!(node, paths, values) || return Inf
-        candidate_loss, invalid = _node_refinement_score(score_node, node)
+        all(isfinite, values) || return Inf
+        candidate_loss, invalid = score_parameters(values)
         evaluations[] += 1
         invalid_evaluations[] += invalid
         if !invalid && isfinite(candidate_loss) &&
                 candidate_loss < best_trial_loss[]
-            best_trial_node[] = DynamicExpressions.copy_node(node;
-                break_sharing=Val(true))
+            best_trial_values[] = copy(values)
             best_trial_loss[] = candidate_loss
         end
         return !invalid && isfinite(candidate_loss) ? candidate_loss : Inf
@@ -118,11 +137,10 @@ function _node_refine_constants(candidate::_NodeScalarCandidate, loss::Real,
     catch exception
         exception isa _ConstantRefinementBudgetExhausted || rethrow()
     end
-    if best_trial_node[] === nothing || !(best_trial_loss[] < loss)
-        return (candidate, Float64(loss), evaluations[], invalid_evaluations[])
+    if best_trial_values[] === nothing || !(best_trial_loss[] < loss)
+        return (initial, Float64(loss), evaluations[], invalid_evaluations[])
     end
-    refined = _NodeScalarCandidate(best_trial_node[], candidate.complexity)
-    return (refined, best_trial_loss[], evaluations[], invalid_evaluations[])
+    return (best_trial_values[], best_trial_loss[], evaluations[], invalid_evaluations[])
 end
 
 @testsnippet NodeConstantRefinementImports begin
