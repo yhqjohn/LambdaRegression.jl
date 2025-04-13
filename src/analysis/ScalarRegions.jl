@@ -137,26 +137,19 @@ function _closed_signature_compatible(actual, expected::Ty)
     return false
 end
 
+const _UNARY_FLOAT_SIGNATURE = TyFun(FloatTy, FloatTy)
+const _BINARY_FLOAT_SIGNATURE = TyFun(FloatTy, TyFun(FloatTy, FloatTy))
+
 function _operator_sets(context)
-    unary_types = Dict(
-        :sin => TyFun(FloatTy, FloatTy), :cos => TyFun(FloatTy, FloatTy),
-        :sqrt => TyFun(FloatTy, FloatTy), :square => TyFun(FloatTy, FloatTy),
-    )
-    binary_types = Dict(
-        :+ => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
-        :- => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
-        :* => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
-        :/ => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
-    )
     unary, binary = Set{Symbol}(), Set{Symbol}()
     for (operator, ast_name) in ScalarSearch._UNARY_AST
         actual = get(context, ast_name, nothing)
-        actual !== nothing && _closed_signature_compatible(actual, unary_types[operator]) &&
+        actual !== nothing && _closed_signature_compatible(actual, _UNARY_FLOAT_SIGNATURE) &&
             push!(unary, operator)
     end
     for (operator, ast_name) in ScalarSearch._BINARY_AST
         actual = get(context, ast_name, nothing)
-        actual !== nothing && _closed_signature_compatible(actual, binary_types[operator]) &&
+        actual !== nothing && _closed_signature_compatible(actual, _BINARY_FLOAT_SIGNATURE) &&
             push!(binary, operator)
     end
     return unary, binary

@@ -27,18 +27,43 @@ export evaluate_dynamic_scalar!
 """Domain-safe square root matching `evaluate_scalar_reference`."""
 @inline _dynamic_sqrt(x) = x < 0 ? NaN : sqrt(x)
 
+"""Domain-safe tangent for finite-domain batch evaluation."""
+@inline function _dynamic_tan(x)
+    try
+        return tan(x)
+    catch error
+        error isa DomainError || rethrow()
+        return NaN
+    end
+end
+
+"""Domain-safe real logarithm matching `evaluate_scalar_reference`."""
+@inline _dynamic_log(x) = x <= 0 ? NaN : log(x)
+
+"""Domain-safe real power matching `evaluate_scalar_reference`."""
+@inline function _dynamic_power(x, y)
+    try
+        return x ^ y
+    catch error
+        error isa DomainError || rethrow()
+        return NaN
+    end
+end
+
 """
-Operator table for the scalar world.  The order is part of the local
-Node encoding: unary indices are `sin`, `cos`, `sqrt`, `square`, and binary
-indices are `+`, `-`, `*`, `/`.
+Operator table for the scalar world. The existing unary indices `sin`, `cos`,
+`sqrt`, `square` and binary indices `+`, `-`, `*`, `/` remain the prefix of the
+local Node encoding; `tan`, `exp`, `log`, `abs`, `^`, `max`, and `min` append
+after them.
 
 Helper methods are disabled because this bridge always passes the table
 explicitly to DynamicExpressions and must not mutate its process-wide default
 operator state.
 """
 const DYNAMIC_SCALAR_OPERATORS = DynamicExpressions.OperatorEnum(
-    binary_operators=(+, -, *, /),
-    unary_operators=(sin, cos, _dynamic_sqrt, _dynamic_square),
+    binary_operators=(+, -, *, /, _dynamic_power, max, min),
+    unary_operators=(sin, cos, _dynamic_sqrt, _dynamic_square,
+        _dynamic_tan, exp, _dynamic_log, abs),
     define_helper_functions=false,
     empty_old_operators=false,
 )
@@ -48,6 +73,10 @@ const DYNAMIC_SCALAR_OPERATORS = DynamicExpressions.OperatorEnum(
     op === :cos && return UInt8(2)
     op === :sqrt && return UInt8(3)
     op === :square && return UInt8(4)
+    op === :tan && return UInt8(5)
+    op === :exp && return UInt8(6)
+    op === :log && return UInt8(7)
+    op === :abs && return UInt8(8)
     throw(ArgumentError("unsupported scalar unary operator: $op"))
 end
 
@@ -56,6 +85,9 @@ end
     op === :- && return UInt8(2)
     op === :* && return UInt8(3)
     op === :/ && return UInt8(4)
+    op === :^ && return UInt8(5)
+    op === :max && return UInt8(6)
+    op === :min && return UInt8(7)
     throw(ArgumentError("unsupported scalar binary operator: $op"))
 end
 
@@ -93,6 +125,10 @@ function _dynamic_unary_symbol(op)
     op === cos && return :cos
     op === _dynamic_sqrt && return :sqrt
     op === _dynamic_square && return :square
+    op === _dynamic_tan && return :tan
+    op === exp && return :exp
+    op === _dynamic_log && return :log
+    op === abs && return :abs
     return nothing
 end
 
@@ -101,6 +137,9 @@ function _dynamic_binary_symbol(op)
     op === (-) && return :-
     op === (*) && return :*
     op === (/) && return :/
+    op === _dynamic_power && return :^
+    op === max && return :max
+    op === min && return :min
     return nothing
 end
 
@@ -133,9 +172,9 @@ end
 """
     scalar_from_dynamic(node; operators=DYNAMIC_SCALAR_OPERATORS) -> ScalarExpr | Err
 
-Rebuild a `ScalarExpr` from a DynamicExpressions node.  The conversion is
-strict about the four unary and four binary functions in the local operator
-table; unsupported operator tables remain on the caller's general path.
+Rebuild a `ScalarExpr` from a DynamicExpressions node. The conversion is strict
+about the eight unary and seven binary functions in the local operator table;
+unsupported operator tables remain on the caller's general path.
 """
 function scalar_from_dynamic(node::DynamicExpressions.AbstractExpressionNode;
         operators::DynamicExpressions.AbstractOperatorEnum=DYNAMIC_SCALAR_OPERATORS)
@@ -163,6 +202,32 @@ end
     using Test
     using LambdaRegression.ScalarSearch
     using LambdaRegression.ScalarSearch: DynamicExpressions
+end
+
+@testitem "DynamicExpressions operator indices preserve the legacy prefix" setup=[DynamicExpressionsBufferedImports] begin
+    operators = ScalarSearch.DYNAMIC_SCALAR_OPERATORS
+    @test Tuple(operators.unaops[1:4]) ==
+        (sin, cos, ScalarSearch._dynamic_sqrt, ScalarSearch._dynamic_square)
+    @test Tuple(operators.binops[1:4]) == (+, -, *, /)
+    for (index, op) in enumerate((:sin, :cos, :sqrt, :square))
+        @test ScalarSearch._dynamic_unary_index(op) == UInt8(index)
+    end
+    for (index, op) in enumerate((:+, :-, :*, :/))
+        @test ScalarSearch._dynamic_binary_index(op) == UInt8(index)
+    end
+
+    for (offset, op) in enumerate((:tan, :exp, :log, :abs))
+        @test ScalarSearch._dynamic_unary_index(op) == UInt8(offset + 4)
+        node = scalar_to_dynamic(scalar_unary(op, scalar_input(1)))
+        @test node.op == UInt8(offset + 4)
+        @test scalar_from_dynamic(node) isa ScalarExpr
+    end
+    for (offset, op) in enumerate((:^, :max, :min))
+        @test ScalarSearch._dynamic_binary_index(op) == UInt8(offset + 4)
+        node = scalar_to_dynamic(scalar_binary(op, scalar_input(1), scalar_input(2)))
+        @test node.op == UInt8(offset + 4)
+        @test scalar_from_dynamic(node) isa ScalarExpr
+    end
 end
 
 @testitem "DynamicExpressions buffered evaluation matches the allocating path" setup=[DynamicExpressionsBufferedImports] begin

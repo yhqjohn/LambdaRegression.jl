@@ -719,3 +719,56 @@ end
     @test calls[] <= 40
     @test calls[] == joint_search_result(session).evaluations
 end
+
+@testitem "joint initialization admits extended operators only at matching Float signatures" begin
+    using Test, Random
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
+    using LambdaRegression.Programs: Program
+    using LambdaRegression.Primitives: FTAN, FEXP, FLOG, FABS, FPOW, FMAX, FMIN
+    using LambdaRegression.Regression: initialize_joint_search
+    using LambdaRegression.ScalarSearch: ScalarSearchConfig
+    using LambdaRegression.TypeSystem: FloatTy, IntTy, TyFun, TyLike, get_type
+
+    apply_named(name, args...) = foldl(
+        (function_node, argument) -> AppNode(function_node, argument),
+        args; init=ConstNode(name),
+    )
+    x = IndexNode(0)
+    expression = apply_named(:FMAX,
+        apply_named(:FPOW, apply_named(:FTAN, x), apply_named(:FABS, x)),
+        apply_named(:FMIN, apply_named(:FEXP, apply_named(:FABS, x)),
+            apply_named(:FLOG, apply_named(:FABS, x))),
+    )
+    program = Program(AstTree(AbsNode(:x, expression)))
+    target = TyFun(FloatTy, FloatTy)
+    context = Dict{Symbol,TyLike}(
+        :FTAN => get_type(FTAN), :FEXP => get_type(FEXP),
+        :FLOG => get_type(FLOG), :FABS => get_type(FABS),
+        :FPOW => get_type(FPOW), :FMAX => get_type(FMAX),
+        :FMIN => get_type(FMIN),
+    )
+    config = ScalarSearchConfig(
+        population_size=2, max_evaluations=2, max_total_evaluations=2,
+        tournament_size=2, elite_count=1,
+        max_complexity=16, initial_depth=1,
+        unary_operators=(:tan, :exp, :log, :abs),
+        binary_operators=(:^, :max, :min),
+        constant_refinement_iterations=0, max_constant_refinement_evaluations=0,
+        evolution_strategy=:regularized,
+    )
+    session = initialize_joint_search([program], target, context, _ -> 1.0;
+        config, island_count=1, rng=MersenneTwister(1234))
+    value = session.states[1].population[1].candidate.value
+    @test length(value.regions) == 1
+    region = only(value.regions)
+    @test region.unary_operators == Set((:tan, :exp, :log, :abs))
+    @test region.binary_operators == Set((:^, :max, :min))
+
+    wrong_context = Dict{Symbol,TyLike}(
+        :FTAN => TyFun(IntTy, IntTy),
+        :FPOW => get_type(FTAN),
+    )
+    wrong_unary, wrong_binary = LambdaRegression.ScalarRegions._operator_sets(wrong_context)
+    @test :tan ∉ wrong_unary
+    @test :^ ∉ wrong_binary
+end

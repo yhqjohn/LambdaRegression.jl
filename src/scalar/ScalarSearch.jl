@@ -116,8 +116,14 @@ _same_scalar_expression(left::_ScalarBinary, right::_ScalarBinary) =
     _same_scalar_expression(left.left, right.left) &&
     _same_scalar_expression(left.right, right.right)
 
-const _UNARY_AST = Dict(:sin => :FSIN, :cos => :FCOS, :sqrt => :FSQRT, :square => :SQR)
-const _BINARY_AST = Dict(:+ => :FADD, :- => :FSUB, :* => :FMUL, :/ => :FDIV)
+const _UNARY_AST = Dict(
+    :sin => :FSIN, :cos => :FCOS, :sqrt => :FSQRT, :square => :SQR,
+    :tan => :FTAN, :exp => :FEXP, :log => :FLOG, :abs => :FABS,
+)
+const _BINARY_AST = Dict(
+    :+ => :FADD, :- => :FSUB, :* => :FMUL, :/ => :FDIV,
+    :^ => :FPOW, :max => :FMAX, :min => :FMIN,
+)
 const _AST_UNARY = Dict(value => key for (key, value) in _UNARY_AST)
 const _AST_BINARY = Dict(value => key for (key, value) in _BINARY_AST)
 
@@ -151,13 +157,13 @@ function scalar_constant(value::Real)
     return _ScalarConstant(converted)
 end
 
-"""Create a unary expression for `:sin`, `:cos`, `:sqrt`, or `:square`."""
+"""Create a unary expression for the supported real scalar functions."""
 function scalar_unary(op::Symbol, arg::ScalarExpr)
     haskey(_UNARY_AST, op) || throw(ArgumentError("unsupported scalar unary operator: $op"))
     return _ScalarUnary(op, arg)
 end
 
-"""Create a binary expression for `:+`, `:-`, `:*`, or `:/`."""
+"""Create a binary expression for arithmetic, power, max, or min."""
 function scalar_binary(op::Symbol, left::ScalarExpr, right::ScalarExpr)
     haskey(_BINARY_AST, op) || throw(ArgumentError("unsupported scalar binary operator: $op"))
     return _ScalarBinary(op, left, right)
@@ -176,18 +182,40 @@ function _eval_reference(expr::_ScalarInput, X, sample)
 end
 _eval_reference(expr::_ScalarConstant, X, sample) = expr.value
 
+@inline function _scalar_unary_value(op::Symbol, value::Float64)
+    try
+        return op === :sin ? sin(value) :
+            op === :cos ? cos(value) :
+            op === :tan ? tan(value) :
+            op === :exp ? exp(value) :
+            op === :log ? log(value) :
+            op === :abs ? abs(value) :
+            op === :sqrt ? sqrt(value) :
+            value * value
+    catch error
+        error isa DomainError || rethrow()
+        return NaN
+    end
+end
+
+@inline function _scalar_binary_value(op::Symbol, left::Float64, right::Float64)
+    try
+        return op === :+ ? left + right :
+            op === :- ? left - right :
+            op === :* ? left * right :
+            op === :/ ? left / right :
+            op === :^ ? left ^ right :
+            op === :max ? max(left, right) : min(left, right)
+    catch error
+        error isa DomainError || rethrow()
+        return NaN
+    end
+end
+
 function _eval_reference(expr::_ScalarUnary, X, sample)
     value = _eval_reference(expr.arg, X, sample)
     value isa Err && return value
-    result = try
-        expr.op === :sin ? sin(value) :
-        expr.op === :cos ? cos(value) :
-        expr.op === :sqrt ? sqrt(value) :
-        value * value
-    catch error
-        error isa DomainError || rethrow()
-        return Err(ScalarDomainErr(expr.op, sample))
-    end
+    result = _scalar_unary_value(expr.op, value)
     return isfinite(result) ? result : Err(ScalarDomainErr(expr.op, sample))
 end
 
@@ -196,9 +224,7 @@ function _eval_reference(expr::_ScalarBinary, X, sample)
     left isa Err && return left
     right = _eval_reference(expr.right, X, sample)
     right isa Err && return right
-    result = expr.op === :+ ? left + right :
-        expr.op === :- ? left - right :
-        expr.op === :* ? left * right : left / right
+    result = _scalar_binary_value(expr.op, left, right)
     return isfinite(result) ? result : Err(ScalarDomainErr(expr.op, sample))
 end
 
@@ -314,6 +340,64 @@ end
     _OP_SUBTRACT
     _OP_MULTIPLY
     _OP_DIVIDE
+    _OP_TAN
+    _OP_EXP
+    _OP_LOG
+    _OP_ABS
+    _OP_POWER
+    _OP_MAX
+    _OP_MIN
+end
+
+@inline function _opcode_symbol(opcode::_ScalarOpcode)
+    opcode === _OP_INPUT && return :input
+    opcode === _OP_CONSTANT && return :constant
+    opcode === _OP_SIN && return :sin
+    opcode === _OP_COS && return :cos
+    opcode === _OP_SQRT && return :sqrt
+    opcode === _OP_SQUARE && return :square
+    opcode === _OP_ADD && return :+
+    opcode === _OP_SUBTRACT && return :-
+    opcode === _OP_MULTIPLY && return :*
+    opcode === _OP_DIVIDE && return :/
+    opcode === _OP_TAN && return :tan
+    opcode === _OP_EXP && return :exp
+    opcode === _OP_LOG && return :log
+    opcode === _OP_ABS && return :abs
+    opcode === _OP_POWER && return :^
+    opcode === _OP_MAX && return :max
+    opcode === _OP_MIN && return :min
+    return :unknown
+end
+
+@inline function _scalar_unary_value(opcode::_ScalarOpcode, value::Float64)
+    try
+        return opcode === _OP_SIN ? sin(value) :
+            opcode === _OP_COS ? cos(value) :
+            opcode === _OP_TAN ? tan(value) :
+            opcode === _OP_EXP ? exp(value) :
+            opcode === _OP_LOG ? log(value) :
+            opcode === _OP_ABS ? abs(value) :
+            opcode === _OP_SQRT ? sqrt(value) : value * value
+    catch error
+        error isa DomainError || rethrow()
+        return NaN
+    end
+end
+
+@inline function _scalar_binary_value(opcode::_ScalarOpcode,
+        left::Float64, right::Float64)
+    try
+        return opcode === _OP_ADD ? left + right :
+            opcode === _OP_SUBTRACT ? left - right :
+            opcode === _OP_MULTIPLY ? left * right :
+            opcode === _OP_POWER ? left ^ right :
+            opcode === _OP_MAX ? max(left, right) :
+            opcode === _OP_MIN ? min(left, right) : left / right
+    catch error
+        error isa DomainError || rethrow()
+        return NaN
+    end
 end
 
 struct _ScalarInstruction
@@ -357,6 +441,10 @@ function _compile_scalar!(instructions, expr::_ScalarUnary)
     arg = _compile_scalar!(instructions, expr.arg)
     opcode = expr.op === :sin ? _OP_SIN :
         expr.op === :cos ? _OP_COS :
+        expr.op === :tan ? _OP_TAN :
+        expr.op === :exp ? _OP_EXP :
+        expr.op === :log ? _OP_LOG :
+        expr.op === :abs ? _OP_ABS :
         expr.op === :sqrt ? _OP_SQRT : _OP_SQUARE
     push!(instructions, _ScalarInstruction(opcode, arg, 0, 0.0))
     return length(instructions)
@@ -367,7 +455,10 @@ function _compile_scalar!(instructions, expr::_ScalarBinary)
     right = _compile_scalar!(instructions, expr.right)
     opcode = expr.op === :+ ? _OP_ADD :
         expr.op === :- ? _OP_SUBTRACT :
-        expr.op === :* ? _OP_MULTIPLY : _OP_DIVIDE
+        expr.op === :* ? _OP_MULTIPLY :
+        expr.op === :^ ? _OP_POWER :
+        expr.op === :max ? _OP_MAX :
+        expr.op === :min ? _OP_MIN : _OP_DIVIDE
     push!(instructions, _ScalarInstruction(opcode, left, right, 0.0))
     return length(instructions)
 end
@@ -380,18 +471,6 @@ function prepare_scalar(expr::ScalarExpr)
 end
 
 @inline _slot_start(slot::Int, samples::Int) = (slot - 1) * samples
-
-@inline function _opcode_symbol(opcode::_ScalarOpcode)
-    opcode === _OP_SIN && return :sin
-    opcode === _OP_COS && return :cos
-    opcode === _OP_SQRT && return :sqrt
-    opcode === _OP_SQUARE && return :square
-    opcode === _OP_ADD && return :+
-    opcode === _OP_SUBTRACT && return :-
-    opcode === _OP_MULTIPLY && return :*
-    opcode === _OP_DIVIDE && return :/
-    return opcode === _OP_INPUT ? :input : :constant
-end
 
 """
     evaluate_scalar!(output, prepared, X, workspace) -> output | Err
@@ -433,17 +512,13 @@ function evaluate_scalar!(output::AbstractVector{Float64}, prepared::PreparedSca
             end
         elseif instruction.opcode === _OP_SIN || instruction.opcode === _OP_COS ||
                 instruction.opcode === _OP_SQRT ||
-                instruction.opcode === _OP_SQUARE
+                instruction.opcode === _OP_SQUARE ||
+                instruction.opcode === _OP_TAN || instruction.opcode === _OP_EXP ||
+                instruction.opcode === _OP_LOG || instruction.opcode === _OP_ABS
             source = _slot_start(instruction.left, samples)
             @inbounds for sample in 1:samples
                 value = values[source + sample]
-                result = if instruction.opcode === _OP_SQRT && value < 0.0
-                    NaN
-                else
-                    instruction.opcode === _OP_SIN ? sin(value) :
-                        instruction.opcode === _OP_COS ? cos(value) :
-                        instruction.opcode === _OP_SQRT ? sqrt(value) : value * value
-                end
+                result = _scalar_unary_value(instruction.opcode, value)
                 if isfinite(result)
                     values[destination + sample] = result
                 else
@@ -457,10 +532,8 @@ function evaluate_scalar!(output::AbstractVector{Float64}, prepared::PreparedSca
             @inbounds for sample in 1:samples
                 left_value = values[left + sample]
                 right_value = values[right + sample]
-                result = instruction.opcode === _OP_ADD ? left_value + right_value :
-                    instruction.opcode === _OP_SUBTRACT ? left_value - right_value :
-                    instruction.opcode === _OP_MULTIPLY ? left_value * right_value :
-                    left_value / right_value
+                result = _scalar_binary_value(instruction.opcode, left_value,
+                    right_value)
                 if isfinite(result)
                     values[destination + sample] = result
                 else
@@ -551,6 +624,77 @@ end
         LambdaRegression.LambdaRegression.Primitives.FCOS
     @test scalar_from_ast(ast, [ConstNode(:x)]) isa ScalarExpr
     @test scalar_to_ast(expr, [ConstNode(:x)]) == ast
+end
+
+@testitem "Extended scalar operators round-trip through AST and node backends" setup=[ScalarSearchBaseImports] begin
+    unary_cases = (
+        (:tan, :FTAN, [0.25, 0.5], tan.([0.25, 0.5])),
+        (:exp, :FEXP, [0.0, 1.0], exp.([0.0, 1.0])),
+        (:log, :FLOG, [0.5, 2.0], log.([0.5, 2.0])),
+        (:abs, :FABS, [-0.5, 2.0], abs.([-0.5, 2.0])),
+    )
+    binary_cases = (
+        (:^, :FPOW, [2.0, 3.0], [3.0, 2.0], [8.0, 9.0]),
+        (:max, :FMAX, [2.0, 4.0], [3.0, 1.0], [3.0, 4.0]),
+        (:min, :FMIN, [2.0, 4.0], [3.0, 1.0], [2.0, 1.0]),
+    )
+    dependencies = [ConstNode(:x), ConstNode(:y)]
+
+    for op in (:sinh, :cosh, :tanh, :log10, :sign, :floor, :ceil)
+        @test_throws ArgumentError scalar_unary(op, scalar_input(1))
+    end
+
+    for (op, primitive_name, values, expected) in unary_cases
+        expr = scalar_unary(op, scalar_input(1))
+        X = reshape(values, 1, :)
+        ast = AppNode(ConstNode(primitive_name), dependencies[1])
+        @test evaluate_scalar_reference(expr, X) ≈ expected
+        @test evaluate_scalar(expr, X) ≈ expected
+        @test evaluate_dynamic_scalar(expr, X) ≈ expected
+        node = scalar_to_dynamic(expr)
+        @test ScalarSearch.scalar_from_dynamic(node) isa ScalarExpr
+        @test evaluate_dynamic_scalar(node, X) ≈ expected
+        materialized = scalar_to_ast(expr, dependencies)
+        @test materialized == ast
+        rebuilt = scalar_from_ast(materialized, dependencies)
+        @test ScalarSearch._same_scalar_expression(rebuilt, expr)
+    end
+
+    for (op, primitive_name, left, right, expected) in binary_cases
+        expr = scalar_binary(op, scalar_input(1), scalar_input(2))
+        X = [left'; right']
+        ast = AppNode(AppNode(ConstNode(primitive_name), dependencies[1]), dependencies[2])
+        @test evaluate_scalar_reference(expr, X) ≈ expected
+        @test evaluate_scalar(expr, X) ≈ expected
+        @test evaluate_dynamic_scalar(expr, X) ≈ expected
+        node = scalar_to_dynamic(expr)
+        @test ScalarSearch.scalar_from_dynamic(node) isa ScalarExpr
+        @test evaluate_dynamic_scalar(node, X) ≈ expected
+        materialized = scalar_to_ast(expr, dependencies)
+        @test materialized == ast
+        rebuilt = scalar_from_ast(materialized, dependencies)
+        @test ScalarSearch._same_scalar_expression(rebuilt, expr)
+    end
+end
+
+@testitem "Extended scalar operators classify real-domain and non-finite failures" setup=[ScalarSearchBaseImports] begin
+    cases = (
+        (scalar_unary(:log, scalar_input(1)), reshape([-1.0, 2.0], 1, :), :log),
+        (scalar_unary(:exp, scalar_input(1)), reshape([1000.0, 0.0], 1, :), :exp),
+        (scalar_binary(:^, scalar_input(1), scalar_input(2)),
+            [-2.0 2.0; 0.5 3.0], :^),
+    )
+    for (expr, X, op) in cases
+        expected = LambdaRegression.Utils.Err(ScalarDomainErr(op, 1))
+        @test evaluate_scalar_reference(expr, X) == expected
+        @test evaluate_scalar(expr, X) == expected
+        @test evaluate_dynamic_scalar(expr, X) == expected
+    end
+
+    # A non-finite intermediate must remain an expected error in the node path.
+    nested = scalar_unary(:tan, scalar_unary(:exp, scalar_input(1)))
+    @test evaluate_dynamic_scalar(nested, reshape([1000.0], 1, :)) ==
+        LambdaRegression.Utils.Err(ScalarDomainErr(:exp, 1))
 end
 
 @testitem "Prepared scalar evaluator agrees with the reference corpus" setup=[ScalarSearchBaseImports] begin
@@ -1249,6 +1393,35 @@ end
 
     bad = execute_scalar_fold(add, [[1.0], [2.0, 3.0]], [0.0])
     @test bad == LambdaRegression.Utils.Err(ScalarPlanShapeErr(:fold_item_shape))
+end
+
+@testitem "Scalar collection plans evaluate extended operators and report their domains" setup=[ScalarSearchBaseImports] begin
+    map_expr = scalar_binary(:max, scalar_unary(:exp, scalar_input(1)), scalar_input(2))
+    map_plan = prepare_scalar_map(map_expr; parameter_count=1)
+    @test execute_scalar_map(map_plan, [-1.0, 0.0, 1.0], (0.5,)) ≈
+        [0.5, 1.0, exp(1.0)]
+
+    fold_expr = scalar_binary(:^, scalar_input(1), scalar_input(2))
+    fold_plan = prepare_scalar_fold(fold_expr)
+    @test execute_scalar_fold(fold_plan, [2.0, 2.0], 2.0) == 16.0
+
+    # Invalid values take the prepared-point fallback and retain the operator.
+    log_plan = prepare_scalar_map(scalar_unary(:log, scalar_input(1)))
+    @test execute_scalar_map(log_plan, [-1.0]) ==
+        LambdaRegression.Utils.Err(ScalarDomainErr(:log, 1))
+    @test execute_scalar_fold(fold_plan, [0.5], -2.0) ==
+        LambdaRegression.Utils.Err(ScalarDomainErr(:^, 1))
+
+    sqrt_plan = prepare_scalar_map(scalar_unary(:sqrt, scalar_input(1)))
+    @test execute_scalar_map(sqrt_plan, [-1.0]) ==
+        LambdaRegression.Utils.Err(ScalarDomainErr(:sqrt, 1))
+
+    # tan must route non-finite intermediate values through the point evaluator.
+    tan_division = scalar_unary(:tan,
+        scalar_binary(:/, scalar_input(1), scalar_constant(0.0)))
+    tan_plan = prepare_scalar_map(tan_division)
+    @test execute_scalar_map(tan_plan, [1.0]) ==
+        LambdaRegression.Utils.Err(ScalarDomainErr(:/, 1))
 end
 
 end # module ScalarSearch

@@ -78,4 +78,7 @@ include("workflows/Workflows.jl")
 using .Workflows
 export Workflows
 
+include("adapters/FrontendAdapter.jl")
+export FrontendAdapter
+
 end # module LambdaRegression

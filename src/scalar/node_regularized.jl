@@ -462,6 +462,39 @@ end
     using LambdaRegression.ScalarSearch
 end
 
+@testitem "node-native regularized grammar accepts every extended operator" setup=[NodeRegularizedImports] begin
+    unary = (:sin, :cos, :sqrt, :square, :tan, :exp, :log, :abs)
+    binary = (:+, :-, :*, :/, :^, :max, :min)
+    config = ScalarSearchConfig(
+        population_size=8,
+        max_evaluations=16,
+        max_complexity=16,
+        initial_depth=2,
+        tournament_size=3,
+        elite_count=2,
+        unary_operators=unary,
+        binary_operators=binary,
+        evolution_strategy=:regularized,
+    )
+    leaf = ScalarSearch.DynamicExpressions.Node(Float64; feature=1)
+
+    for op in unary
+        index = ScalarSearch._dynamic_unary_index(op)
+        node = ScalarSearch.DynamicExpressions.Node(Float64; op=index, l=leaf)
+        @test ScalarSearch._node_allowed_operator_indices(node, config) ==
+            filter(!=(index), UInt8[ScalarSearch._dynamic_unary_index(item) for item in unary])
+        @test ScalarSearch.scalar_from_dynamic(node) isa ScalarExpr
+    end
+    for op in binary
+        index = ScalarSearch._dynamic_binary_index(op)
+        node = ScalarSearch.DynamicExpressions.Node(Float64;
+            op=index, l=leaf, r=leaf)
+        @test ScalarSearch._node_allowed_operator_indices(node, config) ==
+            filter(!=(index), UInt8[ScalarSearch._dynamic_binary_index(item) for item in binary])
+        @test ScalarSearch.scalar_from_dynamic(node) isa ScalarExpr
+    end
+end
+
 @testitem "node-native scalar candidates preserve the authoritative boundary" setup=[NodeRegularizedImports] begin
     expr = scalar_binary(:+,
         scalar_unary(:sin, scalar_input(1)),

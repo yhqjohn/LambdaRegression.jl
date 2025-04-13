@@ -47,6 +47,17 @@ end
     value = _kernel_value(kernel.arg, args)
     OP === :sin && return sin(value)
     OP === :cos && return cos(value)
+    OP === :tan && return _scalar_unary_value(:tan, value)
+    OP === :exp && return exp(value)
+    if OP === :log
+        try
+            return log(value)
+        catch error
+            error isa DomainError || rethrow()
+            return NaN
+        end
+    end
+    OP === :abs && return abs(value)
     OP === :sqrt && return value < 0 ? NaN : sqrt(value)
     return value * value
 end
@@ -56,6 +67,16 @@ end
     OP === :+ && return left + right
     OP === :- && return left - right
     OP === :* && return left * right
+    if OP === :^
+        try
+            return left ^ right
+        catch error
+            error isa DomainError || rethrow()
+            return NaN
+        end
+    end
+    OP === :max && return max(left, right)
+    OP === :min && return min(left, right)
     return left / right
 end
 
@@ -211,24 +232,14 @@ function _evaluate_prepared_point!(program::PreparedScalarProgram, features, val
             features[instruction.left]
         elseif instruction.opcode === _OP_CONSTANT
             instruction.value
-        elseif instruction.opcode === _OP_SIN
-            sin(values[instruction.left])
-        elseif instruction.opcode === _OP_COS
-            cos(values[instruction.left])
-        elseif instruction.opcode === _OP_SQRT
-            source = values[instruction.left]
-            source < 0.0 ? NaN : sqrt(source)
-        elseif instruction.opcode === _OP_SQUARE
-            source = values[instruction.left]
-            source * source
-        elseif instruction.opcode === _OP_ADD
-            values[instruction.left] + values[instruction.right]
-        elseif instruction.opcode === _OP_SUBTRACT
-            values[instruction.left] - values[instruction.right]
-        elseif instruction.opcode === _OP_MULTIPLY
-            values[instruction.left] * values[instruction.right]
+        elseif instruction.opcode === _OP_SIN || instruction.opcode === _OP_COS ||
+                instruction.opcode === _OP_SQRT || instruction.opcode === _OP_SQUARE ||
+                instruction.opcode === _OP_TAN || instruction.opcode === _OP_EXP ||
+                instruction.opcode === _OP_LOG || instruction.opcode === _OP_ABS
+            _scalar_unary_value(instruction.opcode, values[instruction.left])
         else
-            values[instruction.left] / values[instruction.right]
+            _scalar_binary_value(instruction.opcode, values[instruction.left],
+                values[instruction.right])
         end
         isfinite(result) || return Err(ScalarDomainErr(_opcode_symbol(instruction.opcode), step))
         values[slot] = result

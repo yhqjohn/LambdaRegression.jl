@@ -23,9 +23,9 @@ export TRUE, FALSE, NOT, COND
 export INL, INR, PAIR, FST, SND
 export CONS, HEAD, TAIL, LENGTH, CASENILERR, UNCONS_CASE, TOLIST, NilErr
 export AMAP, AFOLDL, LENF
-export FSIN, FCOS, FSQRT, SQR
+export FSIN, FCOS, FTAN, FEXP, FLOG, FABS, FSQRT, SQR
 export IEQ, ILE, IADD, ISUB, IMUL
-export FEQ, FLE, FADD, FSUB, FMUL, FDIV
+export FEQ, FLE, FADD, FSUB, FMUL, FDIV, FPOW, FMAX, FMIN
 
 const TRUE = true
 const FALSE = false
@@ -84,6 +84,10 @@ LENF(xs) = float(size(xs, 1))
 
 FSIN(x) = sin(x)
 FCOS(x) = cos(x)
+FTAN(x) = tan(x)
+FEXP(x) = exp(x)
+FLOG(x) = log(x)
+FABS(x) = abs(x)
 FSQRT(x) = sqrt(x)
 SQR(x) = x * x
 
@@ -99,6 +103,9 @@ FADD(x) = y -> x + y
 FSUB(x) = y -> x - y
 FMUL(x) = y -> x * y
 FDIV(x) = y -> x / y
+FPOW(x) = y -> x ^ y
+FMAX(x) = y -> max(x, y)
+FMIN(x) = y -> min(x, y)
 
 const _α, _β, _γ = newtyvar(0), newtyvar(0), newtyvar(0)
 const IntDiscr = IntTy → IntTy → BoolTy
@@ -127,6 +134,10 @@ get_type(::typeof(LENF)) = ∀([_α, _β], TyArray(_α, _β) → FloatTy)
 
 get_type(::typeof(FSIN)) = FloatTy → FloatTy
 get_type(::typeof(FCOS)) = FloatTy → FloatTy
+get_type(::typeof(FTAN)) = FloatTy → FloatTy
+get_type(::typeof(FEXP)) = FloatTy → FloatTy
+get_type(::typeof(FLOG)) = FloatTy → FloatTy
+get_type(::typeof(FABS)) = FloatTy → FloatTy
 get_type(::typeof(FSQRT)) = FloatTy → FloatTy
 get_type(::typeof(SQR)) = FloatTy → FloatTy
 
@@ -141,6 +152,9 @@ get_type(::typeof(FADD)) = FloatOp
 get_type(::typeof(FSUB)) = FloatOp
 get_type(::typeof(FMUL)) = FloatOp
 get_type(::typeof(FDIV)) = FloatOp
+get_type(::typeof(FPOW)) = FloatOp
+get_type(::typeof(FMAX)) = FloatOp
+get_type(::typeof(FMIN)) = FloatOp
 
 @testitem "Primitives preserve identity, laziness, and array layer semantics" begin
     using Test
@@ -181,6 +195,30 @@ end
     @test LENF(AMAP(row -> sum(row))(matrix)) === 2.0
     @test LENF(AMAP(row -> Float64[])(matrix)) === 2.0
     @test LENF(AMAP(row -> vcat(row, row))(nested)) === 2.0
+end
+
+@testitem "Primitives expose the extended real scalar operators" begin
+    using Test
+    using LambdaRegression.Primitives: FTAN, FEXP, FLOG, FABS, FSQRT, SQR,
+        FPOW, FMAX, FMIN
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, get_type
+
+    unary = ((FTAN, tan(0.25)), (FEXP, exp(0.25)), (FLOG, log(2.0)),
+        (FABS, abs(-2.0)), (FSQRT, sqrt(4.0)), (SQR, 3.0^2))
+    for (primitive, expected) in unary
+        argument = primitive === FLOG ? 2.0 : primitive === FABS ? -2.0 :
+            primitive === FSQRT ? 4.0 : primitive === SQR ? 3.0 : 0.25
+        @test primitive(argument) ≈ expected
+        @test get_type(primitive) == TyFun(FloatTy, FloatTy)
+    end
+
+    @test FPOW(2.0)(3.0) === 8.0
+    @test FMAX(2.0)(3.0) === 3.0
+    @test FMIN(2.0)(3.0) === 2.0
+    for primitive in (FPOW, FMAX, FMIN)
+        @test get_type(primitive) ==
+            TyFun(FloatTy, TyFun(FloatTy, FloatTy))
+    end
 end
 
 end # module Primitives
