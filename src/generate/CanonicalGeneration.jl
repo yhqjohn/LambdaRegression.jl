@@ -47,6 +47,13 @@ config = GenerationConfig(; rng, providers, weights)
 result = generate_canonical(target_ty; global_consts, config)
 ```
 
+`GenerationWeights(guarded_family_balance=p)` optionally mixes the existing
+guarded-instance weights with a constructor-family allocation, for `0 ≤ p ≤ 1`.
+It preserves menu order, total guarded mass and admitted types. The default is
+independently zero; bounded default sampling and required-binder guarded menus
+share this policy. Certificate completion/custom samplers/planners reject
+nonzero values rather than silently applying a different allocation.
+
 FunctionDef construction is an optional generation capability, not part of the
 default canonical provider set. Install `FunctionDefProvider` explicitly in
 `GenerationConfig.providers`; successful results containing FunctionDef nodes
@@ -2201,6 +2208,13 @@ and all other descendants retain their ordinary weights. This is not a test of
 semantic input dependence. Non-neutral values require the bounded default
 weighted sampler and planner; certificate completion and custom samplers are
 not covered. A scoped caller must enable it only for the intended output root.
+
+`guarded_family_balance` independently defaults to `0` and must be finite in
+`[0, 1]`. Positive values mix the prepared guarded instance menu with an
+inverse-family-size allocation, preserving its total mass and legal routes.
+Families use runtime value identity, then `guarded_family::Symbol` metadata or
+a source/name fallback. Only bounded default weighted sampling/planning is
+supported; zero preserves existing menus and RNG usage.
 """
 struct GenerationWeights
     default::Float64
@@ -2210,6 +2224,8 @@ struct GenerationWeights
             throw(ArgumentError("default generation weight must be finite and nonnegative"))
         all(weight -> isfinite(weight) && weight >= 0, values(overrides)) ||
             throw(ArgumentError("generation weights must be finite and nonnegative"))
+        get(overrides, :guarded_family_balance, 0.0) <= 1 ||
+            throw(ArgumentError("guarded_family_balance must be in [0, 1]"))
         return new(default, overrides)
     end
 end
@@ -5925,6 +5941,12 @@ end
     _sample_derivation(rng, sample_set)
 
 function _uses_lazy_sampling(config::GenerationConfig)
+    if get(config.weights.overrides, :guarded_family_balance, 0.0) > 0
+        config.sampler isa WeightedDerivationSampler &&
+            config.sampler.completion_probability == 0 &&
+            config.argument_planner isa DefaultArgumentPlanner || throw(ArgumentError(
+                "guarded_family_balance requires bounded WeightedDerivationSampler and DefaultArgumentPlanner"))
+    end
     if get(config.weights.overrides, :root_constant, 1.0) != 1.0
         config.sampler isa WeightedDerivationSampler &&
             config.sampler.completion_probability == 0 &&
@@ -6318,8 +6340,59 @@ function _guarded_sampling_options(relation::CoreRelation, target_ty::Ty, scope_
         scale = length(options)
         options = [(kind=option.kind, value=option.value, weight=option.weight / scale) for option in options]
     end
+    options = _balance_guarded_families(options, relation)
     relation.sampling_options[key] = options
     return options
+end
+
+# Same runtime value is one family even under primitive aliases. No factory is
+# executed to discover an identity. Factory-only/custom heads may declare a
+# stable Symbol; otherwise (source,name) groups their type instances only.
+function _guarded_family_identity(head::HeadEntry, relation::CoreRelation)
+    if _metadata_has(head.metadata, :value)
+        return (:value, _metadata_get(head.metadata, :value, nothing))
+    elseif head.source === :constant && haskey(relation.global_consts, head.name)
+        return (:value, relation.global_consts[head.name])
+    elseif head.source === :variable && haskey(relation.local_consts, head.name)
+        return (:value, relation.local_consts[head.name])
+    elseif head.source === :preset && haskey(relation.presets, head.name)
+        return (:value, relation.presets[head.name])
+    end
+    family = _metadata_get(head.metadata, :guarded_family, nothing)
+    family === nothing && return (:head, head.source, head.name)
+    family isa Symbol || throw(ArgumentError("guarded_family metadata must be a Symbol"))
+    return (:declared, family)
+end
+
+"""Mix prepared guarded instances with inverse-family-size allocation.
+
+No heads/types/child feasibility are changed. Keys use runtime `===` identity,
+then declared metadata or the documented source/name fallback. The relation
+supplies weights and read-only value contexts. Zero total mass returns unchanged;
+invalid declared family metadata fails only when this opt-in policy is active.
+"""
+function _balance_guarded_families(options, relation::CoreRelation)
+    p = get(relation.weights.overrides, :guarded_family_balance, 0.0)
+    (p == 0 || isempty(options)) && return options
+    total = sum(option.weight for option in options)
+    total > 0 || return options
+    keys, ids, counts = Any[], Int[], Int[]
+    for option in options
+        key = _guarded_family_identity(option.value.head, relation)
+        id = findfirst(existing -> existing === key, keys)
+        if id === nothing
+            push!(keys, key)
+            push!(counts, 0)
+            id = length(keys)
+        end
+        push!(ids, id)
+        counts[id] += 1
+    end
+    family_total = sum(option.weight / counts[id] for (option, id) in zip(options, ids))
+    family_total > 0 || return options
+    factor = total / family_total
+    return [merge(option, (; weight=option.weight *
+        ((1 - p) + p * factor / counts[id]))) for (option, id) in zip(options, ids)]
 end
 
 function _head_option_weight(relation::CoreRelation, rule::CoreRule)

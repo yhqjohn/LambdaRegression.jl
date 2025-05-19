@@ -3,6 +3,8 @@ Complete-program regularized evolution with rebuildable, nonoverlapping scalar
 views. Programs remain authoritative; views belong to exactly one frozen value.
 The scalar engine owns selection, archives, maintenance and accounting. This
 adapter supplies transactional variation and complete-objective numerical work.
+Tournament frequency pressure uses complete-program complexity; it is not a
+measure of higher-order structure-family diversity.
 """
 
 import ..ProgramAnalysis
@@ -36,11 +38,14 @@ mutable struct _JointDomain{F}
     rtr_window::Int
     global_proposal::F
     global_probability::Float64
+    function_exposure_probability::Float64
+    program_simplification_steps::Int
     pending_selection::Union{Nothing,Tuple{Int,Int}}
     next_id::Int
     counters::Dict{Symbol,Int}
     events::Vector{NamedTuple}
     event_capacity::Int
+    fixed_template::Union{Nothing,_JointValue}
 end
 
 _joint_count!(domain, key) = (domain.counters[key] = get(domain.counters, key, 0) + 1)
@@ -103,10 +108,16 @@ function _joint_value(domain::_JointDomain, program::Program;
             program.local_consts[name])
         for name in outside_names if haskey(program.local_consts, name))
     domain.next_id += 1
-    return _JointValue(program, regions,
+    value = _JointValue(program, regions,
         [ScalarSearch._node_scalar_candidate(region.expr) for region in regions],
         AstTree(skeleton), [region.dependencies for region in regions], outside,
         length(source.index.nodes), domain.next_id, Tuple(parent_ids), origin)
+    if domain.fixed_template !== nothing &&
+            !_joint_same_template(domain.fixed_template, value)
+        _joint_count!(domain, :fixed_template_rejections)
+        return _region_error(:joint_fixed_template)
+    end
+    return value
 end
 
 # This is deliberately stricter than an observational structural bucket. The
@@ -255,16 +266,34 @@ function ScalarSearch._regularized_refine_value(domain::_JointDomain,
     return (child, refined_loss, count, invalid)
 end
 
-function ScalarSearch._regularized_simplify_value(domain::_JointDomain, value::_JointValue)
+function ScalarSearch._regularized_simplify_value(domain::_JointDomain, value::_JointValue, rng)
     edits = Pair{Int,ScalarExpr}[]
     for (slot, region) in enumerate(value.regions)
         expression = ScalarSearch._simplify_scalar(region.expr)
         ScalarSearch._same_scalar_expression(expression, region.expr) ||
             push!(edits, slot => expression)
     end
-    isempty(edits) && return nothing
-    child = _joint_replace(domain, value, edits; origin=:simplification)
-    return child isa Err ? nothing : child
+    child = isempty(edits) ? value :
+        _joint_replace(domain, value, edits; origin=:simplification)
+    child isa Err && return nothing
+    for _ in 1:domain.program_simplification_steps
+        values, types = copy(child.program.local_consts), copy(child.program.local_consts_ty)
+        tree = Mutations.mutate_tree(child.program.tree, domain.target_ty;
+            rng, global_consts_ty=merge(domain.type_context, domain.input_types),
+            local_consts=values, local_consts_ty=types,
+            mutations=[Mutations.BetaReduceMutation()],
+            chooser=Mutations.WeightedPairChooser(), provider=Mutations.IndexedProvider(),
+            max_try=1, bloat_policy=Mutations.BloatPolicy(
+                enabled=true, max_nodes=domain.max_nodes, max_nodes_delta=domain.max_nodes))
+        tree isa Err && break
+        proposed = _joint_value(domain, _publish_program(tree, values, types);
+            parent_ids=(value.id,), origin=:simplification)
+        proposed isa Err && break
+        child = proposed
+    end
+    # Even a beta contraction can change bounded execution or a custom objective.
+    # The maintenance owner scores this complete proposal before replacement.
+    return child === value ? nothing : child
 end
 
 function ScalarSearch._regularized_sample_mutation(domain::_JointDomain,
@@ -292,12 +321,81 @@ function _joint_global_child(domain, rng, parent, donor)
     return (child, true)
 end
 
+# Only the complete output's existing lambda prefix is traversed. Four remaining
+# concrete arrows may be exposed; a mu/other result never gets unfolded here.
+function _joint_function_exposure_plan(domain, parent)
+    isempty(parent.regions) || return nothing
+    node, ty = parent.program.tree.root, TypeSystem.prune(domain.target_ty)
+    path = Int[]
+    while node isa AbsNode
+        ty isa TyFun || return nothing
+        push!(path, 1)
+        node, ty = node.body, TypeSystem.prune(ty.res)
+    end
+    for steps in 1:4
+        ty isa TyFun || return nothing
+        ty = TypeSystem.prune(ty.res)
+        ty == FloatTy && return (; path, steps)
+    end
+    return nothing
+end
+
+"""Propose one owned output-lambda exposure using existing typed eta rewrites.
+
+The preflight plan anchors the complete program's output prefix, not arbitrary
+callbacks. Each step prepares fresh typed sites and checks complete bounds;
+failure discards every intermediate. No score or parent syntax is reused as a
+candidate certificate. The normal offspring owner scores/adopts the final value.
+"""
+function _joint_function_exposure_child(domain, rng, parent, plan)
+    _joint_count!(domain, :function_exposure_attempts)
+    program, path = parent.program, copy(plan.path)
+    values, types = copy(program.local_consts), copy(program.local_consts_ty)
+    context = _merged_type_context(program, domain.type_context, domain.input_types)
+    ctx = (; local_consts=values, local_consts_ty=types,
+        global_consts_ty=merge(domain.type_context, domain.input_types),
+        tyfactory=TypeSystem.newtyvar, symfactory=SymbolGenerator(),
+        const_symfactory=ConstSymbolFactory())
+    for _ in 1:plan.steps
+        tree = AstTree(deepcopy(program.tree.root))
+        env = Mutations.MutationEnv(rng, domain.target_ty, context, tree, nothing,
+            false, IdDict{Any,Any}(), Mutations.AdaptivePolicy(),
+            IdDict{DataType,Mutations.MutationStat}(), Mutations.BloatPolicy())
+        provider = Mutations.IndexedProvider()
+        Mutations.prepare!(provider, tree, context, env, ctx) isa Err && return (parent, false)
+        sites = Mutations.sites(provider)
+        position = findfirst(site -> site.path == path, sites)
+        position === nothing && return (parent, false)
+        site = Mutations._remap_site(tree, sites[position], env.analysis, ctx)
+        site isa Err && return (parent, false)
+        mutation = Mutations.EtaExpandMutation()
+        Mutations.is_site_eligible(mutation, site, env, ctx) || return (parent, false)
+        Mutations.apply(mutation, tree, site, env, ctx) isa Err && return (parent, false)
+        source = prepare_source(tree, context, domain.target_ty;
+            max_nodes=domain.max_nodes, max_depth=domain.max_depth)
+        source isa Err && return (parent, false)
+        program = _publish_program(source.index.tree, copy(values), copy(types))
+        push!(path, 1)
+    end
+    child = _joint_value(domain, program;
+        parent_ids=(parent.id,), origin=:function_exposure)
+    (child isa Err || isempty(child.regions)) && return (parent, false)
+    _joint_count!(domain, :function_exposure_changed)
+    return (child, true)
+end
+
 function ScalarSearch._regularized_named_child(domain::_JointDomain, rng,
         parent::_JointValue, donor::_JointValue, feature_count, config, kind;
         temperature=1.0)
     selection = domain.pending_selection
     domain.pending_selection = nothing
     kind in (:simplify, :do_nothing, :optimize) && return (parent, false)
+    if isempty(parent.regions) && domain.function_exposure_probability > 0
+        plan = _joint_function_exposure_plan(domain, parent)
+        if plan !== nothing && rand(rng) < domain.function_exposure_probability
+            return _joint_function_exposure_child(domain, rng, parent, plan)
+        end
+    end
     if isempty(parent.regions) || (domain.global_probability > 0 &&
             rand(rng) < domain.global_probability)
         return _joint_global_child(domain, rng, parent, donor)
@@ -382,12 +480,28 @@ function ScalarSearch._regularized_replacement_index(domain::_JointDomain,
 end
 
 function ScalarSearch._regularized_observe(domain::_JointDomain,
-        state, event, parent, child, admitted)
+        state, event, parent, child, admitted; new_offspring::Bool=false)
     _joint_count!(domain, admitted ? :admitted : :not_admitted)
-    child.value.origin === :global && admitted && _joint_count!(domain, :global_admitted)
+    if new_offspring && child.value.origin === :global
+        _joint_count!(domain, :global_scored)
+        if isfinite(child.loss)
+            _joint_count!(domain, :global_valid)
+            admitted && _joint_count!(domain, :global_admitted)
+        end
+    elseif new_offspring && child.value.origin === :function_exposure
+        _joint_count!(domain, :function_exposure_scored)
+        if isfinite(child.loss)
+            _joint_count!(domain, :function_exposure_valid)
+            admitted && _joint_count!(domain, :function_exposure_admitted)
+        end
+    end
+    before = parent === nothing ? nothing :
+        (; id=parent.value.id, loss=parent.loss,
+            complexity=parent.value.complexity)
     _joint_event!(domain, (; event, id=child.value.id,
         parent_ids=child.value.parent_ids, origin=child.value.origin,
-        loss=child.loss, complexity=child.value.complexity, admitted))
+        loss=child.loss, complexity=child.value.complexity, admitted, new_offspring,
+        before))
     return nothing
 end
 
@@ -410,6 +524,43 @@ stable. Nodes outside the scalar bridge remain eligible for global proposals.
 `config.max_complexity` bounds each scalar region; `max_nodes` bounds the whole
 AST and indexes complete-complexity maintenance. No independent hole population
 is created. Invalid initial syntax or an insufficient budget fails explicitly.
+
+`seed_per_island=true` places independent copies of the supplied complete
+programs, in order, in each island's leading slots (up to its capacity). Other
+slots keep the existing randomized initialization. The option changes only the
+starting population: later selection may replace those members. The default
+`false` preserves the original global slot schedule.
+
+`program_simplification_steps=0` keeps only the existing scalar simplification.
+Values 1 or 2 additionally propose that many bounded existing beta mutations
+per member at cycle maintenance. Each step rechecks typing and complete AST
+bounds; failed steps stop the proposal. The final complete program is freshly
+scored against the current task, uses structural budget, and replaces its member
+only when non-worse, without refreshing age. No beta equivalence or score reuse
+is assumed, including for bounded execution and custom objectives.
+
+`function_exposure_probability=0.0` disables output-function exposure without
+an extra RNG draw. A positive probability applies only to parents with no Float
+regions and a concrete finite output-function chain: following existing leading
+lambdas, at most four existing typed eta expansions expose its Float body. The
+whole candidate is freshly scored and ordinarily admitted; recursive/other
+result types and longer chains are ineligible. A selected failure consumes the
+ordinary attempt and does not retry or fall back to a global proposal.
+
+`fixed_template=true` anchors every constructed value to the first program's
+literal outside syntax, exact region paths, dependency replacements and outside
+materials via `_joint_same_template`. It requires disabled global proposals,
+function exposure and program-level simplification. Scalar initialization,
+variation, simplification and numerical publication all recheck this boundary;
+the observational structure key grants no reuse rights. A mismatched additional
+seed fails initialization; a mismatched offspring is an expected failed edit.
+
+`use_frequency_in_tournament=true` and `adaptive_parsimony_scaling=1040.0`
+control the scalar engine's tournament cost adjustment by full-program
+complexity frequency. This is a whole-program complexity frequency, not
+higher-order structure-family diversity. Turning it off disables only this
+tournament adjustment; mutation acceptance continues to use its existing
+frequency policy. The scale must convert to a finite nonnegative `Float64`.
 """
 function initialize_joint_search(programs, target_ty, type_context, score;
         config::ScalarSearchConfig=ScalarSearchConfig(evolution_strategy=:regularized),
@@ -418,8 +569,13 @@ function initialize_joint_search(programs, target_ty, type_context, score;
         max_nodes::Int=2048, max_depth::Int=256,
         group_exchange_probability::Real=0.25, replacement::Symbol=:age,
         rtr_window::Int=8, global_proposal=nothing, global_probability::Real=0.02,
+        function_exposure_probability::Real=0.0,
+        program_simplification_steps::Int=0,
         ncycles_per_iteration::Int=64, frequency_window::Int=100000,
-        loss_normalization::Real=1.0, event_capacity::Int=256)
+        loss_normalization::Real=1.0, event_capacity::Int=256,
+        fixed_template::Bool=false, seed_per_island::Bool=false,
+        use_frequency_in_tournament::Bool=true,
+        adaptive_parsimony_scaling::Real=1040.0)
     isempty(programs) && throw(ArgumentError("joint search requires initial programs"))
     config.evolution_strategy === :regularized ||
         throw(ArgumentError("joint search requires regularized maintenance"))
@@ -427,23 +583,35 @@ function initialize_joint_search(programs, target_ty, type_context, score;
     replacement in (:age, :rtr) || throw(ArgumentError("replacement must be :age or :rtr"))
     rtr_window > 0 || throw(ArgumentError("rtr_window must be positive"))
     all(p -> isfinite(p) && 0 <= p <= 1,
-        (group_exchange_probability, global_probability)) || throw(ArgumentError("invalid proposal probability"))
+        (group_exchange_probability, global_probability, function_exposure_probability)) ||
+        throw(ArgumentError("invalid proposal probability"))
     event_capacity >= 0 || throw(ArgumentError("event_capacity must be nonnegative"))
+    program_simplification_steps in 0:2 || throw(ArgumentError(
+        "program_simplification_steps must be 0, 1, or 2"))
+    fixed_template && (global_proposal !== nothing || global_probability != 0 ||
+        function_exposure_probability != 0 || program_simplification_steps != 0) &&
+        throw(ArgumentError("fixed_template requires disabled global/exposure/program simplification"))
     ncycles_per_iteration > 0 || throw(ArgumentError("maintenance period must be positive"))
     isfinite(loss_normalization) && loss_normalization > 0 ||
         throw(ArgumentError("loss_normalization must be finite and positive"))
+    frequency_scale = Float64(adaptive_parsimony_scaling)
+    isfinite(frequency_scale) && frequency_scale >= 0 ||
+        throw(ArgumentError("adaptive_parsimony_scaling must be finite and nonnegative"))
     _valid_bounds(max_nodes, max_depth)
     domain = _JointDomain(target_ty, Dict{Symbol,TyLike}(type_context),
         Dict{Symbol,TyLike}(input_types), named_input_policy, max_nodes, max_depth,
         Float64(group_exchange_probability), replacement, rtr_window,
-        global_proposal, Float64(global_probability), nothing, 0, Dict{Symbol,Int}(),
-        NamedTuple[], event_capacity)
+        global_proposal, Float64(global_probability), Float64(function_exposure_probability),
+        program_simplification_steps,
+        nothing, 0, Dict{Symbol,Int}(),
+        NamedTuple[], event_capacity, nothing)
     initial = _JointValue[]
     for program in programs
         owned = Program(program.tree; local_consts=program.local_consts,
             local_consts_ty=program.local_consts_ty)
         value = _joint_value(domain, owned)
         value isa Err && throw(ArgumentError("invalid joint initial program: $(value.value)"))
+        fixed_template && domain.fixed_template === nothing && (domain.fixed_template = value)
         push!(initial, value)
     end
     structural = ScalarSearch._split_budget(config.max_evaluations, island_count)
@@ -451,7 +619,8 @@ function initialize_joint_search(programs, target_ty, type_context, score;
     totals = config.max_total_evaluations === nothing ? fill(nothing, island_count) :
         ScalarSearch._split_budget(config.max_total_evaluations, island_count)
     flow = ScalarSearch._NodeRegularizedFlow(nothing, true, 1.0, 3.17,
-        ncycles_per_iteration, true, 0.0614, 0.982, true, 1040.0)
+        ncycles_per_iteration, true, 0.0614, 0.982,
+        use_frequency_in_tournament, frequency_scale)
     frequency = ScalarSearch._RegularizedFrequency(frequency_window, max_nodes)
     states = Any[]
     function objective(value)
@@ -466,11 +635,20 @@ function initialize_joint_search(programs, target_ty, type_context, score;
             constants[island], totals[island])
         island_rng = MersenneTwister(rand(rng, UInt64))
         values = _JointValue[]
+        preserved_seed_count = seed_per_island ? min(length(initial), config.population_size) : 0
         for slot in 1:config.population_size
             position = (island - 1) * config.population_size + slot
-            seed = initial[mod1(position, length(initial))]
+            preserved_seed = slot <= preserved_seed_count
+            seed_source = preserved_seed ? initial[slot] : initial[mod1(position, length(initial))]
+            seed = seed_source
+            if preserved_seed
+                copied = _joint_value(domain, seed_source.program)
+                copied isa Err && throw(ArgumentError(
+                    "invalid per-island joint initial program copy: $(copied.value)"))
+                seed = copied
+            end
             value = seed
-            if position > length(initial) && !isempty(seed.regions)
+            if position > length(initial) && !preserved_seed && !isempty(seed.regions)
                 edits = Pair{Int,ScalarExpr}[]
                 for (region_slot, region) in enumerate(seed.regions)
                     local_config = _joint_local_config(config, region)
@@ -623,6 +801,91 @@ end
     end
 end
 
+@testitem "joint initialization optionally seeds every island from complete programs" setup=[JointSearchFixture] begin
+    programs = [pair_program(i, i + 0.5) for i in 1:8]
+    same_program(a, b) = a.tree == b.tree &&
+        a.local_consts == b.local_consts && a.local_consts_ty == b.local_consts_ty
+    config = joint_config()
+    default = initialize_joint_search(programs, pair_ty, joint_types, _ -> 1.0;
+        config, island_count=2, rng=MersenneTwister(42))
+    default_report = joint_search_result(default)
+    @test length(default_report.population) == 2
+    @test length.(default_report.population) == [4, 4]
+    @test all(same_program(default_report.population[1][i].program, programs[i]) for i in 1:4)
+    @test all(same_program(default_report.population[2][i].program, programs[i + 4]) for i in 1:4)
+
+    calls = Ref(0)
+    seeded = initialize_joint_search(programs, pair_ty, joint_types,
+        _ -> (calls[] += 1; 1.0); config, island_count=2,
+        rng=MersenneTwister(42), seed_per_island=true)
+    report = joint_search_result(seeded)
+    @test length(report.population) == 2
+    @test length.(report.population) == [4, 4]
+    @test all(same_program(report.population[island][slot].program, programs[slot])
+        for island in 1:2 for slot in 1:4)
+    @test all(seeded.states[1].population[slot].candidate.value.program.local_consts !==
+        seeded.states[2].population[slot].candidate.value.program.local_consts for slot in 1:4)
+    @test all(seeded.states[1].population[slot].candidate.value.regions !==
+        seeded.states[2].population[slot].candidate.value.regions for slot in 1:4)
+    @test report.evaluations == calls[] == 8
+    @test report.attempts == 0
+    @test get(report.counters, :admitted, 0) == 8
+    @test all(programs[i].local_consts == Dict(:a => Float64(i), :b => Float64(i) + 0.5)
+        for i in 1:8)
+
+    one_seed = initialize_joint_search([programs[1]], pair_ty, joint_types, _ -> 1.0;
+        config, island_count=2, rng=MersenneTwister(555), seed_per_island=true)
+    one_seed_report = joint_search_result(one_seed)
+    @test all(same_program(one_seed_report.population[island][1].program, programs[1])
+        for island in 1:2)
+    randomized_origins = [member.candidate.value.origin
+        for (island, state) in enumerate(one_seed.states)
+        for (slot, member) in enumerate(state.population)
+        if !((island, slot) in ((1, 1), (2, 1)))]
+    @test length(randomized_origins) == 6
+    @test all(origin in (:initial, :initial_random) for origin in randomized_origins)
+    @test one_seed_report.evaluations == 8
+end
+
+@testitem "joint tournament frequency controls preserve defaults and mutation frequency" setup=[JointSearchFixture] begin
+    config = joint_config()
+    program = pair_program(1, 2)
+    make_session(; kwargs...) = initialize_joint_search([program], pair_ty,
+        joint_types, _ -> 1.0; config, island_count=1,
+        rng=MersenneTwister(555), kwargs...)
+    default = make_session()
+    explicit_default = make_session(use_frequency_in_tournament=true,
+        adaptive_parsimony_scaling=1040.0)
+    no_tournament_frequency = make_session(use_frequency_in_tournament=false,
+        adaptive_parsimony_scaling=17.0)
+
+    default_state = only(default.states)
+    explicit_state = only(explicit_default.states)
+    disabled_state = only(no_tournament_frequency.states)
+    @test default_state.flow.use_frequency_in_tournament
+    @test default_state.flow.adaptive_parsimony_scaling == 1040.0
+    @test explicit_state.flow.use_frequency_in_tournament
+    @test explicit_state.flow.adaptive_parsimony_scaling == 1040.0
+    @test !disabled_state.flow.use_frequency_in_tournament
+    @test disabled_state.flow.adaptive_parsimony_scaling == 17.0
+    @test default_state.flow.use_frequency
+    @test explicit_state.flow.use_frequency
+    @test disabled_state.flow.use_frequency
+
+    default_population = only(joint_search_result(default).population)
+    explicit_population = only(joint_search_result(explicit_default).population)
+    @test [(c.program.tree, c.program.local_consts, c.loss) for c in default_population] ==
+        [(c.program.tree, c.program.local_consts, c.loss) for c in explicit_population]
+    @test rand(copy(default_state.rng), UInt64) ==
+        rand(copy(explicit_state.rng), UInt64) ==
+        rand(copy(disabled_state.rng), UInt64)
+
+    for invalid_scale in (-1.0, NaN, Inf)
+        @test_throws ArgumentError make_session(
+            adaptive_parsimony_scaling=invalid_scale)
+    end
+end
+
 @testitem "joint configuration atomic edits preserve parents and exact port templates" setup=[JointSearchFixture] begin
     parent = pair_program(1, 2)
     session = initialize_joint_search([parent], pair_ty, joint_types, p -> 1.0;
@@ -639,6 +902,30 @@ end
     @test child.complexity == value.complexity
     @test R._joint_replace(session.domain, value,
         [1 => scalar_input(1)]) isa LambdaRegression.Utils.Err
+end
+
+@testitem "joint fixed template guards initialization and every rebuilt value" setup=[JointSearchFixture] begin
+    config = joint_config()
+    session = initialize_joint_search([pair_program(1, 2)], pair_ty, joint_types,
+        _ -> 1.0; config, island_count=1, rng=MersenneTwister(1234),
+        fixed_template=true, global_probability=0.0)
+    anchor = session.domain.fixed_template
+    @test all(m -> R._joint_same_template(anchor, m.candidate.value),
+        only(session.states).population)
+    child = R._joint_replace(session.domain, anchor,
+        [1 => scalar_constant(7), 2 => scalar_constant(9)])
+    @test child isa R._JointValue
+    @test R._joint_same_template(anchor, child)
+    wrong = Program(AstTree(ConstNode(:q));
+        local_consts=Dict(:q => [1.0, 2.0]),
+        local_consts_ty=Dict{Symbol,TyLike}(:q => pair_ty))
+    @test R._joint_value(session.domain, wrong) isa LambdaRegression.Utils.Err
+    @test_throws ArgumentError initialize_joint_search([anchor.program, wrong],
+        pair_ty, joint_types, _ -> 1.0; config, island_count=1,
+        fixed_template=true, global_probability=0.0)
+    @test_throws ArgumentError initialize_joint_search([anchor.program], pair_ty,
+        joint_types, _ -> 1.0; config, fixed_template=true)
+    @test session.domain.counters[:fixed_template_rejections] >= 1
 end
 
 @testitem "joint parameter adaptation preserves shared symbols and actual score budget" setup=[JointSearchFixture] begin
@@ -720,6 +1007,161 @@ end
     @test calls[] == joint_search_result(session).evaluations
 end
 
+@testsnippet JointSimplificationFixture begin
+    using Test, Random
+    using LambdaRegression.Regression
+    using LambdaRegression.ScalarSearch
+    using LambdaRegression.Programs: Program
+    using LambdaRegression.ASTs.NodeASTs
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike
+    using LambdaRegression.Utils: Err
+    const R = LambdaRegression.Regression
+    const S = LambdaRegression.ScalarSearch
+    const beta_types = Dict{Symbol,TyLike}(
+        :FADD => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
+        :FMUL => TyFun(FloatTy, TyFun(FloatTy, FloatTy)))
+    function wrapped_product()
+        head = AppNode(AbsNode(:unused, ConstNode(:FMUL)), ConstNode(:FADD))
+        argument = AppNode(AbsNode(:identity, IndexNode(0)), ConstNode(:a))
+        return Program(AstTree(AppNode(AppNode(head, ConstNode(:a)), argument));
+            local_consts=Dict(:a => 2.0), local_consts_ty=Dict{Symbol,TyLike}(:a => FloatTy))
+    end
+    function beta_session(score; steps=2, max_evaluations=8, max_total_evaluations=nothing)
+        config = ScalarSearchConfig(; population_size=2, max_evaluations,
+            max_total_evaluations, tournament_size=2, elite_count=1,
+            initial_depth=0, unary_operators=(), binary_operators=(:+, :*),
+            constant_refinement_iterations=0, max_constant_refinement_evaluations=0,
+            evolution_strategy=:regularized)
+        program = wrapped_product()
+        session = initialize_joint_search([program, program], FloatTy, beta_types, score;
+            config, island_count=1, rng=MersenneTwister(1234),
+            program_simplification_steps=steps)
+        # Isolate maintenance from independent archive migration.
+        only(session.states).flow = S._NodeRegularizedFlow(
+            nothing, false, 1.0, 3.17, 1, false, 0.0, 0.982, false, 1040.0)
+        return session
+    end
+end
+
+@testitem "joint bounded program simplification merges regions and preserves sharing" setup=[JointSimplificationFixture] begin
+    for steps in 0:2
+        session = beta_session(p -> 1.0; steps)
+        value = only(session.states).population[1].candidate.value
+        snapshot = deepcopy(value.program.tree)
+        child = S._regularized_simplify_value(session.domain, value, MersenneTwister(1234))
+        if steps == 0
+            @test child === nothing
+        else
+            @test child.complexity == value.complexity - 3steps
+            @test child.program.local_consts == Dict(:a => 2.0)
+            @test child.program.local_consts_ty == value.program.local_consts_ty
+            @test R._joint_scalar_names(child) == [:a]
+            @test child.origin === :simplification
+            @test child.parent_ids == (value.id,)
+            steps == 2 && @test length(child.regions) == 1
+        end
+        @test value.program.tree == snapshot
+    end
+    @test_throws ArgumentError beta_session(p -> 1.0; steps=3)
+end
+
+@testitem "joint program simplification rescores complete objectives and retains age" setup=[JointSimplificationFixture] begin
+    calls = Ref(0)
+    score(p) = (calls[] += 1; Float64(length(p.tree)))
+    session = beta_session(score)
+    state = only(session.states)
+    ages, clock = [m.born for m in state.population], state.birth_clock
+    before = state.population[1].candidate.value.complexity
+    S._node_state_maintain_cycle!(state, 8)
+    @test calls[] == state.evaluations == 4
+    @test all(m -> m.candidate.value.complexity == before - 6, state.population)
+    @test all(m -> m.candidate.loss == length(m.candidate.value.program.tree), state.population)
+    @test [m.born for m in state.population] == ages
+    @test state.birth_clock == clock
+    @test all(candidate.loss == length(candidate.value.program.tree) for candidate in values(state.archive))
+
+    for invalid in (false, true)
+        original_size = length(wrapped_product().tree)
+        objective = p -> length(p.tree) == original_size ? 0.0 :
+            invalid ? Err(:bounded_task_rejected) : 1.0
+        rejected = beta_session(objective)
+        checked = only(rejected.states)
+        previous = [m.candidate for m in checked.population]
+        S._node_state_maintain_cycle!(checked, 8)
+        @test checked.evaluations == 4
+        @test checked.invalid_evaluations == (invalid ? 2 : 0)
+        @test [m.candidate for m in checked.population] == previous
+        @test checked.best.loss == 0.0
+    end
+end
+
+@testitem "joint program simplification obeys structural and total slices" setup=[JointSimplificationFixture] begin
+    for (limit, total, expected) in ((2, nothing, 2), (3, nothing, 3), (8, 2, 2), (8, 3, 3))
+        session = beta_session(p -> Float64(length(p.tree)); max_total_evaluations=total)
+        state = only(session.states)
+        S._node_state_maintain_cycle!(state, limit)
+        @test state.evaluations == expected
+        @test count(m -> m.candidate.value.complexity == 5, state.population) == expected - 2
+    end
+end
+
+@testitem "joint program simplification preserves recursive binders and full bounds" setup=[JointSimplificationFixture] begin
+    config = ScalarSearchConfig(population_size=2, max_evaluations=2,
+        tournament_size=2, elite_count=1, constant_refinement_iterations=0,
+        max_constant_refinement_evaluations=0, evolution_strategy=:regularized)
+    recursive = Program(AstTree(FunctionDefNode(AbsNode(:x,
+        AppNode(AbsNode(:u, AppNode(IndexNode(2), IndexNode(0))), IndexNode(0))))))
+    session = initialize_joint_search([recursive, recursive], TyFun(FloatTy, FloatTy),
+        Dict{Symbol,TyLike}(), p -> 1.0; config, island_count=1,
+        program_simplification_steps=1)
+    value = only(session.states).population[1].candidate.value
+    child = S._regularized_simplify_value(session.domain, value, MersenneTwister(1))
+    @test child.program.tree == AstTree(FunctionDefNode(AbsNode(:x,
+        AppNode(IndexNode(1), IndexNode(0)))))
+    @test value.program.tree == recursive.tree
+
+    # Substitution would duplicate a large opaque Float argument beyond the
+    # full-program node cap. Scalar-region simplification cannot see across it.
+    argument = foldl((child, _) -> AppNode(ConstNode(:OPAQUE), child), 1:3;
+        init=ConstNode(:x))
+    duplicate = Program(AstTree(AppNode(
+        AbsNode(:u, AppNode(AppNode(ConstNode(:FMUL), IndexNode(0)), IndexNode(0))), argument)))
+    types = merge(beta_types, Dict{Symbol,TyLike}(:OPAQUE => TyFun(FloatTy, FloatTy)))
+    limited = initialize_joint_search([duplicate, duplicate], FloatTy, types, p -> 1.0;
+        config, island_count=1, input_types=Dict{Symbol,TyLike}(:x => FloatTy),
+        max_nodes=length(duplicate.tree), program_simplification_steps=2)
+    parent = only(limited.states).population[1].candidate.value
+    @test S._regularized_simplify_value(limited.domain, parent, MersenneTwister(1)) === nothing
+    @test parent.program.tree == duplicate.tree
+    @test only(limited.states).evaluations == 2
+end
+
+@testitem "joint global accounting excludes copies refinement and migration" setup=[JointSimplificationFixture] begin
+    session = beta_session(p -> 1.0; steps=0)
+    state = only(session.states)
+    parent = state.population[1].candidate
+    value = R._joint_value(session.domain, parent.value.program;
+        parent_ids=(parent.value.id,), origin=:global)
+    child = S._NodeSearchCandidate(value, 1.0, 3, true)
+    for event in (:do_nothing, :simplify, :migration, :constant_refinement)
+        S._regularized_observe(session.domain, state, event, parent, child, true)
+        @test last(session.domain.events).before ==
+            (; id=parent.value.id, loss=parent.loss,
+                complexity=parent.value.complexity)
+    end
+    @test get(session.domain.counters, :global_scored, 0) == 0
+    @test get(session.domain.counters, :global_admitted, 0) == 0
+    S._regularized_observe(session.domain, state, :add, parent, child, true; new_offspring=true)
+    invalid = S._NodeSearchCandidate(value, Inf, 4, true)
+    S._regularized_observe(session.domain, state, :add, parent, invalid, false; new_offspring=true)
+    @test session.domain.counters[:global_scored] == 2
+    @test session.domain.counters[:global_valid] == 1
+    @test session.domain.counters[:global_admitted] == 1
+    @test count(e -> e.new_offspring, session.domain.events) == 2
+    S._regularized_observe(session.domain, state, :initial_population, nothing, child, true)
+    @test last(session.domain.events).before === nothing
+end
+
 @testitem "joint initialization admits extended operators only at matching Float signatures" begin
     using Test, Random
     using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode, IndexNode
@@ -771,4 +1213,162 @@ end
     wrong_unary, wrong_binary = LambdaRegression.ScalarRegions._operator_sets(wrong_context)
     @test :tan ∉ wrong_unary
     @test :^ ∉ wrong_binary
+end
+
+@testsnippet JointFunctionExposureFixture begin
+    using Test, Random
+    using LambdaRegression.Regression
+    using LambdaRegression.ScalarSearch
+    using LambdaRegression.Programs: Program
+    using LambdaRegression.ASTs.NodeASTs
+    using LambdaRegression.TypeSystem: FloatTy, IntTy, TyFun, TyMu, TyLike, newtyvar
+    using LambdaRegression.Utils: Err
+    const R = LambdaRegression.Regression
+    const S = LambdaRegression.ScalarSearch
+    const binary_float = TyFun(FloatTy, TyFun(FloatTy, FloatTy))
+    function exposure_session(program=Program(AstTree(ConstNode(:FADD)));
+            target=binary_float, types=Dict{Symbol,TyLike}(:FADD=>binary_float,
+                :SQR=>TyFun(FloatTy,FloatTy)), probability=1.0,
+            score=p->Float64(length(p.tree)), max_nodes=96, max_depth=24,
+            global_proposal=nothing)
+        config = ScalarSearchConfig(population_size=2,max_evaluations=8,
+            tournament_size=2,elite_count=1,mutation_probability=1.0,
+            crossover_probability=0.0,constant_refinement_iterations=0,
+            max_constant_refinement_evaluations=0,evolution_strategy=:regularized)
+        session = initialize_joint_search([program,program],target,types,score;
+            config,island_count=1,rng=MersenneTwister(42),max_nodes,max_depth,
+            global_proposal,global_probability=0.0,
+            function_exposure_probability=probability)
+        only(session.states).flow = S._NodeRegularizedFlow(
+            nothing,false,1.0,3.17,64,false,0.0,0.982,false,1040.0)
+        return session
+    end
+    exposure_parent(session) = only(session.states).population[1].candidate.value
+    function expose(session,rng=MersenneTwister(2000))
+        parent=exposure_parent(session)
+        S._regularized_named_child(session.domain,rng,parent,parent,0,
+            only(session.states).config,:restart)
+    end
+end
+
+@testitem "joint function exposure completes finite output bodies and owns syntax" setup=[JointFunctionExposureFixture] begin
+    for (program,steps,size) in ((Program(AstTree(ConstNode(:FADD))),2,3),
+            (Program(AstTree(AbsNode(:x,ConstNode(:SQR)))),1,2))
+        session=exposure_session(program)
+        parent=exposure_parent(session)
+        snapshot=deepcopy(parent.program.tree)
+        plan=R._joint_function_exposure_plan(session.domain,parent)
+        @test plan.steps==steps
+        child,changed=expose(session)
+        @test changed
+        @test child.origin===:function_exposure
+        @test child.parent_ids==(parent.id,)
+        @test length(child.regions)==1
+        @test S.scalar_complexity(only(child.regions).expr)==size
+        @test only(child.regions).dependencies==[IndexNode(0),IndexNode(1)]
+        @test child.program.tree.root isa AbsNode
+        @test child.program.tree.root.body isa AbsNode
+        @test parent.program.tree==snapshot
+        @test child.program.tree !== parent.program.tree
+        @test child.program.local_consts !== parent.program.local_consts
+        @test session.domain.counters[:function_exposure_attempts]==1
+        @test session.domain.counters[:function_exposure_changed]==1
+        @test only(session.states).evaluations==2
+    end
+end
+
+@testitem "joint function exposure is disabled without RNG and skips ineligible parents" setup=[JointFunctionExposureFixture] begin
+    disabled=exposure_session(;probability=0.0)
+    rng=MersenneTwister(555)
+    reference=copy(rng)
+    child,changed=expose(disabled,rng)
+    @test !changed && child===exposure_parent(disabled)
+    @test rand(rng)==rand(reference)
+    @test !haskey(disabled.domain.counters,:function_exposure_attempts)
+    parent=exposure_parent(disabled)
+    default=initialize_joint_search([parent.program,parent.program],binary_float,
+        disabled.domain.type_context,p->1.0;config=only(disabled.states).config,island_count=1)
+    @test default.domain.function_exposure_probability==0.0
+    for probability in (-0.1,1.1,NaN)
+        @test_throws ArgumentError exposure_session(;probability)
+    end
+    variable=newtyvar(0)
+    recursive=TyMu(variable,TyFun(FloatTy,variable))
+    long=foldr((_,tail)->TyFun(FloatTy,tail),1:5;init=FloatTy)
+    for target in (TyFun(FloatTy,IntTy),recursive,long)
+        session=exposure_session(Program(AstTree(ConstNode(:opaque)));
+            target,types=Dict{Symbol,TyLike}(:opaque=>target))
+        @test R._joint_function_exposure_plan(session.domain,exposure_parent(session))===nothing
+        skipped_rng=MersenneTwister(1234)
+        skipped_reference=copy(skipped_rng)
+        @test !last(expose(session,skipped_rng))
+        @test rand(skipped_rng)==rand(skipped_reference)
+        @test !haskey(session.domain.counters,:function_exposure_attempts)
+    end
+    local_program=Program(AstTree(AbsNode(:x,IndexNode(0))))
+    local_session=exposure_session(local_program;target=TyFun(FloatTy,FloatTy))
+    parent=exposure_parent(local_session)
+    @test R._joint_function_exposure_plan(local_session.domain,parent)===nothing
+    rng1,rng2=MersenneTwister(1111),MersenneTwister(1111)
+    local_session.domain.function_exposure_probability=0.0
+    first=S._regularized_named_child(local_session.domain,rng1,parent,parent,1,
+        only(local_session.states).config,:add)
+    local_session.domain.function_exposure_probability=1.0
+    second=S._regularized_named_child(local_session.domain,rng2,parent,parent,1,
+        only(local_session.states).config,:add)
+    @test last(first)==last(second)
+    @test rand(rng1)==rand(rng2)
+    @test !haskey(local_session.domain.counters,:function_exposure_attempts)
+end
+
+@testitem "joint function exposure bounds discard all intermediate edits without fallback" setup=[JointFunctionExposureFixture] begin
+    for (max_nodes,max_depth) in ((4,24),(96,2))
+        fallback=Ref(0)
+        session=exposure_session(;max_nodes,max_depth,
+            global_proposal=(p,d,rng)->(fallback[]+=1;nothing))
+        parent=exposure_parent(session)
+        tree=deepcopy(parent.program.tree)
+        child,changed=expose(session)
+        @test !changed && child===parent
+        @test parent.program.tree==tree
+        @test fallback[]==0
+        @test session.domain.counters[:function_exposure_attempts]==1
+        @test !haskey(session.domain.counters,:function_exposure_changed)
+        @test only(session.states).evaluations==2
+        state=only(session.states)
+        S._node_state_one_offspring!(state,8)
+        @test state.offspring_attempts==1
+        @test state.evaluations==2
+        @test session.domain.counters[:function_exposure_attempts]==2
+        @test fallback[]==0
+    end
+end
+
+@testitem "joint function exposure is fully rescored and uses ordinary admission" setup=[JointFunctionExposureFixture] begin
+    for invalid in (false,true)
+        calls=Ref(0)
+        score(p)=(calls[]+=1; p.tree.root isa AbsNode && invalid ?
+            Err(:task_rejected_expansion) : Float64(length(p.tree)))
+        session=exposure_session(;score)
+        state=only(session.states)
+        S._node_state_one_offspring!(state,8)
+        @test calls[]==state.evaluations==3
+        @test session.domain.counters[:function_exposure_scored]==1
+        @test get(session.domain.counters,:function_exposure_valid,0)==!invalid
+        @test get(session.domain.counters,:function_exposure_admitted,0)==!invalid
+        @test count(m->m.candidate.value.origin===:function_exposure,state.population)==!invalid
+        @test state.invalid_evaluations==invalid
+        event=last(session.domain.events)
+        @test event.new_offspring && event.origin===:function_exposure
+        @test event.admitted==!invalid
+        if !invalid
+            exposed=only(filter(m->m.candidate.value.origin===:function_exposure,state.population)).candidate
+            @test exposed.loss==7.0 # Parent scored 1: no eta-equivalence loss reuse.
+            for event in (:do_nothing,:migration,:constant_refinement)
+                S._regularized_observe(session.domain,state,event,exposed,exposed,true)
+            end
+            @test session.domain.counters[:function_exposure_scored]==1
+            @test session.domain.counters[:function_exposure_admitted]==1
+        end
+    end
 end

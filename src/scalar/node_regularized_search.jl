@@ -87,7 +87,7 @@ function _regularized_refine_value(::Nothing, value::_NodeScalarCandidate,
         rng, restarts)
 end
 
-function _regularized_simplify_value(::Nothing, value::_NodeScalarCandidate)
+function _regularized_simplify_value(::Nothing, value::_NodeScalarCandidate, rng)
     expr = _node_scalar_materialize(value)
     expr isa Err && return nothing
     simplified = _simplify_scalar(expr)
@@ -115,7 +115,8 @@ end
 _regularized_replacement_index(domain, state, parent, child) =
     _node_oldest_index(state.population)
 
-_regularized_observe(domain, state, event, parent, child, admitted) = nothing
+_regularized_observe(domain, state, event, parent, child, admitted;
+    new_offspring::Bool=false) = nothing
 
 function _node_oldest_index(population)
     best = firstindex(population)

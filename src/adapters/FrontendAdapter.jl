@@ -33,6 +33,7 @@ end
 const _ALLOWED_UNARY_OPERATORS = Set((:sin, :cos, :tan, :exp, :log, :abs, :sqrt, :square))
 const _ALLOWED_BINARY_OPERATORS = Set((:+, :-, :*, :/, :^, :max, :min))
 const _DEFAULT_ADAPTER_OPERATOR_SET = (:+, :-, :*, :/, :sin, :cos, :sqrt, :square)
+const _DEFAULT_SCALAR_FIT_OPERATOR_SET = (:+, :-, :*, :/, :square)
 const _SEARCH_CONFIG_FIELDS = Set(fieldnames(ScalarSearchConfig))
 const _SEARCH_KEYWORDS = Set((:stop_loss, :initial_population, :objective))
 
@@ -127,7 +128,7 @@ function _fit_config(kwargs)
 
     if !haskey(options, :operator_set) && !haskey(options, :unary_operators) &&
             !haskey(options, :binary_operators)
-        options[:operator_set] = _DEFAULT_ADAPTER_OPERATOR_SET
+        options[:operator_set] = _DEFAULT_SCALAR_FIT_OPERATOR_SET
     end
     if haskey(options, :operator_set)
         unary, binary = _split_operator_set(pop!(options, :operator_set))
@@ -519,6 +520,20 @@ function generate_pretraining_tasks(; task_kind=:array, kwargs...)
     kind in (:array, :series) || throw(ArgumentError(
         "pretraining task_kind must be array or series"))
     return generate_collection_pretraining_tasks(; task_kind=kind, kwargs...)
+end
+
+@testitem "Frontend scalar defaults and explicit operator overrides" begin
+    using LambdaRegression.FrontendAdapter: _fit_config
+    default, _, _ = _fit_config((;))
+    @test default.unary_operators == (:square,)
+    @test default.binary_operators == (:+, :-, :*, :/)
+    explicit, _, _ = _fit_config((operator_set=["sin", "+"],))
+    @test explicit.unary_operators == (:sin,)
+    @test explicit.binary_operators == (:+,)
+    empty_unary, _, _ = _fit_config((unary_operators=String[], binary_operators=["*"],))
+    @test isempty(empty_unary.unary_operators)
+    @test empty_unary.binary_operators == (:*,)
+    @test_throws ArgumentError _fit_config((operator_set=String[],))
 end
 
 @testitem "Frontend adapter fits and round-trips multiple output channels" begin

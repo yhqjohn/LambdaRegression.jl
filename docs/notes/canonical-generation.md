@@ -31,3 +31,8 @@ targets, select a plan with known premises, complete its children under the
 chosen bounded policy, and lower explicit binders to indices. A completion
 policy may bound nodes, depth, fuel, or provider use; these controls do not
 weaken the finite impossibility decision.
+
+Optional guarded-family balancing redistributes sampling weight among
+constructor families while preserving total mass and legal construction routes.
+It changes sampling preference, not availability, typing, or completion evidence.
+The default is disabled.

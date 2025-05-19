@@ -655,7 +655,7 @@ end
 """
     initialize_age_search(reg, data; population_count=2,
                           population_size=reg.config.population_size,
-                          seed=nothing, recent_capacity=32)
+                          seed=nothing, recent_capacity=32, initial_transform=nothing)
 
 Construct and score each island exactly once through `init_population`, with a
 distinct derived seed per island. Initialization has no hidden population fill;
@@ -665,6 +665,12 @@ for the state's lifetime; injected mutable resources retain their identity.
 Construct default components against the final world and do not replace
 world-defining component fields afterward, because default callables may close
 over that world.
+
+Optional `initial_transform(state, program; rng)` runs on each ordinary initial
+program before its first score, archive insertion or population comparison. It
+must return an owned `Program` or `Err`; the latter stops initialization. The
+callback owns and accounts for its additional work. It may read the partial
+state's counters, but must not mutate the state or the supplied program.
 """
 function initialize_age_search(
     reg::Regressor,
@@ -673,6 +679,7 @@ function initialize_age_search(
     population_size::Int=get(reg.config, :population_size, 0),
     seed=nothing,
     recent_capacity::Int=32,
+    initial_transform=nothing,
 )
     length(data.X) == length(data.Y) || return Err(ArgumentError("X and Y must have the same length"))
     isempty(data.X) && return Err(ArgumentError("age-search data must contain at least one sample"))
@@ -717,6 +724,11 @@ function initialize_age_search(
         for (slot, raw) in enumerate(result)
             raw isa Program || throw(ArgumentError("init_population must return Programs"))
             candidate = raw
+            if initial_transform !== nothing
+                candidate = initial_transform(state, raw; rng=state.rngs[island])
+                candidate isa Err && return candidate
+                candidate isa Program || throw(ArgumentError("initial_transform must return Program or Err"))
+            end
             record = _age_score_record!(state, candidate, (), :initial, :init)
             if record.birth == 0
                 record = AgeSearchIndividual(
@@ -1008,6 +1020,27 @@ end
         data = SupervisedDataset([1.0, 2.0], [1.0, 2.0])
         return reg, data
     end
+end
+
+@testitem "Age search initial transform runs before scoring and can stop partial initialization" setup=[AgeSearchBaseImports] begin
+    reg, data = age_test_fixture()
+    seen = Int[]
+    partial = Ref{Any}(nothing)
+    transform = (state, program; rng) -> begin
+        partial[] = state
+        push!(seen, state.counters.objective_calls)
+        length(seen) == 2 && return Err(:bounded_stop)
+        return Program(program.tree; local_consts=program.local_consts,
+            local_consts_ty=program.local_consts_ty)
+    end
+    result = initialize_age_search(reg, data; population_count=1,
+        initial_transform=transform, seed=3)
+    @test result isa Err
+    @test result.value === :bounded_stop
+    @test seen == [0, 1]
+    @test partial[].counters.objective_calls == 1
+    @test length(partial[].archive) == 1
+    @test partial[].best !== nothing
 end
 
 @testitem "Age search crossover calls one selected recombine direction" setup=[AgeSearchBaseImports] begin

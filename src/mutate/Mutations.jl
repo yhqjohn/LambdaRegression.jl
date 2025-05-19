@@ -243,10 +243,12 @@ body replacement use `SubtreeReplacementMutation` with its injected site lock,
 path-selection policy, and replacement generator.
 
 All three rewrites resolve the selected node from the attempt-local `site.path`;
-stale object identity cannot redirect them. A source or generated unused binding
-is still a call-by-value application `(λx. body) rhs`: `rhs` may therefore
-diverge, time out, or raise a host error even though `x` is unused. These
-operators preserve typing and lexical scope, not termination or totality.
+stale object identity cannot redirect them. In the default prepared native
+evaluator, source-lambda arguments are call-by-need: an unused binding does not
+force its RHS. Host calls are strict; an alternative evaluator may use a
+different evaluation policy. These operators preserve typing and lexical scope,
+not arbitrary effectful-host behavior or resource costs. A subsequently used
+RHS may still diverge, time out, or raise a host error.
 
 `GeneratedBindingInsertionMutation(rhs_types; ...)` is also opt-in. `rhs_types`
 must be an explicit finite collection of closed monotypes and/or fully quantified
@@ -2944,15 +2946,16 @@ end
 """
     CSEMutation(; min_count=1) <: AbstractMutation
 
-Semantics-preserving common subexpression extraction.
+Scope-aware common subexpression extraction for pure source programs.
 
 This mutation chooses an anchor occurrence and delegates to the common
 `Transforms.eliminate_node!` path.  The transformation consumes the
 attempt-local `ProgramAnalysis.SyntaxIndex`, compares captures by binding
 identity, and introduces a let-like application around a legal host.
 
-When `min_count=1`, this acts as a "zero-cost" structural move: it can extract a
-single occurrence to increase structural diversity without changing semantics.
+When `min_count=1`, this extracts a single occurrence without changing its
+completed pure-program value. It adds a binding and can change scalar-edit
+opportunities, tree size, and execution-step costs; it is not a cost-free move.
 Single-lift mode admits non-index sites. Repeated CSE mode (`min_count>1`) keeps
 the default candidate filter to applications so it avoids low-value repeated
 variables and constants.

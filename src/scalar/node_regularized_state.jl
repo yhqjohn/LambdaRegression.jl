@@ -163,7 +163,7 @@ function _node_state_maintain_cycle!(state::_NodeRegularizedState,
         state.config.max_total_evaluations !== nothing &&
             _node_state_total_remaining(state) <= 0 && return state
         simplified = _regularized_simplify_value(
-            state.domain, member.candidate.value)
+            state.domain, member.candidate.value, state.rng)
         if simplified !== nothing
             candidate = _node_state_score_candidate!(
                 state, simplified, member.candidate.evolved, evaluation_limit)
@@ -300,7 +300,7 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
             _node_state_record!(state, child)
             admitted = _node_state_replace_offspring!(state, parent, child)
             _regularized_observe(state.domain, state, :crossover,
-                parent, child, admitted)
+                parent, child, admitted; new_offspring=true)
         end
         return state
     end
@@ -348,7 +348,7 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
             admitted = false
         end
         _regularized_observe(state.domain, state, kind,
-            first_parent, child, admitted)
+            first_parent, child, admitted; new_offspring=true)
     end
     return state
 end

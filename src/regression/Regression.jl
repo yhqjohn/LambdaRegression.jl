@@ -626,6 +626,14 @@ a loader result: it runs no business logic and can be customized with
 support that seam. This is local to AgeSearch; it does not make `recombine` a
 requirement of every `Populations.AbstractCrossover`, which also exposes the
 independent two-child `crossover` interface.
+
+An optional `initialization_candidate_snapshot` callback can capture successful
+pre-growth candidates when `initialization_observer` is also supplied. It runs
+synchronously with a read-only borrowed `(tree, local_consts, local_consts_ty)`
+view, may run concurrently by slot during parallel initialization, must not use
+search RNGs or mutate the borrowed materials, must be thread-safe, and must
+return a detached snapshot. The existing observer still receives the completed
+per-slot diagnostics serially after initialization joins.
 """
 function default_components(;
     global_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
@@ -778,6 +786,7 @@ function default_components(;
     init_growth_mutation=nothing,
     init_population=nothing,
     initialization_observer=nothing,
+    initialization_candidate_snapshot=nothing,
     kwargs...
 )
     haskey(kwargs, :type_inference) && throw(ArgumentError(
@@ -811,6 +820,10 @@ function default_components(;
     initialization_observer === nothing || applicable(initialization_observer, Any[]) ||
         throw(ArgumentError(
             "initialization_observer must accept the ordered diagnostics vector",
+        ))
+    initialization_candidate_snapshot === nothing || initialization_observer !== nothing ||
+        throw(ArgumentError(
+            "initialization_candidate_snapshot requires initialization_observer",
         ))
 
     # The observer is invoked only after serial/parallel initialization has
@@ -980,6 +993,7 @@ function default_components(;
     )
         last_error = nothing
         candidates = CanonicalGeneration.GenerationResult[]
+        candidate_attempts = initialization_candidate_snapshot === nothing ? nothing : Int[]
         for attempt in 1:init_max_try
             rng = derive_rng(
                 seed,
@@ -1013,6 +1027,7 @@ function default_components(;
                 "procedural generator must return GenerationResult or Err",
             ))
             push!(candidates, result)
+            candidate_attempts === nothing || push!(candidate_attempts, attempt)
             length(candidates) >= init_candidates_per_individual && break
         end
         isempty(candidates) && return last_error === nothing ?
@@ -1026,6 +1041,24 @@ function default_components(;
         result = candidates[selected_index]
         result.metadata[:init_target_nodes] = target_nodes
         result.metadata[:init_candidate_count] = length(candidates)
+        if initialization_candidate_snapshot !== nothing
+            snapshots = map(eachindex(candidates)) do index
+                candidate = candidates[index]
+                snapshot = initialization_candidate_snapshot((;
+                    tree=candidate.tree,
+                    local_consts=candidate.local_consts,
+                    local_consts_ty=candidate.local_const_types,
+                ))
+                (; candidate_index=index,
+                    successful_attempt=candidate_attempts[index],
+                    node_count=candidate_sizes[index], snapshot)
+            end
+            result.metadata[:init_successful_attempts] = Tuple(candidate_attempts)
+            result.metadata[:init_candidate_sizes] = Tuple(candidate_sizes)
+            result.metadata[:init_selected_index] = selected_index
+            result.metadata[:init_selected_growth_before_nodes] = candidate_sizes[selected_index]
+            result.metadata[:init_candidate_snapshots] = Tuple(snapshots)
+        end
         tree, local_consts, local_consts_ty = grow_initial_candidate(
             result,
             target_ty,
@@ -1034,6 +1067,9 @@ function default_components(;
             attempt_offset,
             target_nodes,
         )
+        if initialization_candidate_snapshot !== nothing
+            result.metadata[:init_selected_growth_after_nodes] = result.metadata[:init_final_nodes]
+        end
         program = _publish_program(tree, local_consts, local_consts_ty)
         return return_diagnostics ?
             (; program, diagnostics=Dict{Symbol,Any}(result.metadata)) : program
@@ -1116,6 +1152,7 @@ function default_components(;
         init_growth_mutation,
         init_population,
         initialization_observer,
+        initialization_candidate_snapshot,
     )
     return merge(base, (;kwargs...))
 end
@@ -1459,6 +1496,81 @@ end
     @test length(diagnostics) == 1
     @test length(only(diagnostics)) == 1
     @test only(only(diagnostics)) isa AbstractDict
+end
+
+@testitem "Regression initialization candidate snapshots are detached and do not alter generation" setup=[RegBaseImports] begin
+    using LambdaRegression.Primitives: FADD
+
+    target_ty = TyFun(FloatTy, FloatTy)
+    globals = Dict{Symbol,Any}(:FADD => FADD)
+    global_types = get_type_ctx(globals)
+
+    capture = candidate -> begin
+        names = sort!(collect(keys(candidate.local_consts)); by=String)
+        symbols = Tuple((;
+            name=String(name),
+            value=sprint(show, candidate.local_consts[name]),
+            declared_type=sprint(show, candidate.local_consts_ty[name]),
+        ) for name in names)
+        (; expression=sprint(show, MIME"text/plain"(), candidate.tree), symbols)
+    end
+
+    function initialize(; snapshots::Bool)
+        diagnostics = Any[]
+        rng = MersenneTwister(42)
+        components = default_components(
+            global_consts=globals,
+            global_consts_ty=global_types,
+            input_slots=Symbol[:x],
+            input_types=Dict{Symbol,TyLike}(:x => FloatTy),
+            init_candidates_per_individual=2,
+            init_max_try=4,
+            init_growth_attempts=1,
+            initialization_observer=items -> push!(diagnostics, items),
+            initialization_candidate_snapshot=snapshots ? capture : nothing,
+        )
+        config = default_config(population_size=4, parallel=(enabled=false,))
+        reg = Regressor(target_ty, components, config, rng)
+        population = components.init_population(
+            reg, nothing; N=4, seed=UInt64(71),
+            global_type_ctx=merge(global_types, components.input_types),
+        )
+        return (; population, diagnostics, next_rng=rand(rng, UInt64))
+    end
+
+    off = initialize(snapshots=false)
+    on = initialize(snapshots=true)
+    repeated = initialize(snapshots=true)
+
+    @test !(off.population isa Err)
+    @test !(on.population isa Err)
+    @test getfield.(off.population, :tree) == getfield.(on.population, :tree)
+    @test getfield.(off.population, :local_consts) == getfield.(on.population, :local_consts)
+    @test getfield.(off.population, :local_consts_ty) == getfield.(on.population, :local_consts_ty)
+    @test off.next_rng == on.next_rng
+    @test only(on.diagnostics) == only(repeated.diagnostics)
+    @test getfield.(on.population, :tree) == getfield.(repeated.population, :tree)
+    @test length(only(on.diagnostics)) == length(on.population)
+    @test all(!haskey(row, :init_candidate_snapshots) for row in only(off.diagnostics))
+
+    for (slot, row) in pairs(only(on.diagnostics))
+        snapshots = row[:init_candidate_snapshots]
+        @test length(snapshots) == row[:init_candidate_count]
+        @test Tuple(snapshot.node_count for snapshot in snapshots) == row[:init_candidate_sizes]
+        @test Tuple(snapshot.successful_attempt for snapshot in snapshots) == row[:init_successful_attempts]
+        @test issorted(collect(row[:init_successful_attempts]))
+        @test row[:init_candidate_sizes][row[:init_selected_index]] == row[:init_selected_growth_before_nodes]
+        @test row[:init_selected_growth_after_nodes] == row[:init_final_nodes]
+        @test all(snapshot.snapshot.expression isa String for snapshot in snapshots)
+        @test all(snapshot.snapshot.symbols isa Tuple for snapshot in snapshots)
+        @test all(all(symbol.name isa String && symbol.value isa String &&
+            symbol.declared_type isa String for symbol in snapshot.snapshot.symbols)
+            for snapshot in snapshots)
+        @test !(snapshots[1].snapshot isa AbstractDict)
+    end
+    @test_throws ArgumentError default_components(
+        initialization_candidate_snapshot=capture,
+    )
 end
 
 @testitem "Regression default initialization is deterministic across thread modes" setup=[RegBaseImports] begin
