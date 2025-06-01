@@ -20,6 +20,10 @@ result = run_mixed_alternation!(state; rng=MersenneTwister(1), cycles=2,
 Layer policies are supplied by the caller; this library module does
 not prescribe a task-specific profile.
 
+`select_chain_seeds` combines ordered pools of learned programs with bounded
+random, source-rank, or new-task-scored selection. It returns ordinary Program
+seeds and screening counts; it neither trains subproblems nor starts a search.
+
 `run_continuous_search!` is the alternative serial action composition: bounded
 outer and local work publish material immediately, with an optional bounded
 `StructurePolicy` for family opportunities and survival. Action weights count
@@ -69,7 +73,7 @@ published as owned `Program`s.
 module Workflows
 
 using TestItems
-using Random: AbstractRNG, MersenneTwister, rand, shuffle!
+using Random: AbstractRNG, MersenneTwister, default_rng, rand, shuffle!
 using ..Utils: Err
 using ..ASTs.NodeASTs: AstNode, children
 using ..Programs: Program, numeric_parameter_blocks
@@ -86,6 +90,7 @@ using ..Regression: Regressor, SupervisedDataset, AgeSearchState,
 export run_mixed_alternation!, ObjectiveCounts, score_candidate!
 export StructurePolicy, structure_snapshot, ContinuousSearchConfig, run_continuous_search!
 export run_joint_search!
+export select_chain_seeds
 
 mutable struct ObjectiveCounts
     calls::Int
@@ -798,6 +803,7 @@ end
 include("continuous.jl")
 include("continuous_session_tests.jl")
 include("joint.jl")
+include("composition_seeds.jl")
 
 @testitem "Mixed workflow outer-only run borrows initialized state" begin
     using Random: MersenneTwister

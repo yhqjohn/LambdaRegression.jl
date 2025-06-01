@@ -17,6 +17,8 @@ using .TypeSystem
 export TypeSystem
 
 include("search/SearchPolicies.jl")
+include("search/Schedules.jl")
+export Schedules
 
 include("programs/Programs.jl")
 using .Programs

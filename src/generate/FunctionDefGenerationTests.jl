@@ -1,3 +1,262 @@
+@testitem "FunctionDef strict wrapped self filter respects native demand and host value evidence" begin
+    using Test, Random
+    using LambdaRegression.TypeSystem:
+        Ty, TyLike, TyFun, TyList, FloatTy, BoolTy, infer, iscompatible
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, AppNode, ConstNode
+    using LambdaRegression.Execution: evaluate_native
+    using LambdaRegression.Primitives: FADD, FDIV, SQR, COND
+    using LambdaRegression.Utils: Err
+    CG = LambdaRegression.CanonicalGeneration
+    list = TyList(FloatTy)
+    target = TyFun(list, FloatTy)
+    float_op = TyFun(FloatTy, TyFun(FloatTy, FloatTy))
+    globals = Dict{Symbol,Any}(:FADD => FADD, :renamed => FADD, :FDIV => FDIV, :SQR => SQR)
+    relation = CG.CoreRelation(global_consts=globals,
+        local_consts=Dict{Symbol,Any}(:NIL1 => Float64[], :c => 0.5, :d => 0.1),
+        local_consts_ty=Dict{Symbol,TyLike}(:NIL1 => list, :c => FloatTy, :d => FloatTy),
+        providers=(CG.ContextHeadProvider(),))
+    head(name, ty; source=:constant, metadata=(;)) = CG.HeadEntry(name, source, ty,
+        CG.CoreProductive(), CG.WeightBucket(:constant); metadata)
+    application(h, args...) = CG.HeadApplicationDerivation(h, CG.CoreDerivation[args...])
+    zero = CG.ConstantDerivation(head(:zero, FloatTy; metadata=(value=0.0,)))
+    one = CG.ConstantDerivation(head(:one, FloatTy; metadata=(value=1.0,)))
+    nil = CG.ConstantDerivation(head(:NIL1, list; source=:variable))
+    base = CG.LambdaDerivation(list, zero)
+    call = CG.ScopeApplicationDerivation(1, target, CG.CoreDerivation[nil])
+    function finite_base(ty)
+        arguments = Ty[]
+        while ty isa TyFun
+            push!(arguments, ty.arg)
+            ty = ty.res
+        end
+        result = ty isa TyList ? nil : zero
+        for argument in reverse(arguments)
+            result = CG.LambdaDerivation(argument, result)
+        end
+        return result
+    end
+    candidate(body; ty=target) = CG.FunctionDefCandidate(ty, body, finite_base(ty))
+    wrap(body) = CG.LambdaDerivation(list, body)
+    knot = CG.DirectKnotFilter()
+    query = CG.GenerationQuery(target; depth_left=8, node_budget=48)
+    provider = CG.FunctionDefProvider(admissibility=knot)
+
+    # Saved req1 shape: changed-argument self([]) is the first FADD operand;
+    # the other operand retains its nested safe access and arithmetic wrapper.
+    access = CG.SafeListAccessDerivation(CG.VariableDerivation(0, list), list,
+        CG.VariableDerivation(1, FloatTy),
+        CG.ConstantDerivation(head(:d, FloatTy; source=:variable)), FloatTy)
+    remainder = application(head(:FDIV, float_op),
+        CG.ConstantDerivation(head(:c, FloatTy; source=:variable)),
+        application(head(:SQR, TyFun(FloatTy, FloatTy)), access))
+    body = wrap(application(head(:FADD, float_op), call, remainder))
+    loop = candidate(body)
+    @test !CG._has_strict_saturated_self_call(loop) # Context value evidence is absent.
+    @test CG._has_strict_saturated_self_call(loop, relation)
+    @test knot(loop) # The conservative one-argument path cannot guess FADD.
+    @test !knot(loop, relation, query)
+    @test !CG._functiondef_admissible(provider, loop, relation, query)
+    @test !CG._functiondef_admissible(CG._require_genuine_self_call(provider), loop, relation, query)
+
+    # Exercise the real materializer/native evaluator, without search or loss.
+    function materialize(body; ty=target)
+        definition = CG.FunctionDefDerivation(ty, body, finite_base(ty), 0, (:function_def,), 0)
+        values, types = Dict{Symbol,Any}(), Dict{Symbol,TyLike}()
+        node = CG.materialize_generation_derivation(CG.DefaultAstMaterializer(),
+            definition, values, types, relation, Random.Xoshiro(42))
+        return AstTree(node), merge(globals, relation.local_consts, values),
+            merge(relation.global_consts_ty, relation.local_consts_ty, types)
+    end
+    loop_tree, loop_values, loop_types = materialize(body)
+    @test iscompatible(infer(loop_tree, loop_types), target)
+    @test evaluate_native(loop_tree, loop_values; args=(Float64[],),
+        max_steps=64, max_call_depth=8) isa Err
+
+    alias = candidate(wrap(application(head(:renamed, float_op), call, one)))
+    @test CG._has_strict_saturated_self_call(alias, relation)
+    bound_head = head(:arbitrary_name, float_op; metadata=(value=FADD,))
+    @test CG._has_strict_saturated_self_call(candidate(wrap(application(bound_head, call, one))))
+    shadow = head(:FADD, float_op; metadata=(value=AstTree(AbsNode(:unused, ConstNode(:one))),))
+    @test !CG._has_strict_saturated_self_call(candidate(wrap(application(shadow, call, one))), relation)
+    factory_calls = Ref(0)
+    factory = head(:FADD, float_op; metadata=(value=FADD,
+        factory=(args...) -> (factory_calls[] += 1; FADD)))
+    @test !CG._has_strict_saturated_self_call(candidate(wrap(application(factory, call, one))), relation)
+    @test factory_calls[] == 0
+    @test CG._has_strict_saturated_self_call(candidate(wrap(application(
+        head(:FADD, float_op), one, call))), relation) # Proved numeric second stage.
+
+    # Ordinary scoped lambdas may discard their recursive argument. Test the
+    # new predicate independently from the old unchanged-argument traversal.
+    lazy_scope = wrap(CG.ScopeApplicationDerivation(2, TyFun(FloatTy, FloatTy),
+        CG.CoreDerivation[call]))
+    @test !CG._has_strict_saturated_self_call(candidate(lazy_scope), relation)
+    lazy_tree, lazy_values, _ = materialize(lazy_scope)
+    lazy_values[:answer] = 11.0
+    lazy_tree = AstTree(AppNode(AbsNode(:ignore, lazy_tree.root),
+        AbsNode(:unused, ConstNode(:answer))))
+    @test evaluate_native(lazy_tree, lazy_values; args=(Float64[],), max_steps=128) == 11.0
+    @test !CG._has_strict_saturated_self_call(candidate(wrap(application(
+        head(:FADD, float_op), CG.ScopeApplicationDerivation(2, target,
+            CG.CoreDerivation[nil]), one))), relation) # Same type is not self.
+
+    # COND is a host first call returning a lambda AST. Its later branch
+    # arguments stay lazy; the deliberately divergent true branch is unused.
+    cond_head = head(:COND, TyFun(BoolTy, TyFun(FloatTy, TyFun(FloatTy, FloatTy)));
+        metadata=(value=COND,))
+    false_value = CG.ConstantDerivation(head(:FALSE_VALUE, BoolTy; metadata=(value=false,)))
+    conditional = wrap(application(cond_head, false_value, call, one))
+    @test !CG._has_strict_saturated_self_call(candidate(conditional), relation)
+    cond_tree, cond_values, _ = materialize(conditional)
+    @test evaluate_native(cond_tree, cond_values; args=(Float64[],), max_steps=128) == 1.0
+
+    # A one-argument partial self call returns the second lambda, rather than
+    # evaluating the recursive body. The host can safely ignore that function.
+    binary = TyFun(FloatTy, TyFun(FloatTy, FloatTy))
+    unary = TyFun(FloatTy, FloatTy)
+    consume = head(:consume, TyFun(unary, FloatTy); metadata=(value=(_ -> 7.0),))
+    partial_call = CG.ScopeApplicationDerivation(2, binary,
+        CG.CoreDerivation[CG.VariableDerivation(1, FloatTy)])
+    partial_body = CG.LambdaDerivation(FloatTy, CG.LambdaDerivation(FloatTy,
+        application(consume, partial_call)))
+    @test !CG._has_strict_saturated_self_call(candidate(partial_body; ty=binary), relation)
+    partial_tree, partial_values, _ = materialize(partial_body; ty=binary)
+    @test evaluate_native(partial_tree, partial_values; args=(2.0, 3.0), max_steps=128) == 7.0
+
+    deferred = CG.LambdaDerivation(list, CG.ScopeApplicationDerivation(2, target,
+        CG.CoreDerivation[nil]))
+    consume_list_function = head(:consume_function, TyFun(target, FloatTy);
+        metadata=(value=(_ -> 9.0),))
+    @test !CG._has_strict_saturated_self_call(candidate(wrap(
+        application(consume_list_function, deferred))), relation)
+    inner = CG.FunctionDefDerivation(target, CG.LambdaDerivation(list,
+        CG.ScopeApplicationDerivation(3, target, CG.CoreDerivation[nil])),
+        base, 0, (:function_def,), 0)
+    nested = wrap(application(consume_list_function, inner))
+    @test !CG._has_strict_saturated_self_call(candidate(nested), relation)
+    nested_tree, nested_values, _ = materialize(nested)
+    @test evaluate_native(nested_tree, nested_values; args=(Float64[],), max_steps=128) == 9.0
+
+    list_target = TyFun(list, list)
+    recursive_source = CG.ScopeApplicationDerivation(1, list_target, CG.CoreDerivation[nil])
+    source_body = wrap(CG.SafeListAccessDerivation(recursive_source, list,
+        CG.VariableDerivation(0, list), nil, list))
+    source_candidate = candidate(source_body; ty=list_target)
+    @test CG._has_strict_saturated_self_call(source_candidate, relation)
+    @test CG._has_strict_saturated_self_call_signature(CG.derivation_signature(source_body), list_target)
+    @test !CG._has_strict_saturated_self_call_signature(CG.derivation_signature(body), target)
+    @test !CG._has_strict_saturated_self_call_signature(CG.derivation_signature(partial_body), binary)
+    struct StrictSignatureBody <: CG.CoreDerivation
+        signature
+    end
+    CG.derivation_signature(d::StrictSignatureBody) = d.signature
+    @test CG._has_strict_saturated_self_call(candidate(
+        StrictSignatureBody(CG.derivation_signature(source_body)); ty=list_target), relation)
+    @test !CG._has_strict_saturated_self_call(candidate(
+        StrictSignatureBody(CG.derivation_signature(body))), relation)
+
+    tail_call = CG.ScopeApplicationDerivation(3, target,
+        CG.CoreDerivation[CG.VariableDerivation(0, list)])
+    success = application(bound_head, CG.VariableDerivation(1, FloatTy), tail_call)
+    guarded = wrap(CG.SafeListAccessDerivation(CG.VariableDerivation(0, list),
+        list, success, zero, FloatTy))
+    @test !CG._has_strict_saturated_self_call(candidate(guarded), relation)
+    @test knot(candidate(guarded), relation, query)
+    guarded_tree, guarded_values, _ = materialize(guarded)
+    @test evaluate_native(guarded_tree, guarded_values; args=([2.0, 3.0],), max_steps=256) == 5.0
+end
+
+@testitem "FunctionDef numeric strict prefixes use primitive identity and preserve lazy later stages" begin
+    using Test, Random
+    using LambdaRegression.TypeSystem: TyLike, TyFun, TyList, FloatTy, BoolTy, infer, iscompatible
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, ConstNode
+    using LambdaRegression.Execution: evaluate_native
+    using LambdaRegression.Primitives: FADD, FSUB, FMUL, FDIV, FSIN, COND
+    CG = LambdaRegression.CanonicalGeneration
+    list = TyList(FloatTy)
+    target = TyFun(list, FloatTy)
+    binary = TyFun(FloatTy, TyFun(FloatTy, FloatTy))
+    ternary = TyFun(FloatTy, binary)
+    ignore_ast = AstTree(AbsNode(:unused, ConstNode(:answer)))
+    shadow = _ -> ignore_ast
+    calls = Ref(0)
+    mixed = _ -> (calls[] += 1; _ -> ignore_ast)
+    globals = Dict{Symbol,Any}(:FDIV => FDIV, :alias => FDIV, :FSIN => FSIN,
+        :FADD => shadow, :mixed => mixed, :COND => COND)
+    globals_ty = Dict{Symbol,TyLike}(:FDIV => binary, :alias => binary,
+        :FSIN => TyFun(FloatTy, FloatTy), :FADD => binary, :mixed => ternary,
+        :COND => TyFun(BoolTy, TyFun(FloatTy, TyFun(FloatTy, FloatTy))))
+    relation = CG.CoreRelation(global_consts=globals, global_consts_ty=globals_ty,
+        local_consts=Dict{Symbol,Any}(:local_alias => FDIV),
+        local_consts_ty=Dict{Symbol,TyLike}(:local_alias => binary),
+        providers=(CG.ContextHeadProvider(),))
+    head(name, ty=binary; source=:constant, metadata=(;)) = CG.HeadEntry(
+        name, source, ty, CG.CoreProductive(), CG.WeightBucket(:constant); metadata)
+    app(h, args...) = CG.HeadApplicationDerivation(h, CG.CoreDerivation[args...])
+    one = CG.ConstantDerivation(head(:one, FloatTy; metadata=(value=1.0,)))
+    nil = CG.ConstantDerivation(head(:nil, list; metadata=(value=Float64[],)))
+    self_call = CG.ScopeApplicationDerivation(1, target, CG.CoreDerivation[nil])
+    wrap(body) = CG.LambdaDerivation(list, body)
+    base = wrap(one)
+    candidate(body) = CG.FunctionDefCandidate(target, wrap(body), base)
+    knot = CG.DirectKnotFilter()
+    query = CG.GenerationQuery(target; depth_left=8, node_budget=48)
+    provider = CG.FunctionDefProvider(admissibility=knot)
+    detects(body) = CG._has_strict_saturated_self_call(candidate(body), relation)
+
+    # A numeric denominator under a unary host remains strict.
+    denominator = app(head(:FDIV), one, self_call)
+    wrapped = app(head(:FSIN, TyFun(FloatTy, FloatTy)), denominator)
+    @test detects(wrapped)
+    @test !CG._has_unchanged_self_call_derivation(wrap(wrapped), 0)
+    @test !knot(candidate(wrapped), relation, query)
+    @test !CG._functiondef_admissible(provider, candidate(wrapped), relation, query)
+    @test !CG._has_strict_saturated_self_call_signature(
+        CG.derivation_signature(wrap(wrapped)), target)
+    for primitive in (FADD, FSUB, FMUL, FDIV)
+        h = head(:unrelated_name; metadata=(value=primitive,))
+        @test CG._strict_host_argument_prefix(h, relation) == 2
+        @test detects(app(h, one, self_call))
+    end
+    @test detects(app(head(:alias), one, self_call))
+    @test detects(app(head(:local_alias; source=:variable), one, self_call))
+
+    # A same-named alien function and explicit metadata override do not inherit
+    # a primitive's second stage. Their first host argument remains strict.
+    @test CG._strict_host_argument_prefix(head(:FADD), relation) == 1
+    @test !detects(app(head(:FADD), one, self_call))
+    @test detects(app(head(:FADD), self_call, one))
+    overridden = head(:FDIV; metadata=(value=shadow,))
+    @test !detects(app(overridden, one, self_call))
+    factory_calls = Ref(0)
+    factory = head(:FDIV; metadata=(value=FDIV,
+        factory=(args...) -> (factory_calls[] += 1; FDIV)))
+    @test !detects(app(factory, one, self_call))
+    @test factory_calls[] == 0
+
+    false_value = CG.ConstantDerivation(head(:false_value, BoolTy; metadata=(value=false,)))
+    conditional = app(head(:COND, globals_ty[:COND]), false_value, self_call, one)
+    mixed_body = app(head(:mixed, ternary), one, one, self_call)
+    @test !detects(conditional)
+    @test !detects(mixed_body)
+    @test calls[] == 0 # Classification never probes a host function.
+
+    # Both counterexamples really discard the recursive argument at runtime.
+    # The mixed host returns a host closure, then an AST lambda: inspecting all
+    # arguments merely because the initial value is a Function would be wrong.
+    for body in (app(head(:FADD), one, self_call), conditional, mixed_body)
+        definition = CG.FunctionDefDerivation(target, wrap(body), base, 0, (:function_def,), 0)
+        values, types = Dict{Symbol,Any}(), Dict{Symbol,TyLike}()
+        tree = AstTree(CG.materialize_generation_derivation(CG.DefaultAstMaterializer(),
+            definition, values, types, relation, Random.Xoshiro(555)))
+        context = merge(globals, relation.local_consts, values, Dict(:answer => 1.0))
+        context_ty = merge(globals_ty, relation.local_consts_ty, types, Dict(:answer => FloatTy))
+        @test iscompatible(infer(tree, context_ty), target)
+        @test evaluate_native(tree, context; args=(Float64[],), max_steps=128) == 1.0
+    end
+    @test calls[] == 1
+end
+
 @testitem "FunctionDef FunctionDef generation requires a finite base witness" begin
     using Test
     using Random

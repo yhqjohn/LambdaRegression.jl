@@ -2215,6 +2215,41 @@ inverse-family-size allocation, preserving its total mass and legal routes.
 Families use runtime value identity, then `guarded_family::Symbol` metadata or
 a source/name fallback. Only bounded default weighted sampling/planning is
 supported; zero preserves existing menus and RNG usage.
+
+`list_recursive_body_probability` and `list_recursive_tail_probability`
+independently default to `0` and must lie in `[0, 1)`. In a safe-list success
+body over an original FunctionDef list parameter, the first mixes in a bounded
+proposal jointly using the concrete element binder and calling that self; the
+second prefers the same source's strict tail in its corresponding recursive
+argument. Other operands and operators remain generated normally. Failed
+proposals refund nodes and return to the ordinary route without resetting
+provider attempts. Neutral settings draw no additional randomness. These are
+bounded default-sampler/planner policies; certified completion is rejected.
+They supply right-fold ingredients, and also apply to an already-demanded
+stateful helper, but do not themselves introduce a left-fold helper type.
+
+`functiondef_self_call_probability` and `safe_list_short_fallback_probability`
+also default to `0` and lie in `[0,1)`, with the same bounded default
+sampler/planner restriction. The former tries one genuine Call-constrained body
+inside an ordinary FunctionDef route, passing its original admissibility. It
+uses the existing attempt ledger only when at least two attempts remain,
+reserving an ordinary attempt on failure. Already Call-forced routes are
+unchanged. The latter tries a minimum-cost finite core fallback excluding every
+visible marked self identity, only in a real FunctionDef context; failure keeps
+the original fallback route. The independent fallback's forbids never enter the
+success body. Short evidence is not numeric-domain or termination evidence.
+Sampling node budgets count derivation charges, not the materialized AST size;
+the caller's final AST resource admission remains a separate check.
+
+`fold_step_joint_use_probability` defaults to `0` and lies in `[0,1)`. At a
+selected AFOLDL callback, one bounded proposal uses both fresh item and old
+state identities; a function-valued state must head an application. The
+proposal precedes the existing grounded/synthesized menu, which remains the
+ordinary route and failure fallback. It preserves inherited occurrence and
+forbidden-binder requirements, refunds failed node charges but not shared
+provider attempts, and does not change fold selection weights. This is a
+bounded default-sampler/planner policy, not an effective-dependence proof or
+a List state-helper entry. Zero draws no extra randomness.
 """
 struct GenerationWeights
     default::Float64
@@ -2226,6 +2261,12 @@ struct GenerationWeights
             throw(ArgumentError("generation weights must be finite and nonnegative"))
         get(overrides, :guarded_family_balance, 0.0) <= 1 ||
             throw(ArgumentError("guarded_family_balance must be in [0, 1]"))
+        for name in (:list_recursive_body_probability, :list_recursive_tail_probability,
+                     :functiondef_self_call_probability, :safe_list_short_fallback_probability,
+                     :fold_step_joint_use_probability)
+            get(overrides, name, 0.0) < 1 ||
+                throw(ArgumentError("$name must be in [0, 1), retaining the ordinary route"))
+        end
         return new(default, overrides)
     end
 end
@@ -2443,6 +2484,32 @@ struct ScopeApplicationDerivation <: CoreDerivation
     index::Int
     head_ty::Ty
     args::Vector{CoreDerivation}
+end
+
+"""An accounted application whose head is a generated finite expression.
+
+This representation adds no general application search rule or core evidence.
+Finite extensions select the head and arguments and supply their shared depth,
+node, and provider bounds. Invalid closed arrow spines fail at construction.
+Materialization retains each child's original value/factory provenance.
+"""
+struct ComputedApplicationDerivation <: CoreDerivation
+    head::CoreDerivation
+    args::Vector{CoreDerivation}
+    result_ty::Ty
+    function ComputedApplicationDerivation(head::CoreDerivation,
+        args::Vector{CoreDerivation})
+        isempty(args) && throw(ArgumentError("computed application needs an argument"))
+        rest = derivation_result_type(head)
+        _in_closed_fragment(rest) || throw(ArgumentError("computed head must have a closed finite type"))
+        for arg in args
+            rest isa TyFun || throw(ArgumentError("computed application exceeds head arity"))
+            iscompatible(rest.arg, derivation_result_type(arg)) ||
+                throw(ArgumentError("computed application argument type mismatch"))
+            rest = rest.res
+        end
+        return new(head, args, rest)
+    end
 end
 
 rigid_safe_derivation(d::VariableDerivation) = true
@@ -2882,6 +2949,13 @@ Base.@noinline Base.@nospecializeinfer function _signature_calls_scope_binder(si
     elseif tag === :function_def
         length(signature) >= 4 || return false
         return _signature_calls_scope_binder(signature[4], index + 1)
+    elseif tag === :computed_application
+        length(signature) >= 4 || return false
+        head = signature[3]
+        head isa Tuple && length(head) >= 2 && head[1] === :var &&
+            head[2] == index && !isempty(signature[4]) && return true
+        return _signature_calls_scope_binder(head, index) ||
+            _scope_any(arg -> _signature_calls_scope_binder(arg, index), signature[4])
     end
     return false
 end
@@ -5941,6 +6015,12 @@ end
     _sample_derivation(rng, sample_set)
 
 function _uses_lazy_sampling(config::GenerationConfig)
+    if _bounded_proposal_bias_enabled(config.weights)
+        config.sampler isa WeightedDerivationSampler &&
+            config.sampler.completion_probability == 0 &&
+            config.argument_planner isa DefaultArgumentPlanner || throw(ArgumentError(
+                "proposal biases require bounded WeightedDerivationSampler and DefaultArgumentPlanner"))
+    end
     if get(config.weights.overrides, :guarded_family_balance, 0.0) > 0
         config.sampler isa WeightedDerivationSampler &&
             config.sampler.completion_probability == 0 &&
@@ -6091,7 +6171,8 @@ function _sample_generation_derivation(
     root_constant_weight::Float64=1.0,
 )
     query_relation, effective = _relation_for_query(relation, query)
-    if _generation_extensions_exhausted(query_relation, effective)
+    if _generation_extensions_exhausted(query_relation, effective) &&
+       !_has_list_state_helper_context(effective)
         return _sample_generation_derivation(
             state,
             query_relation,
@@ -6438,6 +6519,7 @@ function _sample_from_options(
     generation_query::Union{Nothing,GenerationQuery}=nothing;
     root_constant_weight::Float64=1.0,
 )
+    options = _prefer_state_helper_body_options(options, relation, generation_query)
     pool, total_weight = _positive_option_pool(_root_weighted_options(options, root_constant_weight))
     while !isempty(pool) && total_weight > 0
         chosen = _weighted_option_index(state.rng, pool, total_weight)
@@ -6640,6 +6722,9 @@ function _sample_scope_application(
     generation_query::Union{Nothing,GenerationQuery}=nothing,
 )
     depth_left >= 0 || return nothing
+    preferred = _sample_preferred_list_recursive_call!(state, relation, rule,
+        scope_tys, depth_left, guarded_left, allow_safe_list_access, generation_query)
+    preferred === nothing || return preferred
     _consume_sampling_nodes!(state, length(rule.argument_tys)) || return nothing
     args = Vector{CoreDerivation}(undef, length(rule.argument_tys))
     for i in _argument_resolution_order(rule)
@@ -6774,6 +6859,9 @@ function _sample_afoldl_step_argument(
     allow_safe_list_access::Bool=true,
     generation_query::Union{Nothing,GenerationQuery}=nothing,
 )
+    joint = _sample_joint_afoldl_step(state, relation, rule, scope_tys,
+        depth_left, guarded_left, allow_safe_list_access, generation_query)
+    joint === nothing || return joint
     options = NamedTuple[]
     grounded = _grounded_derivations(relation, first(rule.argument_tys), scope_tys)
     isempty(grounded) || push!(options, (kind=:grounded_step, value=grounded, weight=1.0))
@@ -12791,6 +12879,10 @@ end
 end
 
 include("FunctionDefGeneration.jl")
+include("ListRecursionBias.jl")
+include("RecursiveProposalBias.jl")
+include("FoldStepBias.jl")
+include("ListStateHelperGeneration.jl")
 include("GenerationFrontier.jl")
 
 end # module CanonicalGeneration

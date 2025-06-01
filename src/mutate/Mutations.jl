@@ -419,6 +419,7 @@ module Mutations
 
 using Random
 using TestItems
+using ..Schedules: ProposalProgress, AbstractSchedule, schedule_value
 
 using ..Utils: Err
 using ..TypeSystem
@@ -443,6 +444,7 @@ export mutate_tree, default_mutations
 export AbstractMutation, required_site_kinds, is_site_eligible, apply
 export AbstractSiteProvider, IndexedProvider
 export AbstractPairChooser, WeightedPairChooser
+export ScheduledPairChooser, chooser_at_progress
 export BloatPolicy, AdaptivePolicy
 export MutationAttemptRecorder, mutation_recorder_summary
 export prune_local_consts!
@@ -1201,6 +1203,64 @@ end
 
 WeightedPairChooser(weights::AbstractDict, cache_eligibility::Bool) =
     WeightedPairChooser(_normalize_mutation_weights(weights), cache_eligibility)
+
+"""
+    ScheduledPairChooser(; weights, base=WeightedPairChooser())
+
+Overlay scalar schedules on ordinary mutation-family weights. Resolves once per
+`mutate_tree` request, preserving all unmentioned base/default weights. Weights
+still multiply eligible site mass and success hints; they are not probabilities.
+Requires explicit `progress` for direct mutation calls; complete-program search
+supplies its cumulative proposal clock. No change to site eligibility or finite
+generation occurs. Invalid/nonnegative weight constraints throw `ArgumentError`.
+"""
+struct ScheduledPairChooser{W<:AbstractDict} <: AbstractPairChooser
+    base::WeightedPairChooser
+    weights::W
+    function ScheduledPairChooser(; weights::AbstractDict, base::WeightedPairChooser=WeightedPairChooser())
+        owned = Dict{Type,Union{Real,AbstractSchedule}}()
+        for (key, value) in pairs(weights)
+            key isa Type || throw(ArgumentError("mutation weight keys must be types"))
+            value isa Union{Real,AbstractSchedule} || throw(ArgumentError("weights must be numbers or schedules"))
+            for endpoint in (0.0, 1.0)
+                weight = schedule_value(value, endpoint)
+                isfinite(weight) && weight >= 0 || throw(ArgumentError(
+                    "mutation weights must be finite and nonnegative"))
+            end
+            owned[key] = value
+        end
+        return new{typeof(owned)}(base, owned)
+    end
+end
+
+chooser_at_progress(chooser::AbstractPairChooser, progress) = chooser
+function chooser_at_progress(chooser::ScheduledPairChooser, progress)
+    progress === nothing && throw(ArgumentError("ScheduledPairChooser requires explicit progress"))
+    weights = copy(chooser.base.weights)
+    for (key, schedule) in chooser.weights
+        weights[key] = schedule_value(schedule, progress)
+    end
+    return WeightedPairChooser(weights, chooser.base.cache_eligibility)
+end
+
+@testitem "Scheduled mutation weights preserve the ordinary chooser and clamp endpoints" begin
+    using LambdaRegression.Mutations: WeightedPairChooser, ScheduledPairChooser,
+        chooser_at_progress, SubtreeReplacementMutation, ScalarConstMutation
+    using LambdaRegression.Schedules
+    M = LambdaRegression.Mutations
+    ordinary = WeightedPairChooser()
+    scheduled = ScheduledPairChooser(base=ordinary,
+        weights=Dict(SubtreeReplacementMutation => LinearSchedule(1, 0.01)))
+    first = chooser_at_progress(scheduled, ProposalProgress(0, 10))
+    last = chooser_at_progress(scheduled, ProposalProgress(20, 10))
+    @test first.weights[SubtreeReplacementMutation] == 1
+    @test last.weights[SubtreeReplacementMutation] == 0.01
+    @test first.weights[ScalarConstMutation] == ordinary.weights[ScalarConstMutation]
+    @test !haskey(ordinary.weights, SubtreeReplacementMutation)
+    @test chooser_at_progress(ordinary, nothing) === ordinary
+    @test_throws ArgumentError chooser_at_progress(scheduled, nothing)
+    @test_throws ArgumentError ScheduledPairChooser(weights=Dict(SubtreeReplacementMutation => -1))
+end
 
 function _mutation_weight(
     chooser::WeightedPairChooser,
@@ -3101,7 +3161,9 @@ function mutate_tree(tree::AstTree, target_ty::Ty;
     bloat_policy::BloatPolicy=BloatPolicy(),
     adaptive_policy::AdaptivePolicy=AdaptivePolicy(),
     recorder::Union{Nothing,MutationAttemptRecorder}=nothing,
+    progress::Union{Nothing,Real,ProposalProgress}=nothing,
 )
+    chooser = chooser_at_progress(chooser, progress)
     current_tree = tree
     # Selection borrows caller dictionaries; only an eligible apply gets copies.
     caller_local_consts = local_consts

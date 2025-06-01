@@ -45,13 +45,18 @@ function _joint_global_proposal(state::AgeSearchState; retry_limit::Int=4)
     retry_limit >= 0 || throw(ArgumentError("global_proposal_attempts must be nonnegative"))
     components = state.reg.components
     has_crossover = get(components, :crossover_op, nothing) !== nothing
+    # This closure owns a separate cumulative global-proposal clock. Local
+    # scalar attempts never advance it; retry attempts share one progress value.
+    global_attempts = Ref(0)
     return function (parent::Program, donor::Program, rng::AbstractRNG)
+        progress = Regression._proposal_progress(components, global_attempts[])
+        global_attempts[] += 1
         left, right = _joint_record(parent), _joint_record(donor)
         for _ in 1:retry_limit
             result = if has_crossover && rand(rng, Bool)
                 Regression._age_crossover(state, left, right, rng)
             else
-                Regression._age_mutation(state, left, rng)
+                Regression._age_mutation(state, left, rng; progress)
             end
             result isa Err && continue
             result isa Program || throw(ArgumentError(

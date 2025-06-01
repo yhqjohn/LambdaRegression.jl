@@ -29,6 +29,7 @@ const _COLLECTION_COMPONENT_KEYS = Set((
     :candidate_admissibility, :functiondef_provider,
     :functiondef_recursive_body_site_weight, :mutations, :mutation_chooser,
     :mutation_provider, :mutation_max_try, :mutation_prune_consts,
+    :full_mutation_provider, :schedule_budget, :schedule_offset,
     :mutation_adaptive_policy, :bloat_policy, :candidate_failure,
     :loss_failure, :crossover_op, :mutation_driver,
     :generation_config_factory, :force_lambda_root_probability,
@@ -43,6 +44,7 @@ const _COLLECTION_RESERVED_COMPONENT_KEYS = Set((
 const _COLLECTION_SEARCH_KEYS = Set((
     :population_count, :recent_capacity, :seed,
     :max_attempts, :max_evaluations, :mutation_weight, :crossover_weight,
+    :replay,
 ))
 const _COLLECTION_FIT_KEYS = Set((
     :task_kind, :operator_set, :population_size, :generations,
@@ -741,6 +743,7 @@ function fit_collection(X, y; kwargs...)
     length(initial_programs) <= population_size || throw(ArgumentError(
         "initial_programs cannot exceed population_size",
     ))
+    initial_programs = [_import_program_seed(program, world.components) for program in initial_programs]
     baselines = _baseline_programs(target_ty)
     init_source = world.components.init_population
     initialization_fallbacks = Ref(0)
@@ -829,6 +832,11 @@ function fit_collection(X, y; kwargs...)
     end
     mutation_weight = pop!(search_options, :mutation_weight, mutation_rate)
     crossover_weight = pop!(search_options, :crossover_weight, crossover_rate)
+    if !haskey(component_options, :schedule_budget)
+        components = merge(components, (; schedule_budget=max(1, max_attempts)))
+        world = merge(world, (; components))
+        reg = Regressor(target_ty, components, config, reg.rng)
+    end
     state = initialize_age_search(
         reg, SupervisedDataset(xs, ys);
         population_count, population_size, seed=search_seed, recent_capacity,
@@ -836,6 +844,7 @@ function fit_collection(X, y; kwargs...)
     state isa Err && throw(ArgumentError("age-search initialization failed: $(state.value)"))
     report = advance_age_search!(state;
         max_attempts, max_evaluations, mutation_weight, crossover_weight,
+        replay=pop!(search_options, :replay, nothing),
     )
     report isa Err && throw(ArgumentError("age-search failed: $(report.value)"))
     record = _record_best(state, Float64(parsimony))
@@ -870,8 +879,7 @@ end
     using LambdaRegression.ASTs.NodeASTs: AbsNode, AppNode, AstTree, ConstNode, IndexNode
     using LambdaRegression.Programs: Program
 
-    # Each row is reduced across its two values, then the outer AMAP keeps the
-    # group array shape (2, 2) -> (2,).
+    # Map each (2, 2) group to its two row sums.
     row_step = AbsNode(:acc, AbsNode(:value,
         AppNode(AppNode(ConstNode(:FADD), IndexNode(1)), IndexNode(0))))
     row_sum = AppNode(AppNode(AppNode(ConstNode(:AFOLDL), row_step), ConstNode(:ZERO)), IndexNode(0))
@@ -896,6 +904,39 @@ end
     @test budgeted["attempts"] == 0
     @test_throws ArgumentError fit_collection(X, Y; task_kind=:array,
         initial_programs=[witness], population_size=2, max_evaluations=1)
+end
+
+@testitem "Collection fit routes full mutation providers with explicit cumulative schedule" begin
+    using LambdaRegression.FrontendAdapter: fit_collection
+    using LambdaRegression.Regression: EncodedMutationProvider
+    using LambdaRegression.Programs: Program
+    using LambdaRegression.ASTs.NodeASTs: AstTree, AbsNode, IndexNode
+    seen = Int[]
+    provider = EncodedMutationProvider(
+        encode=(parent, target; rng, progress, components) -> begin
+            push!(seen, progress.completed_attempts)
+            parent
+        end,
+        call_external=(payload; kwargs...) -> payload,
+        decode=(payload, result; kwargs...) -> result)
+    identity = Program(AstTree(AbsNode(:x, IndexNode(0))))
+    X = reshape(Float64.(1:6), 3, 2)
+    fitted = fit_collection(X, X; initial_programs=[identity], population_size=2,
+        generations=0, components_kwargs=(; full_mutation_provider=provider,
+            schedule_budget=10, schedule_offset=2),
+        search_kwargs=(; max_attempts=3, max_evaluations=3,
+            mutation_weight=1.0, crossover_weight=0.0))
+    @test seen == [2, 3, 4]
+    @test fitted["attempts"] == 3
+    @test fitted["objective_calls"] == 2
+    @test fitted["model"].components.schedule_budget == 10
+    empty!(seen)
+    automatic = fit_collection(X, X; initial_programs=[identity], population_size=2,
+        generations=0, components_kwargs=(; full_mutation_provider=provider),
+        search_kwargs=(; max_attempts=3, max_evaluations=3,
+            mutation_weight=1.0, crossover_weight=0.0))
+    @test seen == [0, 1, 2]
+    @test automatic["model"].components.schedule_budget == 3
 end
 
 @testitem "Collection fit supports list tensor groups with distinct inner shapes" begin

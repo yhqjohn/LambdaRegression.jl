@@ -1,8 +1,8 @@
 """
     Transforms
 
-Small syntax-directed transformations over the common AST.  The current
-kernel is scope-aware common-subexpression extraction and single lift.  It
+Small syntax-directed transformations over the common AST, including typed
+editable program chaining, scope-aware common-subexpression extraction and single lift. It
 consumes a `ProgramAnalysis.SyntaxIndex` plus an occurrence ID, so occurrence
 identity never depends on host node identity or a second lexical snapshot.
 Structural checks are performed here; typed callers retain type and effect
@@ -23,6 +23,8 @@ using ..ProgramAnalysis: _functiondef_self_observation
 export NotEnoughMatchesErr, CrossScopeMatchErr, TargetOccurrenceNotFoundErr
 export UnsupportedCSENodeErr, repeated_nodes, occurrence_id, eliminate_node!
 export fixed_point_witness, lower_functiondefs
+
+include("program_composition.jl")
 
 struct NotEnoughMatchesErr
     min_count::Int

@@ -551,33 +551,13 @@ function _age_score_record!(
     return _age_make_record(state, program, parent_ids, origin, loss, complexity, valid)
 end
 
-function _age_mutation(state::AgeSearchState, parent::AgeSearchIndividual, rng::AbstractRNG)
+function _age_mutation(state::AgeSearchState, parent::AgeSearchIndividual, rng::AbstractRNG;
+        progress::ProposalProgress=_proposal_progress(state.reg.components,
+            max(0, state.counters.raw_attempts - 1)), check_admission::Bool=true)
     c = state.reg.components
-    mutation_driver = get(c, :mutation_driver, Mutations.mutate_tree)
-    local_consts = copy(parent.program.local_consts)
-    local_consts_ty = copy(parent.program.local_consts_ty)
-    mutated = mutation_driver(
-        parent.program.tree,
-        state.reg.target_ty;
-        rng,
-        mutations=c.mutations,
-        chooser=c.mutation_chooser,
-        provider=c.mutation_provider,
-        max_try=c.mutation_max_try,
-        prune_consts=c.mutation_prune_consts,
-        global_consts=c.global_consts,
-        global_consts_ty=merge(c.global_consts_ty, c.input_types),
-        local_consts,
-        local_consts_ty,
-        tyfactory=c.tyfactory_ctor(),
-        symfactory=SymbolGenerator(),
-        const_symfactory=c.const_symfactory_ctor(),
-        bloat_policy=get(c, :bloat_policy, Mutations.BloatPolicy()),
-        adaptive_policy=get(c, :mutation_adaptive_policy, Mutations.AdaptivePolicy()),
-    )
-    mutated isa Err && return mutated
-    mutated isa AstTree || throw(ArgumentError("mutation_driver must return AstTree or Err"))
-    return _publish_program(mutated, local_consts, local_consts_ty)
+    provider = get(c, :full_mutation_provider, OrdinaryMutationProvider())
+    return _checked_propose_mutation(provider, parent.program, state.reg.target_ty;
+        rng, progress, components=c, check_admission)
 end
 
 function _age_crossover(
@@ -760,20 +740,27 @@ function advance_age_search!(
     state::AgeSearchState;
     max_attempts::Int,
     max_evaluations::Int,
-    mutation_weight::Real=1.0,
-    crossover_weight::Real=1.0,
+    mutation_weight=1.0,
+    crossover_weight=1.0,
     proposal=nothing,
     policy::Union{Nothing,AbstractAgeSearchPolicy}=nothing,
+    replay=nothing,
 )
     max_attempts >= 0 || throw(ArgumentError("max_attempts must be non-negative"))
     max_evaluations >= 0 || throw(ArgumentError("max_evaluations must be non-negative"))
-    mw = _age_checked_weight(mutation_weight, :mutation_weight)
-    cw = _age_checked_weight(crossover_weight, :crossover_weight)
+    for endpoint in (0.0, 1.0)
+        _age_checked_weight(schedule_value(mutation_weight, endpoint), :mutation_weight)
+        _age_checked_weight(schedule_value(crossover_weight, endpoint), :crossover_weight)
+    end
+    _replay_start!(replay, state)
     if max_attempts == 0 || max_evaluations == 0
+        _replay_finish!(replay, state)
         return AgeSearchReport(0, 0, 0, 0, 0, 0, 0, 0, 0, state.cursor)
     end
-    any(!isempty(_age_valid_records(state, island)) for island in eachindex(state.populations)) ||
+    if !any(!isempty(_age_valid_records(state, island)) for island in eachindex(state.populations))
+        _replay_finish!(replay, state)
         return Err(AgeSearchNoValidErr())
+    end
     before = _age_snapshot(state.counters)
     objective_start = state.counters.objective_calls
     samples_start = state.counters.sample_executions
@@ -794,6 +781,9 @@ function advance_age_search!(
         island = state.cursor
         state.cursor = mod1(state.cursor + 1, length(state.populations))
         state.counters.raw_attempts += 1
+        progress = _proposal_progress(state.reg.components, state.counters.raw_attempts - 1)
+        mw = _age_checked_weight(schedule_value(mutation_weight, progress), :mutation_weight)
+        cw = _age_checked_weight(schedule_value(crossover_weight, progress), :crossover_weight)
         valid = _age_valid_records(state, island)
         if isempty(valid)
             state.counters.expected_failures += 1
@@ -833,16 +823,14 @@ function advance_age_search!(
                 state.counters.mutation_attempts += 1
                 token = _age_span_begin(diagnostics, :mutation)
                 child_result = try
-                    _age_mutation(state, left, rng)
+                    _age_mutation(state, left, rng; progress, check_admission=false)
                 finally
                     _age_span_end(diagnostics, :mutation, token)
                 end
-                # The built-in driver has already inferred the final child against
-                # this exact target and detached constant context. The returned
-                # tree and local declarations are not edited before scoring.
-                type_checked = _mutation_result_typechecked(get(
-                    state.reg.components, :mutation_driver, Mutations.mutate_tree,
-                ))
+                # The checked provider boundary inferred this final tree, or
+                # reused the exact ordinary driver's final-tree validation.
+                # No provider-controlled trait may bypass that boundary.
+                type_checked = true
             end
         end
         _age_add_operator!(state.counters, label)
@@ -878,8 +866,10 @@ function advance_age_search!(
         state.counters.accepted += 1
         finally
             _age_proposal_end(diagnostics, state, label, left, right, child_result)
+            _replay_periodic!(replay, state)
         end
     end
+    _replay_finish!(replay, state)
     return AgeSearchReport(
         state.counters.raw_attempts - before.raw_attempts,
         state.counters.accepted - accepted_start,

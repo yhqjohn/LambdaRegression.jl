@@ -506,8 +506,8 @@ end
 
 include("collection_programs.jl")
 include("collection_synthesis.jl")
+include("program_seeds.jl")
 
-# Collection programs consume whole samples; rank <= 2 defaults to scalar fitting.
 function generate_synthetic_data(X; task_kind=:auto, kwargs...)
     kind = _resolve_task_kind(X, task_kind)
     return kind === :scalar ? _generate_scalar_synthetic_data(X; kwargs...) :

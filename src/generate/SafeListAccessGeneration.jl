@@ -255,7 +255,10 @@ function _sample_safe_list_access_body(
     generation_query::Union{Nothing,GenerationQuery},
     saved_nodes::Int,
 )
-    fallback = _sample_known_derivation(state, relation, target_ty, scope_tys, depth_left - 1)
+    fallback = _sample_short_nonrecursive_list_fallback(state, relation, target_ty,
+        scope_tys, depth_left - 1, guarded_left, generation_query)
+    fallback === nothing && (fallback =
+        _sample_known_derivation(state, relation, target_ty, scope_tys, depth_left - 1))
     if fallback === nothing
         state.nodes_left = saved_nodes
         return nothing
@@ -281,7 +284,10 @@ function _sample_safe_list_access_body(
         body_query;
         capability_mask=(:safe_list_access,),
     ))
-    body = _sample_proxy_body_derivation(
+    body_query = _with_list_recursion_hints(relation, source, generation_query, body_query)
+    body = _sample_list_recursive_body(state, relation, target_ty,
+        success_scope, depth_left - 1, guarded_left, body_query)
+    body === nothing && (body = _sample_proxy_body_derivation(
         state,
         relation,
         target_ty,
@@ -289,7 +295,7 @@ function _sample_safe_list_access_body(
         depth_left - 1,
         guarded_left,
         body_query,
-    )
+    ))
     if body === nothing
         state.nodes_left = saved_nodes
         return nothing
@@ -338,7 +344,9 @@ function _sample_certified_safe_list_body(
     any(index -> derivation_uses_scope_binder(source.derivation, index), forbidden) && return nothing
     fallback_query = _nested_generation_query(state, generation_query, target_ty,
         scope_tys, depth_left - 1, guarded_left)
-    fallback = _replay_finite_core_certificate(state, relation, fallback_query)
+    fallback = _sample_short_nonrecursive_list_fallback(state, relation, target_ty,
+        scope_tys, depth_left - 1, guarded_left, generation_query)
+    fallback === nothing && (fallback = _replay_finite_core_certificate(state, relation, fallback_query))
     fallback isa _UnsupportedEvidenceSampling && return nothing
     fallback === nothing && return nothing
     # A type certificate is not a proof of the enclosing occurrence/filter
@@ -350,6 +358,21 @@ function _sample_certified_safe_list_body(
     body_query = _nested_generation_query(state, body_parent, target_ty, success_scope,
         depth_left - 1, guarded_left)
     body_query = _derive_generation_query(body_query; capability_mask=(:safe_list_access,))
+    # This is a bounded complete-candidate builder even when called by the
+    # root frontier's preparer. The root controller is not opened/reset here.
+    # A failed preference leaves the original proof-backed OR replay intact.
+    if state.completion.probability == 0 && !state.completion.completing &&
+       _list_recursion_bias_enabled(relation.weights)
+        preferred_query = _with_list_recursion_hints(relation, source, generation_query, body_query)
+        body = _sample_list_recursive_body(state, relation, target_ty, success_scope,
+            depth_left - 1, guarded_left, preferred_query)
+        if body !== nothing
+            result = SafeListAccessDerivation(source.derivation, source.ty, body, fallback, target_ty)
+            _generation_requirements_satisfied(result, generation_query) ||
+                error("biased safe-list composition lost an occurrence obligation")
+            return result
+        end
+    end
     # Select an OR branch before proving it. A positive first certificate does
     # not need the other proxy's graph; failure may try the other branch once.
     first_proxy = rand(state.rng, Bool) ? 0 : 1
@@ -413,6 +436,7 @@ function _sample_certified_required_candidate(
             return LambdaDerivation(target.arg, body)
         end
         query.depth_left > 1 || return nothing
+        choice_query = query
         query = _close_functiondef_prefix(query)
         # These are step descriptors, not a menu of recursively prepared
         # witnesses. A selected head prepares just one obligation allocation.
@@ -421,6 +445,7 @@ function _sample_certified_required_candidate(
         # the runtime descriptor boundary, not the first source's schema.
         options = _certified_mixed_candidate_options(relation, query, scope)
         options isa _UnsupportedEvidenceSampling && return nothing
+        options = _prefer_state_helper_body_options(options, relation, choice_query)
         pool, total = _positive_option_pool(options)
         while !isempty(pool) && total > 0
             index = _weighted_option_index(state.rng, pool, total)
@@ -1438,6 +1463,12 @@ function _sample_required_scope_certificate_derivation(
 )
     required = Tuple(_required_scope_binder_indices(generation_query, length(scope_tys)))
     isempty(required) && return nothing
+    # A bounded preference is not a core occurrence certificate. Keep its
+    # concrete argument-source choices in the existing constructive planner.
+    if _has_list_recursion_hint(generation_query)
+        return _sample_required_scope_legacy_derivation(state, relation, target_ty,
+            scope_tys, depth_left, guarded_left, allow_safe_list_access, generation_query)
+    end
     route_observer = get(task_local_storage(), _REQUIRED_SCOPE_ROUTE_DIAGNOSTIC_KEY, nothing)
     if generation_query !== nothing
         nested = _nested_generation_query(state, generation_query, target_ty,
@@ -1510,6 +1541,7 @@ function _sample_required_scope_legacy_derivation(
         ;
         allow_safe_list_access,
     )
+    options = _prefer_state_helper_body_options(options, relation, generation_query)
     pool, total_weight = _positive_option_pool(options)
     saved_nodes = state.nodes_left
     if !isempty(pool) && total_weight > 0
@@ -1936,6 +1968,7 @@ function _sample_fast_required_safe_list_derivation(
     prefix_offset::Int,
     generation_query::Union{Nothing,GenerationQuery},
 )
+    options = _prefer_state_helper_body_options(options, relation, generation_query)
     pool, total_weight = _positive_option_pool(options)
     while !isempty(pool) && total_weight > 0
         chosen = _weighted_option_index(state.rng, pool, total_weight)
@@ -2491,6 +2524,18 @@ function _materialize_fast_required_scope_application(
 )
     rule = plan.rule
     forced = plan.forced
+    if generation_query !== nothing &&
+       ((prefix_count == 0 &&
+         _required_scope_binder_indices(generation_query, length(scope_tys)) == [rule.index]) ||
+        _state_update_request(generation_query, rule.index) !== nothing)
+        before_preferred = state.nodes_left
+        preferred = _sample_preferred_list_recursive_call!(state, relation, rule,
+            scope_tys, depth_left, guarded_left, allow_safe_list_access, generation_query)
+        if preferred !== nothing
+            _proxy_prefix_satisfied(preferred, prefix_count, prefix_offset) && return preferred
+            state.nodes_left = before_preferred
+        end
+    end
     if generation_query !== nothing &&
        _required_full_self_marker(generation_query, rule.index,
            length(rule.argument_tys)) !== nothing &&
@@ -3245,6 +3290,7 @@ function _sample_from_proxy_using_options(
     allow_safe_list_access::Bool=false,
     generation_query::Union{Nothing,GenerationQuery}=nothing,
 )
+    options = _prefer_state_helper_body_options(options, relation, generation_query)
     pool, total_weight = _positive_option_pool(options)
     (isempty(pool) || total_weight <= 0) && return nothing
     option = pool[_weighted_option_index(state.rng, pool, total_weight)]
@@ -3696,6 +3742,10 @@ function _sample_proxy_using_afoldl_step_argument(
     allow_safe_list_access::Bool=false,
     generation_query::Union{Nothing,GenerationQuery}=nothing,
 )
+    joint = _sample_joint_afoldl_step(state, relation, rule, scope_tys,
+        depth_left, guarded_left, allow_safe_list_access, generation_query;
+        prefix_count, prefix_offset)
+    joint === nothing || return joint
     options = NamedTuple[]
     grounded = _proxy_using_materialized_derivations(
         _grounded_derivations(relation, first(rule.argument_tys), scope_tys),

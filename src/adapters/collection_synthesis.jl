@@ -204,8 +204,7 @@ function _collection_program(
     input_ty = task_kind === :array ? TensorSchema(input_shape).ty : TyList(frame_ty)
     output_ty = task_kind === :array ? TensorSchema(output_shape).ty : TyList(output_frame_ty)
 
-    # Draw each task's coefficients independently from the same bounded prior.
-    # Gains are kept away from zero so every output channel depends on its kernel.
+    # Independent bounded coefficients; nonzero gains keep each output channel kernel-dependent.
     draw_gain() = begin
         while true
             value = 2 * rand(rng) - 1
@@ -293,8 +292,7 @@ function _collection_program(
 end
 
 function _collection_program_key(program::Program)
-    # Array-valued constants are program materials too. Callable layout helpers
-    # remain fixed in the task world and are not identified by allocation identity.
+    # Include data constants in the key; callable layout-helper identity is incidental.
     data_locals = sort!(collect((name, value) for (name, value) in program.local_consts
         if !(value isa Function)); by=pair -> string(first(pair)))
     local_material = join((string(name, "=", repr(value)) for (name, value) in data_locals), ";")
@@ -330,7 +328,7 @@ function _collection_family(task_index::Int, requested::Symbol, n_elements::Int)
         "program_family=:center requires at least two elements",
     ))
     requested !== :mixed && return requested
-    # A one-element group has no cross-element centering signal.
+    # :center has no signal when a group has one element.
     return n_elements > 1 && isodd(task_index) ? :center : :pointwise
 end
 
@@ -357,7 +355,7 @@ function _collection_regressor_config(options)
     overrides = _collection_options(
         get(options, :regressor_config, NamedTuple()), "regressor_config",
     )
-    # Nested map/fold execution needs a larger default step budget.
+    # Bound nested map/fold execution; Regression config can override the 4096-step limit.
     values = Dict{Symbol,Any}(:procedural_max_steps => 4_096)
     merge!(values, overrides)
     if haskey(values, :parallel) && values[:parallel] isa AbstractDict

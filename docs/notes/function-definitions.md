@@ -41,3 +41,8 @@ a bounded body without unfolding the fixed point. Typed mutation and crossover
 preserve the self binder and visible binder context when moving subtrees.
 Definitions may be observed as self references or genuine self calls, and a
 well-typed recursive term may still diverge.
+
+Scoped rewrites preserve recursive self identities and rebase their references.
+A syntactic admission filter rejects mandatory self calls on known strict
+execution paths and invalid unguarded recursive calls. Passing this filter
+is not a general termination guarantee; execution limits remain independent.

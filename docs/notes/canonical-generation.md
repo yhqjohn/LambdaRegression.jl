@@ -36,3 +36,9 @@ Optional guarded-family balancing redistributes sampling weight among
 constructor families while preserving total mass and legal construction routes.
 It changes sampling preference, not availability, typing, or completion evidence.
 The default is disabled.
+
+Bounded extensions can construct applications with generated finite heads
+and configure sampling weights and initialization selection independently.
+They share depth, node, and provider-attempt limits with ordinary generation;
+failed proposals can refund node charges without restoring spent attempts.
+They preserve binder requirements and do not add core availability evidence.

@@ -22,6 +22,12 @@ Capabilities
   FunctionDef operators), and automatic core/FunctionDef crossover dispatch.
   Initialization and generator-backed variation share the configured canonical
   generation providers and the general FunctionDef mutation generator.
+  Initialization can softly mix its existing nearest-target candidate choice
+  with uniform choice among successful candidates.
+- `full_mutation_provider` optionally replaces complete-program mutation through
+  a checked provider/mixture/codec interface; local scalar edits and finite
+  generation do not invoke it. `schedule_budget`/`schedule_offset` define its
+  cumulative proposal horizon, also used by scheduled mutation-family weights.
 - `prepare_regression_evaluator` extracts only the task's execution inputs and
   explicit limits, then delegates preparation to `Execution`.
 - `prepare_task_evaluator` resolves an explicit preparer, an injected sample
@@ -49,11 +55,13 @@ Capabilities
 module Regression
 
 using Random
+import Serialization
 using TestItems
 
 import Base.Threads
 
 using ..Utils: Err
+using ..Schedules: ProposalProgress, schedule_value
 using ..TypeSystem
 using ..TypeSystem: Ty, TyLike, TyFun, TyArray, TyNat, FloatTy
 using ..TypeSystem: make_tyvar_factory, get_type_ctx
@@ -90,6 +98,8 @@ struct NotImplementedErr end
 struct MissingComponentErr
     key::Symbol
 end
+
+include("mutation_providers.jl")
 
 """
     SupervisedDataset(X, Y)
@@ -439,6 +449,7 @@ function _role_code(role::Symbol)::UInt64
     role === :eval && return 0x05
     role === :select && return 0x06
     role === :immigrant && return 0x07
+    role === :init_functiondef_root && return 0x08
     return 0xFF
 end
 
@@ -457,6 +468,26 @@ end
 
 function derive_rng(seed::UInt64, generation::Int, index::Int, role::Symbol)::MersenneTwister
     return derive_rng(seed, role, generation, index)
+end
+
+function _select_initial_candidate_index(
+    candidate_sizes::AbstractVector{<:Integer},
+    target_nodes::Int,
+    preference::Float64,
+    rng::Union{Nothing,AbstractRNG},
+)
+    nearest_target_index() = argmin([
+        (abs(size - target_nodes), -size)
+        for size in candidate_sizes
+    ])
+    preference == 1 && return nearest_target_index()
+    rng === nothing && throw(ArgumentError(
+        "non-default initialization size preference requires a selection RNG",
+    ))
+    preference == 0 && return rand(rng, eachindex(candidate_sizes))
+    return rand(rng) < preference ?
+        nearest_target_index() :
+        rand(rng, eachindex(candidate_sizes))
 end
 
 function _preflight_input_signature(target_ty::Ty, slots, input_types)
@@ -604,6 +635,19 @@ function _program_candidate_rejection(ind::Program, components::NamedTuple)
     return reason
 end
 
+_fold_step_joint_weight_kwargs(probability::Real) = probability == 0 ?
+    NamedTuple() : (; fold_step_joint_use_probability=probability)
+
+_list_state_helper_weight_kwargs(weight::Real) = weight == 0 ?
+    NamedTuple() : (; list_state_helper=weight)
+
+function _checked_nonnegative_generation_weight(name::Symbol, value::Real)
+    value isa Bool && throw(ArgumentError("$name must be finite and non-negative"))
+    weight = Float64(value)
+    isfinite(weight) && weight >= 0 || throw(ArgumentError(
+        "$name must be finite and non-negative"))
+    return weight
+end
 
 """
     default_components(; kwargs...) -> NamedTuple
@@ -617,6 +661,25 @@ provider and the general FunctionDef mutation generator. The same configured
 generation world is used across target types; it does not install task-specific
 recursive templates. `candidate_admissibility` applies a cheap AST-level
 rejection filter; it is not a typing check or a termination proof.
+
+Initialization collects the existing bounded number of successful candidates.
+`init_size_preference` is the probability of selecting the candidate nearest
+the slot's target node count (ties still prefer the larger candidate); on the
+remaining probability it chooses uniformly from those successful candidates.
+The default `1` preserves the previous choice without consuming selection RNG.
+This only softens the choice within the successful candidates from the current
+initialization call; it does not retain the original candidate pool afterward.
+
+`init_functiondef_root_probability` optionally mixes a genuinely self-calling
+FunctionDef root into function-typed slots. One independent per-slot draw
+selects this route; zero consumes no draw and preserves ordinary initialization.
+The selected route spends the existing first initialization attempt, forwarding
+the configured provider and generation config. A successful root is selected
+directly, without competing against smaller ordinary candidates. On failure,
+remaining attempts collect ordinary candidates under the existing size policy;
+the failed attempt is not refunded. Values must be finite in `[0,1)` and a
+nonzero value requires the default `init_population`. It is a proposal prior,
+not a promise of successful recursion, termination, or a final AST size bound.
 
 Initialization growth uses the configured unary composition, binary
 composition, and contextual expansion operators. The returned NamedTuple is
@@ -634,6 +697,18 @@ view, may run concurrently by slot during parallel initialization, must not use
 search RNGs or mutate the borrowed materials, must be thread-safe, and must
 return a detached snapshot. The existing observer still receives the completed
 per-slot diagnostics serially after initialization joins.
+
+`fold_step_joint_use_probability` is forwarded to the default generation
+configuration and generator-backed mutation weights. It defaults to zero and
+must be finite in `[0,1)`. It biases bounded AFOLDL callback proposals only;
+it does not alter fold selection weights. A supplied custom
+`generation_config_factory` or mutation list remains caller-owned.
+
+`list_state_helper` is forwarded as a non-negative finite
+`GenerationWeights` weight to the default generation configuration and
+generator-backed mutation weights. It defaults to zero and is a weight, not a
+probability. It biases bounded list-state helper derivations. A supplied custom
+`generation_config_factory` or mutation list remains caller-owned.
 """
 function default_components(;
     global_consts::Dict{Symbol,Any}=Dict{Symbol,Any}(),
@@ -643,6 +718,8 @@ function default_components(;
     tyfactory_ctor=make_tyvar_factory,
     const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
     functiondef_generation_weight::Float64=1.0,
+    fold_step_joint_use_probability::Real=0.0,
+    list_state_helper::Real=0.0,
     generation_providers=(
         CanonicalGeneration.default_head_providers()...,
         CanonicalGeneration.SafeListAccessProvider(),
@@ -679,9 +756,11 @@ function default_components(;
             ),
             generation_kwargs=(;
                 providers=_generation_providers_with_functiondefs(generation_providers),
-                weights=CanonicalGeneration.GenerationWeights(
+                weights=CanonicalGeneration.GenerationWeights(;
                     default=1,
                     function_def=functiondef_generation_weight,
+                    _fold_step_joint_weight_kwargs(fold_step_joint_use_probability)...,
+                    _list_state_helper_weight_kwargs(list_state_helper)...,
                 ),
                 sampling_depth_limit=3,
                 sampling_node_budget=48,
@@ -697,9 +776,11 @@ function default_components(;
             ),
             generation_kwargs=(;
                 providers=_generation_providers_with_functiondefs(generation_providers),
-                weights=CanonicalGeneration.GenerationWeights(
+                weights=CanonicalGeneration.GenerationWeights(;
                     default=1,
                     function_def=functiondef_generation_weight,
+                    _fold_step_joint_weight_kwargs(fold_step_joint_use_probability)...,
+                    _list_state_helper_weight_kwargs(list_state_helper)...,
                 ),
                 sampling_depth_limit=3,
                 sampling_node_budget=48,
@@ -714,9 +795,11 @@ function default_components(;
             ),
             generation_kwargs=(;
                 providers=_generation_providers_with_functiondefs(generation_providers),
-                weights=CanonicalGeneration.GenerationWeights(
+                weights=CanonicalGeneration.GenerationWeights(;
                     default=1,
                     function_def=functiondef_generation_weight,
+                    _fold_step_joint_weight_kwargs(fold_step_joint_use_probability)...,
+                    _list_state_helper_weight_kwargs(list_state_helper)...,
                 ),
                 sampling_depth_limit=3,
                 sampling_node_budget=48,
@@ -728,6 +811,11 @@ function default_components(;
             functiondef_provider,
             generation_kwargs=(;
                 providers=generation_providers,
+                weights=CanonicalGeneration.GenerationWeights(;
+                    default=1,
+                    _fold_step_joint_weight_kwargs(fold_step_joint_use_probability)...,
+                    _list_state_helper_weight_kwargs(list_state_helper)...,
+                ),
                 sampling_depth_limit=4,
                 sampling_node_budget=64,
                 guarded_expansion_depth=1,
@@ -740,6 +828,11 @@ function default_components(;
                 functiondef_recursive_body_site_weight,
             generation_kwargs=(;
                 providers=generation_providers,
+                weights=CanonicalGeneration.GenerationWeights(;
+                    default=1,
+                    _fold_step_joint_weight_kwargs(fold_step_joint_use_probability)...,
+                    _list_state_helper_weight_kwargs(list_state_helper)...,
+                ),
                 sampling_depth_limit=8,
                 sampling_node_budget=96,
                 guarded_expansion_depth=1,
@@ -750,6 +843,11 @@ function default_components(;
             functiondef_provider,
             generation_kwargs=(;
                 providers=generation_providers,
+                weights=CanonicalGeneration.GenerationWeights(;
+                    default=1,
+                    _fold_step_joint_weight_kwargs(fold_step_joint_use_probability)...,
+                    _list_state_helper_weight_kwargs(list_state_helper)...,
+                ),
                 sampling_depth_limit=4,
                 sampling_node_budget=64,
                 guarded_expansion_depth=1,
@@ -758,6 +856,9 @@ function default_components(;
     ],
     mutation_chooser::Mutations.AbstractPairChooser=Mutations.WeightedPairChooser(),
     mutation_provider::Mutations.AbstractSiteProvider=Mutations.IndexedProvider(),
+    full_mutation_provider::AbstractMutationProvider=OrdinaryMutationProvider(),
+    schedule_budget::Int=1,
+    schedule_offset::Int=0,
     mutation_max_try::Int=25,
     mutation_prune_consts::Bool=true,
     mutation_adaptive_policy::Mutations.AdaptivePolicy=Mutations.AdaptivePolicy(),
@@ -769,17 +870,21 @@ function default_components(;
     generation_config_factory=rng -> CanonicalGeneration.GenerationConfig(;
         rng,
         providers=generation_providers,
-        weights=CanonicalGeneration.GenerationWeights(
+        weights=CanonicalGeneration.GenerationWeights(;
             default=1,
             function_def=functiondef_generation_weight,
+            _fold_step_joint_weight_kwargs(fold_step_joint_use_probability)...,
+            _list_state_helper_weight_kwargs(list_state_helper)...,
         ),
         sampling_depth_limit=8,
         sampling_node_budget=96,
         guarded_expansion_depth=1,
     ),
     force_lambda_root_probability::Float64=0.5,
+    init_functiondef_root_probability::Real=0,
     init_candidates_per_individual::Int=2,
     init_target_nodes::Tuple{Vararg{Int}}=(3, 5, 8, 12),
+    init_size_preference::Real=1,
     init_max_try::Int=8,
     init_growth_attempts::Int=2,
     init_growth_max_try::Int=8,
@@ -789,6 +894,7 @@ function default_components(;
     initialization_candidate_snapshot=nothing,
     kwargs...
 )
+    ProposalProgress(schedule_offset, schedule_budget)
     haskey(kwargs, :type_inference) && throw(ArgumentError(
         "type_inference was removed; ProgramAnalysis owns mutation typing and sites",
     ))
@@ -797,6 +903,16 @@ function default_components(;
         throw(ArgumentError(
             "functiondef_generation_weight must be finite and non-negative",
         ))
+    fold_step_joint_use_probability isa Bool && throw(ArgumentError(
+        "fold_step_joint_use_probability must be finite and in [0, 1)",
+    ))
+    isfinite(fold_step_joint_use_probability) &&
+        0 <= fold_step_joint_use_probability < 1 || throw(ArgumentError(
+            "fold_step_joint_use_probability must be finite and in [0, 1)",
+        ))
+    fold_step_joint_use_probability = Float64(fold_step_joint_use_probability)
+    list_state_helper = _checked_nonnegative_generation_weight(
+        :list_state_helper, list_state_helper)
     isfinite(functiondef_recursive_body_site_weight) &&
         functiondef_recursive_body_site_weight >= 0 || throw(ArgumentError(
             "functiondef_recursive_body_site_weight must be finite and non-negative",
@@ -808,6 +924,30 @@ function default_components(;
     !isempty(init_target_nodes) && all(>(0), init_target_nodes) || throw(ArgumentError(
         "init_target_nodes must contain positive sizes",
     ))
+    init_size_preference isa Bool && throw(ArgumentError(
+        "init_size_preference must be a finite real number in [0, 1]",
+    ))
+    isfinite(init_size_preference) && 0 <= init_size_preference <= 1 ||
+        throw(ArgumentError(
+            "init_size_preference must be a finite real number in [0, 1]",
+        ))
+    init_size_preference = Float64(init_size_preference)
+    init_functiondef_root_probability isa Bool && throw(ArgumentError(
+        "init_functiondef_root_probability must be a finite real number in [0, 1)",
+    ))
+    isfinite(init_functiondef_root_probability) &&
+        0 <= init_functiondef_root_probability < 1 || throw(ArgumentError(
+            "init_functiondef_root_probability must be a finite real number in [0, 1)",
+        ))
+    init_functiondef_root_probability = Float64(init_functiondef_root_probability)
+    init_functiondef_root_probability < 1 || throw(ArgumentError(
+        "init_functiondef_root_probability must remain below 1 after Float64 conversion",
+    ))
+    init_functiondef_root_probability == 0 || init_population === nothing ||
+        throw(ArgumentError(
+            "init_functiondef_root_probability requires the default init_population; " *
+            "custom initialization must implement its own route mixture",
+        ))
     init_growth_attempts >= 0 || throw(ArgumentError(
         "init_growth_attempts must be non-negative",
     ))
@@ -994,7 +1134,14 @@ function default_components(;
         last_error = nothing
         candidates = CanonicalGeneration.GenerationResult[]
         candidate_attempts = initialization_candidate_snapshot === nothing ? nothing : Int[]
+        prefer_functiondef_root = init_functiondef_root_probability > 0 &&
+            TypeSystem.prune(target_ty) isa TypeSystem.TyFun &&
+            rand(derive_rng(seed, :init_functiondef_root, slot, attempt_offset)) <
+                init_functiondef_root_probability
+        functiondef_root_applied = false
+        generation_attempts = 0
         for attempt in 1:init_max_try
+            generation_attempts = attempt
             rng = derive_rng(
                 seed,
                 0,
@@ -1005,7 +1152,16 @@ function default_components(;
             config isa CanonicalGeneration.GenerationConfig || throw(ArgumentError(
                 "generation_config_factory must return GenerationConfig",
             ))
-            result = if TypeSystem.prune(target_ty) isa TypeSystem.TyFun &&
+            preferred_attempt = prefer_functiondef_root && attempt == 1
+            result = if preferred_attempt
+                CanonicalGeneration.generate_functiondef_root_scoped(
+                    target_ty;
+                    global_consts,
+                    global_consts_ty,
+                    functiondef_provider,
+                    config,
+                )
+            elseif TypeSystem.prune(target_ty) isa TypeSystem.TyFun &&
                         rand(rng) < force_lambda_root_probability
                 generate_lambda_root(target_ty, rng, config)
             else
@@ -1028,19 +1184,40 @@ function default_components(;
             ))
             push!(candidates, result)
             candidate_attempts === nothing || push!(candidate_attempts, attempt)
+            if preferred_attempt
+                functiondef_root_applied = true
+                break
+            end
             length(candidates) >= init_candidates_per_individual && break
         end
         isempty(candidates) && return last_error === nothing ?
             Err(Mutations.MaxTryReachedErr()) : last_error
         target_nodes = init_target_nodes[mod1(slot, length(init_target_nodes))]
         candidate_sizes = _node_count.(getfield.(candidates, :tree))
-        selected_index = argmin([
-            (abs(size - target_nodes), -size)
-            for size in candidate_sizes
-        ])
+        selection_rng = functiondef_root_applied || init_size_preference == 1 ? nothing : derive_rng(
+            seed, :init_size_selection, slot, attempt_offset)
+        selected_index = functiondef_root_applied ? 1 : _select_initial_candidate_index(
+            candidate_sizes, target_nodes, init_size_preference, selection_rng)
         result = candidates[selected_index]
         result.metadata[:init_target_nodes] = target_nodes
         result.metadata[:init_candidate_count] = length(candidates)
+        result.metadata[:init_size_preference] = init_size_preference
+        result.metadata[:init_size_selection_strategy] =
+            functiondef_root_applied ? :functiondef_root :
+            init_size_preference == 1 ? :nearest_target :
+            init_size_preference == 0 ? :uniform_successful_candidates :
+            :nearest_target_uniform_successful_mixture
+        result.metadata[:init_selected_index] = selected_index
+        result.metadata[:init_selected_candidate_nodes] = candidate_sizes[selected_index]
+        result.metadata[:init_selected_growth_before_nodes] = candidate_sizes[selected_index]
+        if init_functiondef_root_probability > 0
+            result.metadata[:init_functiondef_root_probability] = init_functiondef_root_probability
+            result.metadata[:init_functiondef_root_requested] = prefer_functiondef_root
+            result.metadata[:init_functiondef_root_attempted] = prefer_functiondef_root
+            result.metadata[:init_functiondef_root_succeeded] = functiondef_root_applied
+            result.metadata[:init_functiondef_root_fallback] = prefer_functiondef_root && !functiondef_root_applied
+            result.metadata[:init_generation_attempts] = generation_attempts
+        end
         if initialization_candidate_snapshot !== nothing
             snapshots = map(eachindex(candidates)) do index
                 candidate = candidates[index]
@@ -1055,8 +1232,6 @@ function default_components(;
             end
             result.metadata[:init_successful_attempts] = Tuple(candidate_attempts)
             result.metadata[:init_candidate_sizes] = Tuple(candidate_sizes)
-            result.metadata[:init_selected_index] = selected_index
-            result.metadata[:init_selected_growth_before_nodes] = candidate_sizes[selected_index]
             result.metadata[:init_candidate_snapshots] = Tuple(snapshots)
         end
         tree, local_consts, local_consts_ty = grow_initial_candidate(
@@ -1124,6 +1299,8 @@ function default_components(;
         tyfactory_ctor,
         const_symfactory_ctor,
         functiondef_generation_weight,
+        fold_step_joint_use_probability,
+        list_state_helper,
         functiondef_recursive_body_site_weight,
         generation_providers,
         contextual_expansion_site_selection,
@@ -1133,6 +1310,9 @@ function default_components(;
         mutations,
         mutation_chooser,
         mutation_provider,
+        full_mutation_provider,
+        schedule_budget,
+        schedule_offset,
         mutation_max_try,
         mutation_prune_consts,
         mutation_adaptive_policy,
@@ -1144,8 +1324,10 @@ function default_components(;
         functiondef_provider,
         generation_config_factory,
         force_lambda_root_probability,
+        init_functiondef_root_probability,
         init_candidates_per_individual,
         init_target_nodes,
+        init_size_preference,
         init_max_try,
         init_growth_attempts,
         init_growth_max_try,
@@ -1175,6 +1357,7 @@ end
 include("ConstantSearch.jl")
 include("TaskSchemas.jl")
 include("age_search.jl")
+include("search_replay.jl")
 include("scalar_refinement.jl")
 include("joint_search.jl")
 include("typed_refinement.jl")
@@ -1391,6 +1574,98 @@ end
     @test_throws MethodError default_config(generations=1)
 end
 
+@testitem "Regression default_components forwards fold-step generation bias" setup=[RegBaseImports] begin
+    using Random
+    CG = LambdaRegression.CanonicalGeneration
+    generator_types = Union{
+        LambdaRegression.Mutations.SubtreeReplacementMutation,
+        LambdaRegression.Mutations.ContextualExpansionMutation,
+        LambdaRegression.Mutations.BinaryCompositionMutation,
+        LambdaRegression.Mutations.FunctionDefMutation,
+    }
+
+    neutral = default_components()
+    neutral_weights = neutral.generation_config_factory(MersenneTwister(1)).weights
+    @test get(neutral_weights.overrides, :fold_step_joint_use_probability, 0.0) == 0.0
+
+    probability = 0.65
+    biased = default_components(fold_step_joint_use_probability=probability)
+    initial_weights = biased.generation_config_factory(MersenneTwister(1)).weights
+    @test initial_weights.overrides[:fold_step_joint_use_probability] == probability
+    generator_backed = filter(mutation -> mutation isa generator_types, biased.mutations)
+    @test length(generator_backed) == 6
+    @test all(generator_backed) do mutation
+        mutation.generation_kwargs.weights.overrides[:fold_step_joint_use_probability] == probability
+    end
+
+    custom_factory = rng -> CG.GenerationConfig(; rng,
+        weights=CG.GenerationWeights(fold_step_joint_use_probability=0.25))
+    custom = default_components(fold_step_joint_use_probability=probability,
+        generation_config_factory=custom_factory)
+    @test custom.generation_config_factory === custom_factory
+    custom_weights = custom.generation_config_factory(MersenneTwister(1)).weights
+    @test custom_weights.overrides[:fold_step_joint_use_probability] == 0.25
+
+    for invalid in (false, true, -0.1, 1.0, Inf, NaN)
+        @test_throws ArgumentError default_components(
+            fold_step_joint_use_probability=invalid)
+    end
+end
+
+@testitem "Regression default_components forwards list-state helper weight" setup=[RegBaseImports] begin
+    using Random
+    CG = LambdaRegression.CanonicalGeneration
+    Mutations = LambdaRegression.Mutations
+    generator_types = Union{
+        Mutations.SubtreeReplacementMutation,
+        Mutations.ContextualExpansionMutation,
+        Mutations.BinaryCompositionMutation,
+        Mutations.FunctionDefMutation,
+    }
+
+    neutral = default_components()
+    neutral_weights = neutral.generation_config_factory(MersenneTwister(1)).weights
+    @test get(neutral_weights.overrides, :list_state_helper, 0.0) == 0.0
+    neutral_generators = filter(mutation -> mutation isa generator_types, neutral.mutations)
+    @test length(neutral_generators) == 6
+    @test all(mutation ->
+        get(mutation.generation_kwargs.weights.overrides, :list_state_helper, 0.0) == 0.0,
+        neutral_generators)
+
+    weight = 2.5 # A generation weight, not a probability.
+    biased = default_components(list_state_helper=weight)
+    @test biased.list_state_helper == weight
+    initial_weights = biased.generation_config_factory(MersenneTwister(1)).weights
+    @test initial_weights.overrides[:list_state_helper] == weight
+    generator_backed = filter(mutation -> mutation isa generator_types, biased.mutations)
+    @test length(generator_backed) == 6
+    @test all(generator_backed) do mutation
+        mutation.generation_kwargs.weights.overrides[:list_state_helper] == weight
+    end
+
+    custom_factory = rng -> CG.GenerationConfig(; rng,
+        weights=CG.GenerationWeights(list_state_helper=0.75))
+    custom_factory_components = default_components(list_state_helper=weight,
+        generation_config_factory=custom_factory)
+    @test custom_factory_components.generation_config_factory === custom_factory
+    @test custom_factory_components.generation_config_factory(MersenneTwister(1)).
+        weights.overrides[:list_state_helper] == 0.75
+    @test all(mutation ->
+        mutation.generation_kwargs.weights.overrides[:list_state_helper] == weight,
+        filter(mutation -> mutation isa generator_types, custom_factory_components.mutations))
+
+    user_mutations = [Mutations.ParameterIntroductionMutation()]
+    custom_mutations_components = default_components(list_state_helper=weight,
+        mutations=user_mutations)
+    @test custom_mutations_components.mutations === user_mutations
+    @test custom_mutations_components.generation_config_factory(MersenneTwister(1)).
+        weights.overrides[:list_state_helper] == weight
+
+    for invalid in (false, true, -0.1, Inf, -Inf, NaN, big(10)^1000)
+        @test_throws ArgumentError default_components(list_state_helper=invalid)
+    end
+end
+
 @testitem "Regression mse basic cases" setup=[RegBaseImports] begin
     @test mse(2.0, 1.0) == 1.0
     @test mse([1.0, 2.0], [1.0, 4.0]) == 2.0
@@ -1515,10 +1790,12 @@ end
         (; expression=sprint(show, MIME"text/plain"(), candidate.tree), symbols)
     end
 
-    function initialize(; snapshots::Bool)
+    function initialize(; snapshots::Bool, size_preference=nothing)
         diagnostics = Any[]
         rng = MersenneTwister(42)
-        components = default_components(
+        preference_options = size_preference === nothing ? NamedTuple() :
+            (; init_size_preference=size_preference)
+        components = default_components(;
             global_consts=globals,
             global_consts_ty=global_types,
             input_slots=Symbol[:x],
@@ -1528,6 +1805,7 @@ end
             init_growth_attempts=1,
             initialization_observer=items -> push!(diagnostics, items),
             initialization_candidate_snapshot=snapshots ? capture : nothing,
+            preference_options...,
         )
         config = default_config(population_size=4, parallel=(enabled=false,))
         reg = Regressor(target_ty, components, config, rng)
@@ -1539,6 +1817,7 @@ end
     end
 
     off = initialize(snapshots=false)
+    explicit_default = initialize(snapshots=false, size_preference=1.0)
     on = initialize(snapshots=true)
     repeated = initialize(snapshots=true)
 
@@ -1547,7 +1826,11 @@ end
     @test getfield.(off.population, :tree) == getfield.(on.population, :tree)
     @test getfield.(off.population, :local_consts) == getfield.(on.population, :local_consts)
     @test getfield.(off.population, :local_consts_ty) == getfield.(on.population, :local_consts_ty)
+    @test getfield.(off.population, :tree) == getfield.(explicit_default.population, :tree)
+    @test getfield.(off.population, :local_consts) == getfield.(explicit_default.population, :local_consts)
+    @test getfield.(off.population, :local_consts_ty) == getfield.(explicit_default.population, :local_consts_ty)
     @test off.next_rng == on.next_rng
+    @test off.next_rng == explicit_default.next_rng
     @test only(on.diagnostics) == only(repeated.diagnostics)
     @test getfield.(on.population, :tree) == getfield.(repeated.population, :tree)
     @test length(only(on.diagnostics)) == length(on.population)
@@ -1560,6 +1843,10 @@ end
         @test Tuple(snapshot.successful_attempt for snapshot in snapshots) == row[:init_successful_attempts]
         @test issorted(collect(row[:init_successful_attempts]))
         @test row[:init_candidate_sizes][row[:init_selected_index]] == row[:init_selected_growth_before_nodes]
+        @test row[:init_size_preference] == 1.0
+        @test row[:init_size_selection_strategy] == :nearest_target
+        @test row[:init_selected_candidate_nodes] ==
+            row[:init_candidate_sizes][row[:init_selected_index]]
         @test row[:init_selected_growth_after_nodes] == row[:init_final_nodes]
         @test all(snapshot.snapshot.expression isa String for snapshot in snapshots)
         @test all(snapshot.snapshot.symbols isa Tuple for snapshot in snapshots)
@@ -1571,6 +1858,169 @@ end
     @test_throws ArgumentError default_components(
         initialization_candidate_snapshot=capture,
     )
+end
+
+@testitem "Regression initialization size preference uses target and uniform policies" setup=[RegBaseImports] begin
+    using LambdaRegression.Regression: _select_initial_candidate_index
+
+    sizes = [5, 9, 11, 20]
+    target_nodes = 10
+    legacy_index = argmin([(abs(size - target_nodes), -size) for size in sizes])
+    rng_default = MersenneTwister(1234)
+    rng_unchanged = MersenneTwister(1234)
+    @test _select_initial_candidate_index(sizes, target_nodes, 1.0, rng_default) ==
+        legacy_index
+    @test rand(rng_default, UInt64) == rand(rng_unchanged, UInt64)
+
+    expected_uniform = rand(MersenneTwister(2000), eachindex(sizes))
+    @test _select_initial_candidate_index(
+        sizes, target_nodes, 0.0, MersenneTwister(2000)) == expected_uniform
+
+    @test default_components().init_size_preference == 1.0
+    @test default_components(init_size_preference=1).init_size_preference == 1.0
+    @test default_components(init_size_preference=0).init_size_preference == 0.0
+    for invalid in (-0.1, 1.1, Inf, -Inf, NaN, false, true)
+        @test_throws ArgumentError default_components(init_size_preference=invalid)
+    end
+end
+
+@testitem "Regression initialization FunctionDef root mixture preserves routes and attempt budgets" setup=[RegBaseImports] begin
+    using LambdaRegression.ASTs.NodeASTs: FunctionDefNode
+    using LambdaRegression.ProgramAnalysis: functiondef_recursion_summary
+    using LambdaRegression.Regression: derive_rng, _role_code
+    using LambdaRegression.TypeSystem: BoolTy
+    CG = LambdaRegression.CanonicalGeneration
+    seed = UInt64(43)
+    gate = rand(derive_rng(seed, :init_functiondef_root, 1, 0))
+    selected_probability = (gate + 1) / 2
+    @test 0 < selected_probability < 1
+    @test _role_code(:init_functiondef_root) != _role_code(:init_size_selection)
+
+    function initialize(; probability=nothing, body_attempts=1, max_try=4,
+                        candidates=2, size_preference=1, fixed_rng=true)
+        config_calls = Ref(0)
+        filter_calls = Ref(0)
+        factory_rngs = Any[]
+        diagnostics = Any[]
+        provider = CG.FunctionDefProvider(
+            max_nesting=1, body_attempts=body_attempts,
+            admissibility=(candidate, relation, query) -> begin
+                filter_calls[] += 1
+                true
+            end,
+        )
+        weights = CG.GenerationWeights(
+            list_recursive_body_probability=0.8,
+            list_recursive_tail_probability=0.8,
+            functiondef_self_call_probability=0.8,
+            safe_list_short_fallback_probability=0.8,
+        )
+        options = probability === nothing ? NamedTuple() :
+            (; init_functiondef_root_probability=probability)
+        components = default_components(;
+            global_consts=Dict{Symbol,Any}(:root_route_probe => false),
+            global_consts_ty=Dict{Symbol,TyLike}(:root_route_probe => BoolTy),
+            functiondef_provider=provider,
+            generation_config_factory=rng -> begin
+                config_calls[] += 1
+                push!(factory_rngs, rng)
+                CG.GenerationConfig(;
+                    rng=fixed_rng ? Random.Xoshiro(2000) : rng,
+                    providers=(CG.ContextHeadProvider(),), weights,
+                    sampling_depth_limit=3, sampling_node_budget=12,
+                )
+            end,
+            force_lambda_root_probability=1.0,
+            init_candidates_per_individual=candidates,
+            init_max_try=max_try, init_growth_attempts=0,
+            init_size_preference=size_preference,
+            initialization_observer=items -> append!(diagnostics, items),
+            initialization_candidate_snapshot=candidate -> (;),
+            options...,
+        )
+        reg = Regressor(TyFun(FloatTy, FloatTy), components,
+            default_config(population_size=1), MersenneTwister(42))
+        population = components.init_population(reg, nothing;
+            N=1, seed, global_type_ctx=components.global_consts_ty)
+        return (; population, diagnostics, config_calls=config_calls[],
+            filter_calls=filter_calls[], components, provider,
+            next_rngs=[rand(rng, UInt64) for rng in factory_rngs])
+    end
+
+    preferred = initialize(probability=selected_probability)
+    @test !(preferred.population isa Err)
+    @test preferred.config_calls == 1
+    @test preferred.filter_calls == 1
+    @test preferred.components.functiondef_provider === preferred.provider
+    @test only(preferred.population).tree.root isa FunctionDefNode
+    @test functiondef_recursion_summary(only(preferred.population)).self_calls > 0
+    row = only(preferred.diagnostics)
+    @test row[:init_functiondef_root_requested]
+    @test row[:init_functiondef_root_attempted]
+    @test row[:init_functiondef_root_succeeded]
+    @test !row[:init_functiondef_root_fallback]
+    @test row[:init_generation_attempts] == 1
+    @test row[:init_candidate_count] == 1
+    @test row[:init_successful_attempts] == (1,)
+    @test row[:init_size_selection_strategy] === :functiondef_root
+    @test row[:init_selected_growth_before_nodes] == row[:init_initial_nodes]
+    @test row[:init_initial_nodes] == row[:init_final_nodes]
+    @test row[:sampling_nodes_used] <= 12
+    uniform_preferred = initialize(probability=selected_probability, size_preference=0)
+    @test only(uniform_preferred.diagnostics)[:init_size_selection_strategy] === :functiondef_root
+    @test getfield.(preferred.population, :tree) == getfield.(uniform_preferred.population, :tree)
+
+    fallback = initialize(probability=selected_probability, body_attempts=0)
+    @test !(fallback.population isa Err)
+    @test fallback.config_calls == 3 # One failed preferred + two ordinary successes.
+    @test fallback.filter_calls == 0
+    fallback_row = only(fallback.diagnostics)
+    @test fallback_row[:init_functiondef_root_requested]
+    @test fallback_row[:init_functiondef_root_attempted]
+    @test !fallback_row[:init_functiondef_root_succeeded]
+    @test fallback_row[:init_functiondef_root_fallback]
+    @test fallback_row[:init_generation_attempts] == 3
+    @test fallback_row[:init_successful_attempts] == (2, 3)
+    @test fallback_row[:init_candidate_count] == 2
+    @test fallback_row[:init_size_selection_strategy] === :nearest_target
+    bounded = initialize(probability=selected_probability, body_attempts=0, max_try=2)
+    @test !(bounded.population isa Err)
+    @test bounded.config_calls == 2
+    @test only(bounded.diagnostics)[:init_candidate_count] == 1
+    @test only(bounded.diagnostics)[:init_successful_attempts] == (2,)
+    exhausted = initialize(probability=selected_probability, body_attempts=0, max_try=1)
+    @test exhausted.population isa Err
+    @test exhausted.config_calls == 1
+    @test isempty(exhausted.diagnostics)
+
+    ordinary = initialize(probability=gate / 2)
+    @test !(ordinary.population isa Err)
+    @test ordinary.config_calls == 2
+    ordinary_row = only(ordinary.diagnostics)
+    @test !ordinary_row[:init_functiondef_root_requested]
+    @test !ordinary_row[:init_functiondef_root_attempted]
+    @test !ordinary_row[:init_functiondef_root_succeeded]
+    @test !ordinary_row[:init_functiondef_root_fallback]
+    @test ordinary_row[:init_generation_attempts] == 2
+
+    omitted = initialize(fixed_rng=false)
+    zero = initialize(probability=0, fixed_rng=false)
+    @test !(zero.population isa Err)
+    @test getfield.(omitted.population, :tree) == getfield.(zero.population, :tree)
+    @test getfield.(omitted.population, :local_consts) == getfield.(zero.population, :local_consts)
+    @test getfield.(omitted.population, :local_consts_ty) == getfield.(zero.population, :local_consts_ty)
+    @test omitted.diagnostics == zero.diagnostics
+    @test omitted.next_rngs == zero.next_rngs
+    @test !haskey(only(zero.diagnostics), :init_functiondef_root_probability)
+    @test default_components().init_functiondef_root_probability == 0
+    custom_init = (args...; kwargs...) -> nothing
+    @test default_components(init_population=custom_init,
+        init_functiondef_root_probability=0).init_population === custom_init
+    @test_throws ArgumentError default_components(init_population=custom_init,
+        init_functiondef_root_probability=0.5)
+    for invalid in (-0.1, 1, 1.1, Inf, -Inf, NaN, false, true)
+        @test_throws ArgumentError default_components(init_functiondef_root_probability=invalid)
+    end
 end
 
 @testitem "Regression default initialization is deterministic across thread modes" setup=[RegBaseImports] begin

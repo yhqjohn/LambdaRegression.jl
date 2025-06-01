@@ -27,3 +27,11 @@ unchanged same-task island migrants can retain their scores. Structural,
 numerical, and transfer costs have explicit limits and accounting. Complexity
 frequency controls selection pressure, not diversity among structural families.
 Published programs are read-only, and the task world stays stable during a session.
+
+Closed programs can be composed as editable syntax with checked type boundaries
+and independently owned local values. Seed selection bounds the number of
+compositions and uses source ranks or explicit whole-program scoring.
+
+Parameter schedules use cumulative proposal progress. Complete-program mutation
+providers pass type, binding, ownership, and admission checks before scoring.
+Optional replay records selected programs without changing search decisions.

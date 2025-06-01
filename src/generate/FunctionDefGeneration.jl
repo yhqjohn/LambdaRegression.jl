@@ -30,6 +30,17 @@ fallback is selected only after the source is empty and cannot establish a
 structurally smaller recursive argument. The filter is deliberately syntactic
 and total; richer loop analysis and runtime limits remain separate injectable
 policies.
+
+For closed finite function types with a complete leading-lambda prefix and
+non-function result, a saturated self call is also rejected on a certain
+evaluation path: the first argument of a known host Function, the first two
+arguments of the actual FADD/FSUB/FMUL/FDIV primitive values, or the source of
+safe-list access. Other scoped arguments, unknown later curried arguments,
+branches, lambdas and nested definitions are not inspected by this rule.
+Host identity follows materialization's value precedence; factories are never
+called. The optional `(candidate, relation, query)` form supplies context-bound
+host values. Bare signatures lack that value evidence and do not descend into
+head applications. This is separate from the older unchanged-argument rule.
 """
 struct DirectKnotFilter end
 
@@ -60,14 +71,130 @@ function _valid_functiondef_base_type(strategy, witness, target_ty)
     return result_ty === target_ty || TypeSystem.iscompatible(result_ty, target_ty)
 end
 
-function (filter::DirectKnotFilter)(candidate::FunctionDefCandidate)
+function (filter::DirectKnotFilter)(candidate::FunctionDefCandidate, relation=nothing, query=nothing)
     body = candidate.body
     _is_direct_self_derivation(body, candidate.self_index) && return false
     _is_eta_forwarding_derivation(body, candidate.self_index) && return false
     _is_unconditional_self_call_derivation(body, candidate.self_index) && return false
     _has_unchanged_self_call_derivation(body, candidate.self_index) && return false
     _has_unguarded_safe_list_recursive_derivation(body, candidate.self_index) && return false
+    _has_strict_saturated_self_call(candidate, relation) && return false
     return true
+end
+
+"""Return a finite strict prefix using already bound host value evidence.
+
+No factory or host code is executed. A relation supplies optional external
+value dictionaries; a bare HeadEntry can still provide its own value metadata.
+Unknown/preset AST values are not evidence of a strict host argument. An
+unknown host Function guarantees only its first argument: it may return an AST
+lambda. The four listed numeric primitives return host closures for their
+second application. Identity, never a name or dependency summary, proves this.
+"""
+function _strict_host_argument_prefix(head::CG.HeadEntry, relation)
+    CG._metadata_get(head.metadata, :factory, nothing) === nothing || return 0
+    value = if CG._metadata_has(head.metadata, :value)
+        CG._metadata_get(head.metadata, :value, nothing)
+    elseif relation !== nothing && head.source === :constant
+        get(relation.global_consts, head.name, nothing)
+    elseif relation !== nothing && head.source === :variable
+        get(relation.local_consts, head.name, nothing)
+    elseif relation !== nothing && head.source === :preset
+        get(relation.presets, head.name, nothing)
+    else
+        nothing
+    end
+    value isa Function || return 0
+    return value === Primitives.FADD || value === Primitives.FSUB ||
+        value === Primitives.FMUL || value === Primitives.FDIV ? 2 : 1
+end
+
+function _strict_self_parameter_types(target::Ty)
+    CG._in_closed_fragment(target) || return Ty[]
+    arguments = Ty[]
+    current = target
+    while current isa TyFun
+        push!(arguments, current.arg)
+        current = current.res
+    end
+    return arguments
+end
+
+"""Find one saturated self call required before a complete function result.
+
+This bounded structural predicate needs an exact finite, non-function-ending
+arrow spine and the same complete leading-lambda prefix. It observes actual
+host values, not primitive names, and follows only a proved strict prefix.
+Unknown callable behavior and all conditional/deferred regions are left alone.
+The relation is optional value evidence, not an evaluator or strictness oracle.
+"""
+function _has_strict_saturated_self_call(candidate::FunctionDefCandidate, relation=nothing)
+    parameters = _strict_self_parameter_types(candidate.target_ty)
+    isempty(parameters) && return false
+    current = candidate.body
+    for parameter in parameters
+        current isa CG.LambdaDerivation || return _has_strict_saturated_self_call_signature(
+            CG.derivation_signature(candidate.body), candidate.target_ty, candidate.self_index)
+        TypeSystem.typekey(current.arg_ty) == TypeSystem.typekey(parameter) || return false
+        current = current.body
+    end
+    return _strict_path_self_call(current, candidate.self_index + length(parameters),
+        length(parameters), candidate.target_ty, relation)
+end
+
+function _strict_path_self_call(d::CG.ScopeApplicationDerivation, self_index, arity, target, relation)
+    # A partial recursive application can return a lambda without evaluating
+    # its body. An arbitrary other scoped function may ignore all arguments.
+    return d.index == self_index && length(d.args) == arity &&
+        TypeSystem.typekey(d.head_ty) == TypeSystem.typekey(target)
+end
+function _strict_path_self_call(d::CG.HeadApplicationDerivation, self_index, arity, target, relation)
+    isempty(d.args) && return false
+    prefix = min(length(d.args), _strict_host_argument_prefix(d.head, relation))
+    for index in 1:prefix
+        _strict_path_self_call(d.args[index], self_index, arity, target, relation) && return true
+    end
+    return false
+end
+_strict_path_self_call(d::CG.SafeListAccessDerivation, self_index, arity, target, relation) =
+    _strict_path_self_call(d.source, self_index, arity, target, relation)
+_strict_path_self_call(d::CG.CoreDerivation, self_index, arity, target, relation) =
+    _strict_path_self_signature(CG.derivation_signature(d), self_index, arity, TypeSystem.typekey(target))
+
+# Signatures preserve structural roles, but :head carries no metadata/factory
+# identity. Even a same-named relation binding could be shadowed by metadata;
+# do not recover host evidence from it. This path is deliberately narrower.
+Base.@noinline Base.@nospecializeinfer function _has_strict_saturated_self_call_signature(
+    signature, target::Ty, self_index::Int=0,
+)
+    Base.@nospecialize signature
+    parameters = _strict_self_parameter_types(target)
+    isempty(parameters) && return false
+    current = signature
+    for parameter in parameters
+        current isa Tuple && length(current) >= 3 && current[1] === :lambda || return false
+        current[2] == TypeSystem.typekey(parameter) || return false
+        current = current[3]
+    end
+    return _strict_path_self_signature(current, self_index + length(parameters),
+        length(parameters), TypeSystem.typekey(target))
+end
+
+Base.@noinline Base.@nospecializeinfer function _strict_path_self_signature(signature, self_index, arity, target_key)
+    Base.@nospecialize signature target_key
+    signature isa Tuple && !isempty(signature) || return false
+    if signature[1] === :scope_application
+        length(signature) >= 4 && signature[4] isa Tuple || return false
+        return signature[2] == self_index && length(signature[4]) == arity && signature[3] == target_key
+    elseif signature[1] === :safe_list_access
+        length(signature) >= 7 || return false
+        return _strict_path_self_signature(signature[5], self_index, arity, target_key)
+    elseif signature[1] === :computed_application
+        normalized = _computed_scope_signature(signature)
+        normalized === signature || return _strict_path_self_signature(normalized, self_index, arity, target_key)
+        return length(signature) >= 4 && _strict_path_self_signature(signature[3], self_index, arity, target_key)
+    end
+    return false
 end
 
 function _inner_functiondef_admissible(policy, candidate, args...)
@@ -428,6 +555,11 @@ Base.@noinline Base.@nospecializeinfer function _has_unguarded_safe_list_recursi
             ),
             signature[5],
         )
+    elseif tag === :computed_application
+        normalized = _computed_scope_signature(signature)
+        normalized === signature || return _has_unguarded_safe_list_recursive_argument(normalized, self_index, safe_list_depth)
+        return _has_unguarded_safe_list_recursive_argument(signature[3], self_index, safe_list_depth) ||
+            CG._scope_any(a -> _has_unguarded_safe_list_recursive_argument(a, self_index, safe_list_depth), signature[4])
     elseif tag === :safe_list_access
         length(signature) >= 7 || return false
         return _has_unguarded_safe_list_recursive_argument(
@@ -510,6 +642,11 @@ Base.@noinline Base.@nospecializeinfer function _has_unchanged_self_call_signatu
             ),
             signature[5],
         )
+    elseif tag === :computed_application
+        normalized = _computed_scope_signature(signature)
+        normalized === signature || return _has_unchanged_self_call_signature(normalized, self_index, parameter_indices)
+        return _has_unchanged_self_call_signature(signature[3], self_index, parameter_indices) ||
+            CG._scope_any(a -> _has_unchanged_self_call_signature(a, self_index, parameter_indices), signature[4])
     elseif tag === :safe_list_access
         length(signature) >= 7 || return false
         return _has_unchanged_self_call_signature(
@@ -541,6 +678,7 @@ Base.@noinline Base.@nospecializeinfer function _is_eta_forwarding_signature(sig
     end
     lambda_count > 0 || return false
     current isa Tuple && length(current) >= 4 || return false
+    current = _computed_scope_signature(current)
     current[1] === :scope_application || return false
     current[2] == self_index + lambda_count || return false
     arguments = current[4]
@@ -565,6 +703,7 @@ Base.@noinline Base.@nospecializeinfer function _is_unconditional_self_call_sign
         lambda_count += 1
         current = current[3]
     end
+    current = _computed_scope_signature(current)
     lambda_count > 0 || return false
     return current isa Tuple && length(current) >= 4 &&
         current[1] === :scope_application &&
@@ -871,9 +1010,11 @@ function CG.generation_provider_applicable(
     _functiondef_remaining(query, provider) > 0 || return false
     provider.body_attempts > 0 || return false
     query.node_budget >= 2 || return false
-    CG._bucket_enabled(relation.weights, provider.weight_bucket) || return false
     _functiondef_attempts_remaining(query, provider) > 0 || return false
-    return CG.generation_function_view(query.target_ty) !== nothing
+    if CG.generation_function_view(query.target_ty) !== nothing
+        return CG._bucket_enabled(relation.weights, provider.weight_bucket)
+    end
+    return _list_state_helper_applicable(provider, relation, query)
 end
 
 function CG.generation_provider_exhausted(
@@ -885,7 +1026,7 @@ function CG.generation_provider_exhausted(
     provider.body_attempts > 0 || return true
     query.depth_left > 0 && query.provider_fuel > 0 || return true
     query.node_budget >= 2 || return true
-    CG._bucket_enabled(relation.weights, provider.weight_bucket) || return true
+    (_functiondef_or_helper_enabled(provider, relation.weights)) || return true
     _functiondef_remaining(query, provider) > 0 || return true
     return _functiondef_attempts_remaining(query, provider) <= 0
 end
@@ -912,7 +1053,7 @@ function CG.generation_root_requirements(
     provider.max_nesting > 0 || return ()
     provider.body_attempts > 0 || return ()
     query.provider_fuel > 0 || return ()
-    CG._bucket_enabled(relation.weights, provider.weight_bucket) || return ()
+    _functiondef_or_helper_enabled(provider, relation.weights) || return ()
     return (FunctionDefAttemptBudget(
         provider.route_token,
         fill(provider.body_attempts, provider.max_nesting),
@@ -970,6 +1111,9 @@ function CG.add_generation_options!(
     query::CG.GenerationQuery,
 )
     CG.generation_provider_applicable(provider, relation, query) || return options
+    if CG.generation_function_view(query.target_ty) === nothing
+        return _add_list_state_helper_options!(provider, options, relation, query)
+    end
     push!(
         options,
         (
@@ -1075,6 +1219,9 @@ function CG.sample_generation_extension(
     option,
     query::CG.GenerationQuery,
 )
+    if hasproperty(option, :kind) && option.kind === :list_state_helper
+        return _sample_list_state_helper(provider, state, relation, option, query)
+    end
     option.remaining > 0 || return nothing
     (option.target_ty === query.target_ty ||
         TypeSystem.iscompatible(option.target_ty, query.target_ty)) || return nothing
@@ -1086,8 +1233,15 @@ function CG.sample_generation_extension(
     nested_fuel = FunctionDefFuel(option.remaining - 1)
     self_binder = FunctionDefSelfBinder(0)
     body_parent = _close_functiondef_prefix(query)
+    helper_requirements = _functiondef_helper_requirements(option)
 
     if !(provider.admissibility isa GenuineSelfCallFilter)
+        preferred = _sample_preferred_functiondef_body(state, relation, provider,
+            option, query, body_parent, base_witness; requirements=helper_requirements)
+        if preferred !== nothing
+            return FunctionDefDerivation(query.target_ty, preferred, base_witness, 0,
+                CG.provider_capabilities(provider), nested_fuel.remaining)
+        end
         _consume_functiondef_attempt!(query, provider) || return nothing
         body = CG.sample_generation_extension(
             state,
@@ -1100,6 +1254,7 @@ function CG.sample_generation_extension(
                 nested_fuel,
                 _functiondef_attempt_budget(query, provider),
                 self_binder,
+                helper_requirements...,
             ),
             allow_safe_list_access=true,
         )
@@ -1136,7 +1291,8 @@ function CG.sample_generation_extension(
             query.target_ty;
             target_ty=query.target_ty,
             node_budget=min(query.node_budget, state.nodes_left),
-            requirements=(nested_fuel, _functiondef_attempt_budget(query, provider), self_binder),
+            requirements=(nested_fuel, _functiondef_attempt_budget(query, provider), self_binder,
+                helper_requirements...),
             allow_safe_list_access=true,
             allow_direct_result=false,
             require_scope_application=true,
@@ -1745,6 +1901,7 @@ function _sample_certified_functiondef_root(state, relation, provider, options, 
 end
 
 function _validate_functiondef_sampling_config(config::CG.GenerationConfig)
+    _bounded_proposal_bias_enabled(config.weights) && CG._uses_lazy_sampling(config)
     any(provider -> provider isa FunctionDefProvider, config.providers) || return config
     config.sampler isa CG.WeightedDerivationSampler || throw(ArgumentError(
         "FunctionDef generation currently requires WeightedDerivationSampler",

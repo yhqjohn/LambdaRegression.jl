@@ -18,6 +18,13 @@ struct _ScopedAbs <: _ScopedTerm
     body::_ScopedTerm
 end
 
+# A self binder has one body edge but is never an ordinary abstraction or
+# a let-like application head. Keep its identity and syntax during rewrites.
+struct _ScopedFunctionDef <: _ScopedTerm
+    binder_id::Int
+    body::_ScopedTerm
+end
+
 struct _ScopedApp <: _ScopedTerm
     func::_ScopedTerm
     arg::_ScopedTerm
@@ -45,7 +52,7 @@ end
 function _compute_next_scoped_binder_id(term::_ScopedTerm)
     highest = 0
     function visit(node::_ScopedTerm)
-        if node isa _ScopedAbs
+        if node isa Union{_ScopedAbs,_ScopedFunctionDef}
             highest = max(highest, node.binder_id)
             visit(node.body)
         elseif node isa _ScopedApp
@@ -195,6 +202,10 @@ function _resolve_scoped_occurrence(
         body = _resolve_scoped_occurrence(index, only(index.children[occurrence]), terms)
         body isa Err && return body
         _ScopedAbs(index.owner_binder[occurrence], node.name, body)
+    elseif node isa FunctionDefNode
+        body = _resolve_scoped_occurrence(index, only(index.children[occurrence]), terms)
+        body isa Err && return body
+        _ScopedFunctionDef(index.owner_binder[occurrence], body)
     elseif node isa AppNode
         child_ids = index.children[occurrence]
         func = _resolve_scoped_occurrence(index, child_ids[1], terms)
@@ -274,7 +285,7 @@ function _materialize_scoped_node(
         position = findlast(==(term.binder_id), binders)
         position === nothing && return Err(_EscapedScopedBinderErr(term.binder_id))
         return IndexNode(length(binders) - position)
-    elseif term isa _ScopedAbs
+    elseif term isa Union{_ScopedAbs,_ScopedFunctionDef}
         term.binder_id in seen_binders &&
             return Err(_DuplicateScopedBinderErr(term.binder_id))
         push!(seen_binders, term.binder_id)
@@ -282,7 +293,7 @@ function _materialize_scoped_node(
         body = _materialize_scoped_node(term.body, binders, seen_binders)
         pop!(binders)
         body isa Err && return body
-        return AbsNode(term.name, body)
+        return term isa _ScopedAbs ? AbsNode(term.name, body) : FunctionDefNode(body)
     elseif term isa _ScopedApp
         func = _materialize_scoped_node(term.func, binders, seen_binders)
         func isa Err && return func
@@ -309,7 +320,7 @@ function _scoped_at_path(
     node = scoped.root
     normalized_path = collect(Int, path)
     for (offset, index) in enumerate(normalized_path)
-        if node isa _ScopedAbs && index == 1
+        if node isa Union{_ScopedAbs,_ScopedFunctionDef} && index == 1
             node = node.body
         elseif node isa _ScopedApp && index == 1
             node = node.func
@@ -349,6 +360,10 @@ function _replace_scoped_term(
         body = _replace_scoped_term(node.body, path, offset + 1, replacement)
         body isa Err && return body
         return _ScopedAbs(node.binder_id, node.name, body)
+    elseif node isa _ScopedFunctionDef && index == 1
+        body = _replace_scoped_term(node.body, path, offset + 1, replacement)
+        body isa Err && return body
+        return _ScopedFunctionDef(node.binder_id, body)
     elseif node isa _ScopedApp && index == 1
         func = _replace_scoped_term(node.func, path, offset + 1, replacement)
         func isa Err && return func
@@ -375,7 +390,7 @@ end
 @inline function _scoped_uses_binder(term::_ScopedTerm, binder_id::Int)
     if term isa _ScopedBound
         return term.binder_id == binder_id
-    elseif term isa _ScopedAbs
+    elseif term isa Union{_ScopedAbs,_ScopedFunctionDef}
         return _scoped_uses_binder(term.body, binder_id)
     elseif term isa _ScopedApp
         return _scoped_uses_binder(term.func, binder_id) ||
@@ -394,7 +409,7 @@ function _retained_application_ancestors(
     for index in path
         node isa _ScopedApp && push!(retained, copy(prefix) => copy(prefix))
         push!(prefix, index)
-        if node isa _ScopedAbs && index == 1
+        if node isa Union{_ScopedAbs,_ScopedFunctionDef} && index == 1
             node = node.body
         elseif node isa _ScopedApp && index == 1
             node = node.func
@@ -423,6 +438,8 @@ Explicitly remove an unused let-like application `(λx. body) rhs`. The
 operator resolves De Bruijn references to stable binder identities once per
 `mutate_tree` call, rejects used binders and retained application-role changes,
 then relies on the outer mutation verifier for final target compatibility.
+Uses nested inside FunctionDef bodies count as uses of their original binders;
+the recursive self binder is preserved independently of ordinary lambdas.
 
 This operator is part of the ordinary mutation preset under a conservative
 weight and remains independently removable through the injected mutation list.
@@ -532,6 +549,9 @@ function _legal_hoist_sizes(
     site_is_function::Bool,
     parent_is_function::Bool,
 )
+    # Internal rewrites preserve FunctionDef, but moving a binding out of its
+    # body is a separate policy/typing boundary. Refuse even unused-self moves.
+    parent isa _ScopedFunctionDef && return Int[]
     bindings, _ = _scoped_let_prefix(term, mutation.max_bindings)
     upper = min(length(bindings), mutation.max_bindings)
     upper < mutation.min_bindings && return Int[]
@@ -641,6 +661,8 @@ Move a let-like binding, or a consecutive outer binding prefix, across one
 legal parent region. Binder identities are preserved and the move is rejected
 when a right-hand side would escape a crossed abstraction or when an affected
 application would change its direct-`Abs` HM role.
+FunctionDef bodies support internal moves, with each self-binding body edge
+acting as a conservative barrier: this mutation never hoists across it.
 
 The one-binding form is part of the ordinary preset. Any `max_bindings > 1`
 admits dependency-ordered block candidates; `min_bindings >= 2` makes the
@@ -766,6 +788,15 @@ function _sink_candidate(mutation, scoped::_ScopedTree, site_id::Int)
 
     target_id == body_id && return nothing
     _scoped_is_ancestor(lca, body_id, target_id) || return nothing
+    # Moving into a self-binding body is deliberately unsupported, even if the
+    # RHS does not capture self. Selecting a whole FunctionDef does not cross
+    # that edge and remains an ordinary descendant destination.
+    cursor = target_id
+    while cursor != body_id
+        parent = index.parent[cursor]
+        index.nodes[parent] isa FunctionDefNode && return nothing
+        cursor = parent
+    end
     return _SinkCandidate(body_id, target_id)
 end
 
@@ -850,6 +881,8 @@ The analysis reuses the attempt's `SyntaxIndex` for occurrence and binder
 structure, building the use-site LCA lazily. Rewriting preserves binder
 identities and affected direct-`Abs` HM application roles, then delegates
 final target compatibility to `mutate_tree`.
+Moves inside FunctionDef bodies preserve self identity; destinations across a
+FunctionDef body edge are conservatively refused.
 
 No mutation-specific `ctx` field is required. Expected failure modes are an
 unused binder, no strict legal descendant, a disabled trivial destination, an
@@ -928,6 +961,129 @@ end
     @test materialized.root.body.body.arg.func.name == :x
 end
 
+@testitem "ScopedRewrite FunctionDef rewrites preserve self and reject boundary crossings" begin
+    using Test, Random
+    using LambdaRegression.ASTs.NodeASTs:
+        AbsNode, AppNode, AstTree, ConstNode, FunctionDefNode, IndexNode
+    using LambdaRegression.TypeSystem: FloatTy, TyFun, TyLike, infer, iscompatible
+    using LambdaRegression.ProgramAnalysis: functiondef_recursion_summary
+    using LambdaRegression.Utils: Err
+    M = LambdaRegression.Mutations
+
+    # Same-named ordinary binders and two independent self binders must remain
+    # distinct. This representation-only fixture deliberately needs no typing.
+    nested = AstTree(AbsNode(:x, FunctionDefNode(AbsNode(:x, AppNode(
+        AppNode(IndexNode(1), IndexNode(2)),
+        FunctionDefNode(AbsNode(:x, AppNode(
+            AppNode(IndexNode(1), IndexNode(0)), IndexNode(3),
+        ))),
+    )))))
+    scoped = M._resolve_scoped(nested)
+    @test !(scoped isa Err)
+    @test M._materialize_scoped(scoped) == nested
+    outer_self = M._scoped_at_path(scoped, [1])
+    inner_self = M._scoped_at_path(scoped, [1, 1, 1, 2])
+    @test outer_self isa M._ScopedFunctionDef
+    @test inner_self isa M._ScopedFunctionDef
+    @test outer_self.binder_id != inner_self.binder_id
+    @test M._scoped_at_path(scoped, [1, 1, 1, 1, 1]).binder_id == outer_self.binder_id
+    @test M._scoped_at_path(scoped, [1, 1, 1, 1, 2]).binder_id == scoped.root.binder_id
+    @test M._scoped_at_path(scoped, [1, 1, 1, 2, 1, 1, 1, 1]).binder_id == inner_self.binder_id
+    @test M._scoped_at_path(scoped, [1, 1, 1, 2, 1, 1, 2]).binder_id == outer_self.binder_id
+    @test M._scoped_uses_binder(outer_self, scoped.root.binder_id)
+    replaced = M._replace_scoped(scoped, [1, 1, 1, 2], inner_self)
+    @test M._materialize_scoped(replaced) == nested
+    @test replaced.next_binder_id == 6
+    escaped = M._replace_scoped(scoped, Int[], M._ScopedBound(outer_self.binder_id))
+    @test M._materialize_scoped(escaped) isa Err
+    duplicate = M._ScopedTree(M._ScopedFunctionDef(1,
+        M._ScopedAbs(1, :x, M._ScopedBound(1))))
+    @test M._materialize_scoped(duplicate).value isa M._DuplicateScopedBinderErr
+
+    function_head = M._resolve_scoped(AstTree(AppNode(
+        FunctionDefNode(AbsNode(:x, IndexNode(0))), ConstNode(:one),
+    )))
+    @test M._application_role(function_head.root) === :ordinary
+    @test M._materialize_scoped(function_head).root.func isa FunctionDefNode
+
+    target = TyFun(FloatTy, FloatTy)
+    context = Dict{Symbol,TyLike}(
+        :combine => TyFun(FloatTy, TyFun(FloatTy, FloatTy)),
+        :one => FloatTy, :identity => target, :wrap => TyFun(target, target),
+    )
+    function run(tree, mutation)
+        return M.mutate_tree(tree, target;
+            rng=MersenneTwister(2000), global_consts_ty=context,
+            mutations=[mutation],
+            chooser=M.WeightedPairChooser(
+                weights=Dict{DataType,Float64}(typeof(mutation) => 1.0)),
+            provider=M.IndexedProvider(), max_try=1)
+    end
+
+    # A small typed analogue of the curried-left consumer case: the let RHS
+    # actually calls self, and hoisting stays inside this definition's body.
+    internal = AstTree(FunctionDefNode(AbsNode(:x, AppNode(
+        AppNode(AbsNode(:value, AppNode(ConstNode(:combine), IndexNode(0))),
+            AppNode(IndexNode(1), IndexNode(0))),
+        IndexNode(0),
+    ))))
+    internal_snapshot = deepcopy(internal)
+    expected = AstTree(FunctionDefNode(AbsNode(:x, AppNode(
+        AbsNode(:value, AppNode(AppNode(ConstNode(:combine), IndexNode(0)), IndexNode(1))),
+        AppNode(IndexNode(1), IndexNode(0)),
+    ))))
+    hoisted = run(internal, M.LetHoistMutation())
+    @test hoisted == expected
+    @test internal == internal_snapshot
+    @test iscompatible(infer(hoisted, context), target)
+    @test functiondef_recursion_summary(hoisted).self_calls == 1
+    sunk = run(hoisted, M.LetSinkMutation())
+    @test sunk == internal
+    @test iscompatible(infer(sunk, context), target)
+    @test functiondef_recursion_summary(sunk).self_calls == 1
+
+    unused = AstTree(FunctionDefNode(AbsNode(:x, AppNode(
+        AbsNode(:unused, AppNode(IndexNode(2), IndexNode(1))), ConstNode(:one),
+    ))))
+    pruned = run(unused, M.LetPruneMutation())
+    @test pruned == AstTree(FunctionDefNode(AbsNode(:x,
+        AppNode(IndexNode(1), IndexNode(0)))))
+    @test iscompatible(infer(pruned, context), target)
+    @test functiondef_recursion_summary(pruned).self_calls == 1
+
+    # The outer let is used only inside a nested FunctionDef. Prune must see
+    # that capture, and Sink must refuse to move through its self-binding edge.
+    captured = AstTree(AppNode(AbsNode(:held, FunctionDefNode(AbsNode(:x,
+        AppNode(IndexNode(1), IndexNode(2))))), ConstNode(:one)))
+    captured_snapshot = deepcopy(captured)
+    @test iscompatible(infer(captured, context), target)
+    @test run(captured, M.LetPruneMutation()) isa Err
+    @test run(captured, M.LetSinkMutation()) isa Err
+    @test captured == captured_snapshot
+
+    # Cross-self hoisting is conservatively refused with and without a self
+    # capture, rather than silently treating the FunctionDef as a lambda.
+    for crossing in (
+        AstTree(FunctionDefNode(AppNode(
+            AbsNode(:held, AbsNode(:x, IndexNode(1))), ConstNode(:one)))),
+        AstTree(FunctionDefNode(AppNode(
+            AbsNode(:held, AbsNode(:x, AppNode(IndexNode(1), IndexNode(0)))), IndexNode(0)))),
+    )
+        before = deepcopy(crossing)
+        @test iscompatible(infer(crossing, context), target)
+        @test run(crossing, M.LetHoistMutation()) isa Err
+        @test crossing == before
+    end
+
+    # A whole definition may be a destination without entering its body.
+    whole_definition = AstTree(AppNode(AbsNode(:held, AppNode(
+        ConstNode(:wrap), FunctionDefNode(IndexNode(1)))), ConstNode(:identity)))
+    whole_sunk = run(whole_definition, M.LetSinkMutation())
+    @test whole_sunk == AstTree(AppNode(ConstNode(:wrap), AppNode(
+        AbsNode(:held, FunctionDefNode(IndexNode(1))), ConstNode(:identity))))
+    @test iscompatible(infer(whole_sunk, context), target)
+end
+
 @testitem "ScopedRewrite projects shared occurrences through SyntaxIndex" begin
     using Test
     using LambdaRegression.ASTs.NodeASTs:
@@ -1003,9 +1159,11 @@ end
     )
     @test _resolved_scoped(env).index === index
 
-    rejected = _resolve_scoped(AstTree(FunctionDefNode(ConstNode(:f))))
-    @test rejected isa Err
-    @test rejected.value isa LambdaRegression.Mutations._UnsupportedScopedNodeErr
+    definition = AstTree(FunctionDefNode(ConstNode(:f)))
+    resolved_definition = _resolve_scoped(definition)
+    @test !(resolved_definition isa Err)
+    @test resolved_definition.root isa LambdaRegression.Mutations._ScopedFunctionDef
+    @test LambdaRegression.Mutations._materialize_scoped(resolved_definition) == definition
 end
 
 @testitem "ScopedRewrite rejects escaped binder identity" begin
