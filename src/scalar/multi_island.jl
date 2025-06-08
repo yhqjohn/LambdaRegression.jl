@@ -43,6 +43,7 @@ function _copy_config(config::ScalarSearchConfig, structural::Int,
         initial_pool_multiplier=config.initial_pool_multiplier,
         initial_affine_basis=config.initial_affine_basis,
         evolution_strategy=config.evolution_strategy,
+        proposal_biases=config.proposal_biases,
     )
 end
 

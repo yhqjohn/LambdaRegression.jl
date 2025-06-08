@@ -562,6 +562,7 @@ evaluate_scalar(expr::ScalarExpr, X::AbstractMatrix{<:Real}) =
 include("search.jl")
 include("dynamic_expressions.jl")
 include("node_regularized.jl")
+include("node_composition_cleanup.jl")
 include("node_constant_refinement.jl")
 include("node_regularized_search.jl")
 include("node_regularized_state.jl")

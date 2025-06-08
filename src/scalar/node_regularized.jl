@@ -288,6 +288,38 @@ function _node_finalize_proposal(root, parent::_NodeScalarCandidate,
     return (_NodeScalarCandidate(root, complexity), true)
 end
 
+"""Compose one bounded neighborhood around an existing scalar occurrence.
+
+The current occurrence, same-region donor and visible feature count supply all
+materials. `config` supplies the unary/binary operator world and node cap;
+`:pair` combines two distinct materials, while `:transform_pair` first wraps
+the second. No objective or task dependency is consulted. Missing
+operators/materials and node overflow return unchanged.
+"""
+function _node_bounded_composition(rng, parent, donor, feature_count, config, kind)
+    isempty(config.binary_operators) && return (parent, false)
+    kind !== :pair && isempty(config.unary_operators) && return (parent, false)
+    root = copy(parent.node; break_sharing=Val(true))
+    target = rand(rng, _node_anchors(root))
+    left = copy(target.node; break_sharing=Val(true))
+    materials = DynamicExpressions.Node{Float64}[]
+    for index in 1:feature_count
+        feature = DynamicExpressions.Node(Float64; feature=index)
+        feature == target.node || push!(materials, feature)
+    end
+    for anchor in _node_anchors(donor.node)
+        anchor.node == target.node || push!(materials, anchor.node)
+    end
+    isempty(materials) && return (parent, false)
+    right = copy(rand(rng, materials); break_sharing=Val(true))
+    kind === :transform_pair && (right = DynamicExpressions.Node(Float64;
+        op=_dynamic_unary_index(rand(rng, config.unary_operators)), l=right))
+    rand(rng, Bool) && ((left, right) = (right, left))
+    replacement = DynamicExpressions.Node(Float64;
+        op=_dynamic_binary_index(rand(rng, config.binary_operators)), l=left, r=right)
+    return _node_finalize_proposal(_node_replace_anchor(root, target, replacement), parent, config)
+end
+
 """Build one copy-on-propose node candidate.
 
 Mutation anchors are selected uniformly from the copied parent. The donor,
@@ -299,6 +331,12 @@ function _node_scalar_propose(rng::AbstractRNG, parent::_NodeScalarCandidate,
         donor::_NodeScalarCandidate, feature_count::Int,
         config::ScalarSearchConfig, kind::Symbol; temperature::Real=1.0)
     kind in (:do_nothing, :simplify, :optimize) && return (parent, false)
+    kind in (:pair, :transform_pair) &&
+        return _node_bounded_composition(rng, parent, donor, feature_count, config, kind)
+    kind === :coefficient && return _node_coefficient_proposal(
+        rng, parent, donor, feature_count, config)
+    kind === :prune && return _node_prune_proposal(
+        rng, parent, donor, feature_count, config)
     if kind === :restart
         root = _node_random_fixed_size(
             rng, feature_count, config, rand(rng, 1:config.max_complexity))
@@ -445,6 +483,23 @@ function _node_scalar_sample_mutation(rng::AbstractRNG,
         false,
     )
     conditioned = ntuple(i -> eligible[i] ? weights[i] : 0.0, length(weights))
+    biases = config.proposal_biases
+    # Keep the exact old tuple and draw when disabled, including RNG usage.
+    if any(>(0), values(biases))
+        can_combine = !isempty(config.binary_operators) &&
+            candidate.complexity + 2 <= config.max_complexity
+        can_transform = can_combine && !isempty(config.unary_operators) &&
+            candidate.complexity + 3 <= config.max_complexity
+        extra = (can_combine ? biases.pair : 0.0,
+            can_transform ? biases.transform_pair : 0.0,
+            candidate.complexity + 4 <= config.max_complexity &&
+                :+ in config.binary_operators && :* in config.binary_operators ?
+                biases.coefficient : 0.0,
+            has_children && :+ in config.binary_operators && :* in config.binary_operators ?
+                biases.prune : 0.0)
+        names = (names..., :pair, :transform_pair, :coefficient, :prune)
+        conditioned = (conditioned..., extra...)
+    end
     total = sum(conditioned)
     total > 0 || return :do_nothing
     draw = rand(rng) * total
@@ -583,4 +638,50 @@ end
     @test counts[:delete] > 0
     @test counts[:do_nothing] > 0
     @test counts[:optimize] == 0
+end
+
+@testitem "bounded composition scalar proposals and zero bias preserve contracts" setup=[NodeRegularizedImports] begin
+    S = ScalarSearch
+    config = ScalarSearchConfig(evolution_strategy=:regularized,
+        unary_operators=(:square,), binary_operators=(:+,), max_complexity=12,
+        proposal_biases=(pair=1.0, transform_pair=1.0))
+    parent = S._node_scalar_candidate(scalar_input(1))
+    donor = S._node_scalar_candidate(scalar_input(2))
+    for kind in (:pair, :transform_pair)
+        child, changed = S._node_scalar_propose(MersenneTwister(1), parent,
+            donor, 2, config, kind)
+        @test changed
+        @test S._node_scalar_materialize(parent) == scalar_input(1)
+        @test S._node_scalar_materialize(donor) == scalar_input(2)
+        values = S._node_scalar_evaluate(child, [2.0 3.0; 5.0 7.0])
+        @test values == (kind === :pair ? [7.0, 10.0] : [27.0, 52.0])
+    end
+    limited = ScalarSearchConfig(evolution_strategy=:regularized,
+        max_complexity=1, proposal_biases=(pair=1.0,))
+    @test S._node_scalar_propose(MersenneTwister(1), parent, donor, 2,
+        limited, :pair) == (parent, false)
+    default = ScalarSearchConfig(evolution_strategy=:regularized)
+    explicit = ScalarSearchConfig(evolution_strategy=:regularized,
+        proposal_biases=(pair=0.0, transform_pair=0.0, coefficient=0.0, prune=0.0))
+    first, second = MersenneTwister(1111), MersenneTwister(1111)
+    @test [S._node_scalar_sample_mutation(first, parent, default) for _ in 1:50] ==
+        [S._node_scalar_sample_mutation(second, parent, explicit) for _ in 1:50]
+    @test rand(first) == rand(second)
+    @test default.proposal_biases == explicit.proposal_biases
+    insert_child, inserted = S._node_scalar_propose(MersenneTwister(42),
+        parent, donor, 2, default, :insert)
+    @test inserted
+    @test S._node_scalar_materialize(insert_child) != scalar_input(1)
+    sampled = [S._node_scalar_sample_mutation(MersenneTwister(seed), parent, default)
+        for seed in 1:256]
+    @test :insert in sampled
+    @test S._copy_config(config, 64, 0, nothing).proposal_biases == config.proposal_biases
+    @test_throws ArgumentError ScalarSearchConfig(proposal_biases=(pair=1.0,))
+    @test_throws ArgumentError ScalarSearchConfig(
+        evolution_strategy=:regularized, proposal_biases=(repeat_transform=0.0,))
+    @test_throws ArgumentError ScalarSearchConfig(
+        evolution_strategy=:regularized, proposal_biases=(insert=0.0,))
+    @test_throws ArgumentError ScalarSearchConfig(proposal_biases=(unknown=0.0,))
+    @test_throws ArgumentError ScalarSearchConfig(proposal_biases=(pair=-1.0,))
+    @test_throws ArgumentError ScalarSearchConfig(proposal_biases=(pair=Inf,))
 end

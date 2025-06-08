@@ -2995,12 +2995,170 @@ struct ScopedLazyRelationCacheEntry
     lock::ReentrantLock
 end
 
-const _DEFAULT_RELATION_CACHE = Dict{Any,CoreRelationCacheEntry}()
-const _DEFAULT_RELATION_CACHE_LOCK = ReentrantLock()
-const _DEFAULT_LAZY_RELATION_CACHE = Dict{Any,LazyRelationCacheEntry}()
-const _DEFAULT_LAZY_RELATION_CACHE_LOCK = ReentrantLock()
-const _SCOPED_LAZY_RELATION_CACHE = Dict{Any,ScopedLazyRelationCacheEntry}()
-const _SCOPED_LAZY_RELATION_CACHE_LOCK = ReentrantLock()
+"""Private bounded storage for the three canonical relation caches.
+
+Each cache map has its own lock. When a map reaches `max_entries`, its next
+new entry clears that map before insertion; existing relation objects remain
+valid for callers that already hold them.
+"""
+struct _GenerationRelationCache
+    max_entries::Int
+    relations::Dict{Any,CoreRelationCacheEntry}
+    relations_lock::ReentrantLock
+    lazy_relations::Dict{Any,LazyRelationCacheEntry}
+    lazy_relations_lock::ReentrantLock
+    scoped_lazy_relations::Dict{Any,ScopedLazyRelationCacheEntry}
+    scoped_lazy_relations_lock::ReentrantLock
+end
+
+function _GenerationRelationCache(; max_entries::Integer=128)
+    max_entries > 0 || throw(ArgumentError("max_entries must be positive"))
+    return _GenerationRelationCache(
+        Int(max_entries),
+        Dict{Any,CoreRelationCacheEntry}(),
+        ReentrantLock(),
+        Dict{Any,LazyRelationCacheEntry}(),
+        ReentrantLock(),
+        Dict{Any,ScopedLazyRelationCacheEntry}(),
+        ReentrantLock(),
+    )
+end
+
+const _GLOBAL_GENERATION_RELATION_CACHE = _GenerationRelationCache(max_entries=typemax(Int))
+const _DEFAULT_RELATION_CACHE = _GLOBAL_GENERATION_RELATION_CACHE.relations
+const _DEFAULT_RELATION_CACHE_LOCK = _GLOBAL_GENERATION_RELATION_CACHE.relations_lock
+const _DEFAULT_LAZY_RELATION_CACHE = _GLOBAL_GENERATION_RELATION_CACHE.lazy_relations
+const _DEFAULT_LAZY_RELATION_CACHE_LOCK = _GLOBAL_GENERATION_RELATION_CACHE.lazy_relations_lock
+const _SCOPED_LAZY_RELATION_CACHE = _GLOBAL_GENERATION_RELATION_CACHE.scoped_lazy_relations
+const _SCOPED_LAZY_RELATION_CACHE_LOCK = _GLOBAL_GENERATION_RELATION_CACHE.scoped_lazy_relations_lock
+const _GENERATION_RELATION_CACHE_TLS_KEY = gensym(:generation_relation_cache)
+
+function _active_generation_relation_cache()
+    cache = get(task_local_storage(), _GENERATION_RELATION_CACHE_TLS_KEY, _GLOBAL_GENERATION_RELATION_CACHE)
+    return cache::_GenerationRelationCache
+end
+
+"""Run `f` with a task-local relation cache, restoring the prior cache on exit.
+
+The prior binding is restored on both normal return and exceptions. Cache
+entries use the same keys and per-entry locks as the default global caches.
+"""
+function _with_generation_cache(f::F, cache::_GenerationRelationCache) where {F<:Function}
+    return task_local_storage(f, _GENERATION_RELATION_CACHE_TLS_KEY, cache)
+end
+
+function _get_or_create_generation_cache_entry(
+    build::F,
+    cache::_GenerationRelationCache,
+    entries::Dict{Any,T},
+    entries_lock::ReentrantLock,
+    cache_key,
+) where {F<:Function,T}
+    lock(entries_lock)
+    try
+        entry = get(entries, cache_key, nothing)
+        entry === nothing || return entry
+    finally
+        unlock(entries_lock)
+    end
+
+    entry = build()
+    lock(entries_lock)
+    try
+        existing = get(entries, cache_key, nothing)
+        existing === nothing || return existing
+        length(entries) >= cache.max_entries && empty!(entries)
+        entries[cache_key] = entry
+        return entry
+    finally
+        unlock(entries_lock)
+    end
+end
+
+@testitem "CanonicalGeneration worker-local relation cache ownership" begin
+    using Test
+    using Random
+    using LambdaRegression: CanonicalGeneration
+    using LambdaRegression.TypeSystem: BoolTy, TyLike
+
+    CG = CanonicalGeneration
+    globals = Dict{Symbol,Any}(:worker_cache_flag => true)
+    global_types = Dict{Symbol,TyLike}(:worker_cache_flag => BoolTy)
+    local_values = Dict{Symbol,Any}()
+    local_types = Dict{Symbol,TyLike}()
+    weights = CG.GenerationWeights()
+    providers = (CG.ContextHeadProvider(),)
+    cache = CG._GenerationRelationCache(max_entries=2)
+    cache_before = CG._active_generation_relation_cache()
+
+    outer_key = gensym(:worker_cache_outer)
+    nested_key = gensym(:worker_cache_nested)
+    @test_throws ErrorException CG._with_generation_cache(cache) do
+        @test CG._active_generation_relation_cache() === cache
+        @test_throws ErrorException CG._with_generation_cache(
+            CG._GenerationRelationCache(),
+        ) do
+            @test CG._active_generation_relation_cache() !== cache
+            error("scoped cache restoration probe")
+        end
+        @test CG._active_generation_relation_cache() === cache
+        CG._get_default_lazy_relation_cache_entry(
+            outer_key, weights, providers, nothing, 1, globals, global_types,
+        )
+        CG._get_scoped_lazy_relation_cache_entry(
+            nested_key, weights, providers, nothing, 1,
+            globals, global_types, local_values, local_types,
+        )
+        error("outer cache restoration probe")
+    end
+    @test CG._active_generation_relation_cache() === cache_before
+    @test haskey(cache.lazy_relations, outer_key)
+    @test haskey(cache.scoped_lazy_relations, nested_key)
+    @test !haskey(CG._DEFAULT_LAZY_RELATION_CACHE, outer_key)
+    @test !haskey(CG._SCOPED_LAZY_RELATION_CACHE, nested_key)
+
+    cache_key = gensym(:worker_cache_relation)
+    entry = CG._with_generation_cache(cache) do
+        CG._get_default_relation_cache_entry(
+            cache_key, BoolTy, weights, providers, nothing, 1, globals, global_types,
+        )
+    end
+    @test cache.relations[cache_key] === entry
+    @test !haskey(CG._DEFAULT_RELATION_CACHE, cache_key)
+
+    bounded_cache = CG._GenerationRelationCache(max_entries=1)
+    CG._with_generation_cache(bounded_cache) do
+        CG._get_default_lazy_relation_cache_entry(
+            :first_bounded_entry, weights, providers, nothing, 1, globals, global_types,
+        )
+        CG._get_default_lazy_relation_cache_entry(
+            :second_bounded_entry, weights, providers, nothing, 1, globals, global_types,
+        )
+    end
+    @test length(bounded_cache.lazy_relations) == 1
+    @test haskey(bounded_cache.lazy_relations, :second_bounded_entry)
+
+    make_config() = CG.GenerationConfig(
+        rng=Random.MersenneTwister(42),
+        weights=weights,
+        providers=providers,
+    )
+    ordinary = CG.generate_canonical(
+        BoolTy; global_consts=globals, global_consts_ty=global_types,
+        config=make_config(),
+    )
+    output_cache = CG._GenerationRelationCache()
+    worker_local = CG._with_generation_cache(output_cache) do
+        CG.generate_canonical(
+            BoolTy; global_consts=globals, global_consts_ty=global_types,
+            config=make_config(),
+        )
+    end
+    @test ordinary isa CG.GenerationResult
+    @test worker_local isa CG.GenerationResult
+    @test ordinary.metadata[:derivation] == worker_local.metadata[:derivation]
+    @test !isempty(output_cache.lazy_relations)
+end
 
 """
     generate_canonical(target_ty; kwargs...)
@@ -3994,6 +4152,17 @@ function _forbidden_scope_binders(query::GenerationQuery)
     return Tuple(indices)
 end
 
+function _generation_forbidden_binders_satisfied(
+    derivation::CoreDerivation,
+    query::GenerationQuery,
+)
+    for requirement in query.requirements
+        requirement isa ForbidsScopeBinder || continue
+        derivation_uses_scope_binder(derivation, requirement.index) && return false
+    end
+    return true
+end
+
 _shift_scope_binders(indices::Tuple, added::Int) =
     added == 0 ? indices : Tuple(index + added for index in indices)
 
@@ -4483,7 +4652,9 @@ Sample a general nested query from an extension while preserving `state` and
 the parent's masks and requirements. Requested depth, guarded depth, provider
 fuel, and node budget must not exceed the parent values; attempts to replenish them
 throw `ArgumentError`. Extension dispatch itself consumes one depth unit and
-one provider-fuel unit before invoking the provider-specific overload.
+one provider-fuel unit before invoking the provider-specific overload. Returned
+proposals are checked against inherited forbidden binders; rejection restores
+nodes but does not refund shared attempts or provider fuel.
 """
 function sample_generation_extension(
     state::DerivationSamplingState,
@@ -4513,12 +4684,18 @@ function sample_generation_extension(
         capability_mask,
         requirements,
     )
-    return _sample_generation_derivation(
+    saved_nodes = state.nodes_left
+    derivation = _sample_generation_derivation(
         state,
         relation,
         query,
         allow_safe_list_access,
     )
+    if derivation !== nothing && !_generation_forbidden_binders_satisfied(derivation, query)
+        state.nodes_left = saved_nodes
+        return nothing
+    end
+    return derivation
 end
 
 """
@@ -4539,7 +4716,9 @@ ends that proposal; caller-owned retry budgets decide whether to sample again.
 Omitting it preserves the ordinary route distribution exactly.
 `require_scope_application=true` strengthens binder use to a genuine
 application-head occurrence and uses the finite required-binder certificate;
-free child goals still use ordinary sampling before the certified fallback.
+free child goals still use ordinary sampling before the certified fallback. Both
+routes reject returned derivations that use inherited forbidden binders and
+restore their node charges without refunding attempts.
 """
 function sample_generation_derivation_using_scope_binder(
     state::DerivationSamplingState,
@@ -4588,13 +4767,15 @@ function sample_generation_derivation_using_scope_binder(
             effective,
         )
         if derivation === nothing ||
+           !_generation_forbidden_binders_satisfied(derivation, effective) ||
            (accept_derivation !== nothing && !accept_derivation(derivation))
             state.nodes_left = saved_nodes
             return nothing
         end
         return derivation
     end
-    return _sample_proxy_using_derivation(
+    saved_nodes = state.nodes_left
+    derivation = _sample_proxy_using_derivation(
         state,
         query_relation,
         effective.target_ty,
@@ -4608,6 +4789,105 @@ function sample_generation_derivation_using_scope_binder(
         generation_query=effective,
         accept_derivation,
     )
+    if derivation !== nothing && !_generation_forbidden_binders_satisfied(derivation, effective)
+        state.nodes_left = saved_nodes
+        return nothing
+    end
+    return derivation
+end
+
+@testitem "CanonicalGeneration query return boundaries reject forbidden binders" begin
+    using Test
+    using Random
+    using LambdaRegression.TypeSystem: BoolTy, FloatTy, Ty, TyFun
+
+    CG = LambdaRegression.CanonicalGeneration
+    relation = CG.CoreRelation(providers=(CG.ContextHeadProvider(),),
+        weights=CG.GenerationWeights(default=0, variable=1, lambda=1))
+    forbidden_query(target, scope, depth, nodes) = CG.GenerationQuery(target;
+        scope_tys=scope, depth_left=depth, guarded_left=0,
+        provider_fuel=depth, node_budget=nodes,
+        requirements=(CG.ForbidsScopeBinder(0),))
+
+    # The old ordinary route returned the only available, forbidden variable.
+    blocked = forbidden_query(FloatTy, Ty[FloatTy], 0, 1)
+    @test CG.known_generation_witness(relation, blocked) === nothing
+    blocked_state = CG.DerivationSamplingState(Random.Xoshiro(1), 1)
+    @test CG.sample_generation_extension(blocked_state, relation, blocked;
+        allow_safe_list_access=false) === nothing
+    @test blocked_state.nodes_left == 1
+
+    allowed = CG.GenerationQuery(FloatTy; scope_tys=Ty[FloatTy, BoolTy], depth_left=0,
+        guarded_left=0, provider_fuel=0, node_budget=1,
+        requirements=(CG.ForbidsScopeBinder(1),))
+    allowed_state = CG.DerivationSamplingState(Random.Xoshiro(1), 1)
+    allowed_result = CG.sample_generation_extension(allowed_state, relation,
+        allowed; allow_safe_list_access=false)
+    @test allowed_result isa CG.VariableDerivation
+    @test allowed_result.index == 0
+    @test allowed_state.nodes_left == 0
+
+    # Entering a binder rebases the forbidden outer slot; the new slot is legal.
+    binder_state = CG.DerivationSamplingState(Random.Xoshiro(1111), 1)
+    binder_result = CG.sample_generation_derivation_using_scope_binder(
+        binder_state, relation, blocked, FloatTy; allow_safe_list_access=false)
+    @test binder_result isa CG.VariableDerivation
+    @test binder_result.index == 0
+    @test binder_state.nodes_left == 0
+
+    # A lambda may use its new local binder, but not the shifted outer binder.
+    local_query = forbidden_query(TyFun(FloatTy, FloatTy), Ty[BoolTy], 1, 2)
+    local_state = CG.DerivationSamplingState(Random.Xoshiro(1234), 2)
+    local_result = CG.sample_generation_extension(local_state, relation,
+        local_query; allow_safe_list_access=false)
+    @test local_result isa CG.LambdaDerivation
+    @test local_result.body.index == 0
+    @test !CG.derivation_uses_scope_binder(local_result, 0)
+    @test local_state.nodes_left == 0
+    outer_query = forbidden_query(TyFun(BoolTy, FloatTy), Ty[FloatTy], 1, 2)
+    outer_state = CG.DerivationSamplingState(Random.Xoshiro(1234), 2)
+    @test CG.sample_generation_extension(outer_state, relation, outer_query;
+        allow_safe_list_access=false) === nothing
+    @test outer_state.nodes_left == 2
+
+    # A provider can bypass the public nested entry, so dispatch checks its result.
+    struct ForbiddenReturnProvider <: CG.AbstractHeadProvider
+        calls::Base.RefValue{Int}
+        seen_fuel::Base.RefValue{Int}
+    end
+    CG.add_heads!(::ForbiddenReturnProvider, heads, universe; kwargs...) = heads
+    CG.provides_generation_options(::ForbiddenReturnProvider) = true
+    function CG.sample_generation_extension(provider::ForbiddenReturnProvider,
+        state, relation, option, query)
+        provider.calls[] += 1
+        provider.seen_fuel[] = query.provider_fuel
+        CG.consume_generation_nodes!(state, 1) || return nothing
+        return CG.VariableDerivation(0, FloatTy)
+    end
+    provider = ForbiddenReturnProvider(Ref(0), Ref(-1))
+    provider_relation = CG.CoreRelation(providers=(provider,),
+        weights=CG.GenerationWeights(default=0))
+    provider_query = forbidden_query(FloatTy, Ty[FloatTy], 1, 3)
+    provider_state = CG.DerivationSamplingState(Random.Xoshiro(8000), 3)
+    option = (kind=:generation_extension,
+        value=(provider=provider, option=(;)), weight=1.0)
+    @test CG._sample_option(provider_state, provider_relation, option,
+        Ty[FloatTy], 1, 0, true, provider_query) === nothing
+    @test provider_state.nodes_left == 3
+    @test provider.calls[] == 1
+    @test provider.seen_fuel[] == 0
+
+    # No negative requirement adds no random draw or node charge.
+    plain = CG.GenerationQuery(FloatTy; scope_tys=Ty[FloatTy], depth_left=0,
+        guarded_left=0, provider_fuel=0, node_budget=1)
+    public_state = CG.DerivationSamplingState(Random.Xoshiro(42), 1)
+    old_state = CG.DerivationSamplingState(Random.Xoshiro(42), 1)
+    public_result = CG.sample_generation_extension(public_state, relation, plain;
+        allow_safe_list_access=false)
+    old_result = CG._sample_generation_derivation(old_state, relation, plain, false)
+    @test CG.derivation_signature(public_result) == CG.derivation_signature(old_result)
+    @test public_state.nodes_left == old_state.nodes_left
+    @test rand(public_state.rng) == rand(old_state.rng)
 end
 
 @testitem "CanonicalGeneration variable cache keys use logical identity" begin
@@ -4887,29 +5167,22 @@ function _get_default_lazy_relation_cache_entry(
     global_consts::AbstractDict,
     global_consts_ty::AbstractDict,
 )
-    lock(_DEFAULT_LAZY_RELATION_CACHE_LOCK)
-    try
-        entry = get(_DEFAULT_LAZY_RELATION_CACHE, cache_key, nothing)
-        entry === nothing || return entry
-    finally
-        unlock(_DEFAULT_LAZY_RELATION_CACHE_LOCK)
-    end
-
-    relation = CoreRelation(
-        global_consts=global_consts,
-        global_consts_ty=global_consts_ty,
-        weights=weights,
-        providers=providers,
-        argument_planner=argument_planner,
-        guarded_expansion_depth=guarded_expansion_depth,
-    )
-    entry = LazyRelationCacheEntry(relation, ReentrantLock())
-
-    lock(_DEFAULT_LAZY_RELATION_CACHE_LOCK)
-    try
-        return get!(_DEFAULT_LAZY_RELATION_CACHE, cache_key, entry)
-    finally
-        unlock(_DEFAULT_LAZY_RELATION_CACHE_LOCK)
+    cache = _active_generation_relation_cache()
+    return _get_or_create_generation_cache_entry(
+        cache,
+        cache.lazy_relations,
+        cache.lazy_relations_lock,
+        cache_key,
+    ) do
+        relation = CoreRelation(
+            global_consts=global_consts,
+            global_consts_ty=global_consts_ty,
+            weights=weights,
+            providers=providers,
+            argument_planner=argument_planner,
+            guarded_expansion_depth=guarded_expansion_depth,
+        )
+        LazyRelationCacheEntry(relation, ReentrantLock())
     end
 end
 
@@ -4925,32 +5198,25 @@ function _get_scoped_lazy_relation_cache_entry(
     local_consts_ty::AbstractDict,
     capability_mask=(),
 )
-    lock(_SCOPED_LAZY_RELATION_CACHE_LOCK)
-    try
-        entry = get(_SCOPED_LAZY_RELATION_CACHE, cache_key, nothing)
-        entry === nothing || return entry
-    finally
-        unlock(_SCOPED_LAZY_RELATION_CACHE_LOCK)
-    end
-
-    relation = CoreRelation(
-        global_consts=global_consts,
-        global_consts_ty=global_consts_ty,
-        local_consts=local_consts,
-        local_consts_ty=local_consts_ty,
-        weights=weights,
-        providers=providers,
-        argument_planner=argument_planner,
-        guarded_expansion_depth=guarded_expansion_depth,
-        capability_mask=capability_mask,
-    )
-    entry = ScopedLazyRelationCacheEntry(relation, ReentrantLock())
-
-    lock(_SCOPED_LAZY_RELATION_CACHE_LOCK)
-    try
-        return get!(_SCOPED_LAZY_RELATION_CACHE, cache_key, entry)
-    finally
-        unlock(_SCOPED_LAZY_RELATION_CACHE_LOCK)
+    cache = _active_generation_relation_cache()
+    return _get_or_create_generation_cache_entry(
+        cache,
+        cache.scoped_lazy_relations,
+        cache.scoped_lazy_relations_lock,
+        cache_key,
+    ) do
+        relation = CoreRelation(
+            global_consts=global_consts,
+            global_consts_ty=global_consts_ty,
+            local_consts=local_consts,
+            local_consts_ty=local_consts_ty,
+            weights=weights,
+            providers=providers,
+            argument_planner=argument_planner,
+            guarded_expansion_depth=guarded_expansion_depth,
+            capability_mask=capability_mask,
+        )
+        ScopedLazyRelationCacheEntry(relation, ReentrantLock())
     end
 end
 
@@ -4964,33 +5230,26 @@ function _get_default_relation_cache_entry(
     global_consts::AbstractDict,
     global_consts_ty::AbstractDict,
 )
-    lock(_DEFAULT_RELATION_CACHE_LOCK)
-    try
-        entry = get(_DEFAULT_RELATION_CACHE, cache_key, nothing)
-        entry === nothing || return entry
-    finally
-        unlock(_DEFAULT_RELATION_CACHE_LOCK)
-    end
-
-    relation = CoreRelation(
-        global_consts=global_consts,
-        global_consts_ty=global_consts_ty,
-        weights=weights,
-        providers=providers,
-        argument_planner=argument_planner,
-        guarded_expansion_depth=guarded_expansion_depth,
-    )
-    derivations = _known_derivations!(relation, target_ty, Ty[])
-    candidates = _generation_candidates(relation, target_ty, Ty[], derivations)
-    sample_set = _sample_set(candidates, weights)
-    known_count, scope_count = _relation_counts(relation)
-    entry = CoreRelationCacheEntry(relation, sample_set, known_count, scope_count)
-
-    lock(_DEFAULT_RELATION_CACHE_LOCK)
-    try
-        return get!(_DEFAULT_RELATION_CACHE, cache_key, entry)
-    finally
-        unlock(_DEFAULT_RELATION_CACHE_LOCK)
+    cache = _active_generation_relation_cache()
+    return _get_or_create_generation_cache_entry(
+        cache,
+        cache.relations,
+        cache.relations_lock,
+        cache_key,
+    ) do
+        relation = CoreRelation(
+            global_consts=global_consts,
+            global_consts_ty=global_consts_ty,
+            weights=weights,
+            providers=providers,
+            argument_planner=argument_planner,
+            guarded_expansion_depth=guarded_expansion_depth,
+        )
+        derivations = _known_derivations!(relation, target_ty, Ty[])
+        candidates = _generation_candidates(relation, target_ty, Ty[], derivations)
+        sample_set = _sample_set(candidates, weights)
+        known_count, scope_count = _relation_counts(relation)
+        CoreRelationCacheEntry(relation, sample_set, known_count, scope_count)
     end
 end
 
@@ -6705,6 +6964,10 @@ function _sample_option(
             safe = rigid_safe_derivation(derivation)
             safe isa Bool || throw(ArgumentError("rigid_safe_derivation must return Bool"))
             safe || return nothing
+        end
+        if !_generation_forbidden_binders_satisfied(derivation, effective)
+            state.nodes_left = budget_before
+            return nothing
         end
         return derivation
     end

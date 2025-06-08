@@ -42,3 +42,6 @@ and configure sampling weights and initialization selection independently.
 They share depth, node, and provider-attempt limits with ordinary generation;
 failed proposals can refund node charges without restoring spent attempts.
 They preserve binder requirements and do not add core availability evidence.
+
+Returned derivations are checked against both required and forbidden binder
+constraints, including precomputed and extension-provided candidates.

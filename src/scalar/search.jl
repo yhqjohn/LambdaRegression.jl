@@ -105,7 +105,14 @@ polishing of scored offspring. `max_total_evaluations`, when set, caps the sum
 of structural and constant-refinement objective calls; multi-island sessions
 split that cap across islands. Per-island baseline callbacks are reported
 separately and are excluded from the cap.
-Malformed configuration is rejected immediately.
+`proposal_biases` adds finite nonnegative relative mutation weights for
+`:pair`, `:transform_pair`, `:coefficient`, and `:prune`. These proposals
+consult only the current program, feature ports and configured operators.
+Missing keys mean zero. The existing `:insert` mutation remains in the regular
+palette at its original weight and is not separately biasable. The retained
+proposal weights require regularized evolution; all-zero settings preserve the
+original chooser and RNG path. They do not change scoring, acceptance, or
+numerical-refinement budgets. Malformed configuration is rejected immediately.
 """
 struct ScalarSearchConfig
     population_size::Int
@@ -135,6 +142,24 @@ struct ScalarSearchConfig
     initial_pool_multiplier::Int
     initial_affine_basis::Bool
     evolution_strategy::Symbol
+    proposal_biases::NamedTuple{(:pair, :transform_pair, :coefficient, :prune),NTuple{4,Float64}}
+end
+
+function _validated_proposal_biases(biases::NamedTuple)
+    names = (:pair, :transform_pair, :coefficient, :prune)
+    unsupported = filter(name -> !(name in names), keys(biases))
+    isempty(unsupported) || throw(ArgumentError(
+        "proposal_biases contains unsupported name(s): " *
+        "$(join(string.(unsupported), ", ")); supported names: " *
+        "$(join(string.(names), ", "))"))
+    values = ntuple(length(names)) do index
+        value = Float64(get(biases, names[index], 0.0))
+        isfinite(value) && value >= 0 || throw(ArgumentError(
+            "proposal_biases weights must be finite and nonnegative"))
+        value
+    end
+    isfinite(sum(values)) || throw(ArgumentError("proposal_biases total must be finite"))
+    return NamedTuple{names}(values)
 end
 
 function ScalarSearchConfig(;
@@ -164,7 +189,8 @@ function ScalarSearchConfig(;
         parsimony_coefficient::Real=1.0e-4,
         initial_pool_multiplier::Int=4,
         initial_affine_basis::Bool=false,
-        evolution_strategy::Symbol=:generational)
+        evolution_strategy::Symbol=:generational,
+        proposal_biases::NamedTuple=(;))
     population_size >= 2 || throw(ArgumentError("population_size must be at least 2"))
     max_evaluations >= population_size ||
         throw(ArgumentError("max_evaluations must cover the initial population"))
@@ -217,6 +243,9 @@ function ScalarSearchConfig(;
         throw(ArgumentError("initial_pool_multiplier must be positive"))
     evolution_strategy in (:generational, :regularized) || throw(ArgumentError(
         "evolution_strategy must be :generational or :regularized"))
+    biases = _validated_proposal_biases(proposal_biases)
+    evolution_strategy === :regularized || all(iszero, values(biases)) ||
+        throw(ArgumentError("nonzero proposal_biases requires evolution_strategy=:regularized"))
     if evolution_strategy === :generational
         constant_refinement_timing === :cycle || throw(ArgumentError(
             "constant_refinement_timing=:offspring requires evolution_strategy=:regularized"))
@@ -254,6 +283,7 @@ function ScalarSearchConfig(;
         initial_pool_multiplier,
         initial_affine_basis,
         evolution_strategy,
+        biases,
     )
 end
 

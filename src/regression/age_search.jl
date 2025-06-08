@@ -698,26 +698,40 @@ function initialize_age_search(
             global_type_ctx=global_type_ctx,
         )
         result isa Err && return result
-        issue = _preflight_initial_population(result, reg, reg.components, population_size)
+        parallel_status = _age_initial_parallel_status(
+            state, population_size; initial_transform,
+        )
+        issue = parallel_status.enabled ?
+            _age_preflight_initial_population_parallel(
+                result, reg, reg.components, population_size, parallel_status.workers,
+            ) :
+            _preflight_initial_population(result, reg, reg.components, population_size)
         issue === nothing || return Err(issue)
         pop = AgeSearchIndividual[]
-        for (slot, raw) in enumerate(result)
-            raw isa Program || throw(ArgumentError("init_population must return Programs"))
-            candidate = raw
-            if initial_transform !== nothing
-                candidate = initial_transform(state, raw; rng=state.rngs[island])
-                candidate isa Err && return candidate
-                candidate isa Program || throw(ArgumentError("initial_transform must return Program or Err"))
+        if parallel_status.enabled
+            scores = _age_score_initial_population_parallel(
+                state, result, parallel_status.workers,
+            )
+            _age_publish_initial_scores!(state, pop, scores)
+        else
+            for (slot, raw) in enumerate(result)
+                raw isa Program || throw(ArgumentError("init_population must return Programs"))
+                candidate = raw
+                if initial_transform !== nothing
+                    candidate = initial_transform(state, raw; rng=state.rngs[island])
+                    candidate isa Err && return candidate
+                    candidate isa Program || throw(ArgumentError("initial_transform must return Program or Err"))
+                end
+                record = _age_score_record!(state, candidate, (), :initial, :init)
+                if record.birth == 0
+                    record = AgeSearchIndividual(
+                        record.program, record.id, record.parent_ids, record.origin,
+                        record.loss, record.complexity, record.valid, _age_birth!(state),
+                    )
+                end
+                push!(pop, record)
+                _age_archive!(state, record)
             end
-            record = _age_score_record!(state, candidate, (), :initial, :init)
-            if record.birth == 0
-                record = AgeSearchIndividual(
-                    record.program, record.id, record.parent_ids, record.origin,
-                    record.loss, record.complexity, record.valid, _age_birth!(state),
-                )
-            end
-            push!(pop, record)
-            _age_archive!(state, record)
         end
         push!(state.populations, pop)
     end
@@ -736,7 +750,7 @@ or rejected through `policy`; omitting it retains oldest-member replacement.
 Rejected valid candidates remain in the score archive and are reported to the
 policy observer, but do not count as accepted offspring.
 """
-function advance_age_search!(
+function _advance_age_search_serial!(
     state::AgeSearchState;
     max_attempts::Int,
     max_evaluations::Int,

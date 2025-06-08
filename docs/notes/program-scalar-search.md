@@ -35,3 +35,8 @@ compositions and uses source ranks or explicit whole-program scoring.
 Parameter schedules use cumulative proposal progress. Complete-program mutation
 providers pass type, binding, ownership, and admission checks before scoring.
 Optional replay records selected programs without changing search decisions.
+
+Parallel initialization and age-search proposals use bounded worker tasks with
+private workspaces and ordered publication. Unsupported shared-state paths
+fall back to serial execution. Scalar mutation weights can optionally include
+local composition and pruning proposals; zero weights preserve ordinary selection.

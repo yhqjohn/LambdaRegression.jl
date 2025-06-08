@@ -90,6 +90,7 @@ export AbstractConstantSearch, ConstantSearchBudget, ConstantSearchStats
 export ConstantSearchResult, GaussianConstantSearch, search_constants
 export AgeSearchState, AgeSearchIndividual, AgeSearchMigration
 export AgeSearchCounters, AgeSearchReport, AgeSearchNoValidErr
+export age_parallel_status
 export initialize_age_search, advance_age_search!, inject_age_migrants!
 export TypedRefinementError, TypedRefinementResult
 export search_typed_roots, search_typed_hole
@@ -593,11 +594,16 @@ function default_config(;
 end
 
 function _normalize_parallel_config(parallel::NamedTuple)
-    unknown = filter(key -> key !== :enabled, keys(parallel))
+    unknown = filter(key -> key ∉ (:enabled, :workers), keys(parallel))
     isempty(unknown) || throw(ArgumentError(
         "unknown parallel config option(s): $(join(string.(unknown), ", "))",
     ))
-    return merge((; enabled=false), parallel)
+    result = merge((; enabled=false), parallel)
+    result.enabled isa Bool || throw(ArgumentError("parallel.enabled must be a Bool"))
+    workers = get(result, :workers, Threads.nthreads(:default))
+    workers isa Integer && !(workers isa Bool) && workers > 0 ||
+        throw(ArgumentError("parallel.workers must be a positive integer"))
+    return result
 end
 
 function _merge_config_overrides(config::NamedTuple, overrides::NamedTuple)
@@ -1252,29 +1258,26 @@ function default_components(;
 
     default_init_population = function (reg, data; N, seed, global_type_ctx)
         population = Vector{Program}(undef, N)
-        generated_slots = Vector{Any}(undef, N)
-        parallel_init = Threads.nthreads() > 1 && get(
-            get(reg.config, :parallel, (; enabled=false)),
-            :enabled,
-            false,
-        )
-        if parallel_init
-            Threads.@threads :dynamic for slot in 1:N
-                generated_slots[slot] = generate_individual(
-                    reg.target_ty,
-                    UInt64(seed),
-                    slot;
-                    return_diagnostics=true,
-                )
+        parallel = get(reg.config, :parallel, (; enabled=false))
+        slots = collect(1:N)
+        workers = Int(get(parallel, :workers, Threads.nthreads(:default)))
+        worker_count = min(workers, N, Threads.nthreads(:default))
+        generated_slots = if parallel.enabled && worker_count > 1
+            worker_cache_key = gensym(:initial_generation_cache)
+            _parallel_map(slots, (; enabled=true, workers=worker_count)) do slot
+                worker_task_storage = task_local_storage()
+                cache = get!(worker_task_storage, worker_cache_key) do
+                    CanonicalGeneration._GenerationRelationCache()
+                end
+                CanonicalGeneration._with_generation_cache(cache) do
+                    generate_individual(reg.target_ty, UInt64(seed), slot;
+                        return_diagnostics=true)
+                end
             end
         else
-            for slot in 1:N
-                generated_slots[slot] = generate_individual(
-                    reg.target_ty,
-                    UInt64(seed),
-                    slot;
-                    return_diagnostics=true,
-                )
+            _parallel_map(slots, parallel) do slot
+                generate_individual(reg.target_ty, UInt64(seed), slot;
+                    return_diagnostics=true)
             end
         end
         diagnostics = Vector{Any}(undef, N)
@@ -1307,6 +1310,7 @@ function default_components(;
         binary_composition_site_selection,
         candidate_admissibility,
         make_eval_context,
+        _parallel_default_eval_context=make_eval_context,
         mutations,
         mutation_chooser,
         mutation_provider,
@@ -1356,7 +1360,10 @@ end
 
 include("ConstantSearch.jl")
 include("TaskSchemas.jl")
+include("parallel.jl")
 include("age_search.jl")
+include("age_initial_parallel.jl")
+include("age_parallel.jl")
 include("search_replay.jl")
 include("scalar_refinement.jl")
 include("joint_search.jl")
