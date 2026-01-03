@@ -128,13 +128,17 @@ struct AgeSearchReport
     cursor::Int
 end
 
+abstract type _AbstractAgeContext end
+
 """Mutable state for a persistent complete-AST age search.
 
 `reg` and `data` are borrowed from the caller and must remain stable while the
 state is used. Populations, score records, RNG streams, archive, and counters
-are owned by this state.
+are owned by this state. Public advance/migration operations reject concurrent
+or reentrant use; direct field access and workflow drivers still require
+exclusive ownership.
 """
-mutable struct AgeSearchState
+mutable struct AgeSearchState <: _AbstractAgeContext
     reg::Regressor
     data::SupervisedDataset
     seed::UInt64
@@ -148,6 +152,25 @@ mutable struct AgeSearchState
     archive::Dict{Int,AgeSearchIndividual}
     best::Union{Nothing,AgeSearchIndividual}
     counters::AgeSearchCounters
+    active::Threads.Atomic{Bool}
+
+    function AgeSearchState(reg, data, seed, populations, rngs, cursor,
+            birth_clock, next_id, recent_valid_offspring, recent_capacity,
+            archive, best, counters)
+        new(reg, data, seed, populations, rngs, cursor, birth_clock, next_id,
+            recent_valid_offspring, recent_capacity, archive, best, counters,
+            Threads.Atomic{Bool}(false))
+    end
+end
+
+function _with_age_operation(f, state::AgeSearchState)
+    Threads.atomic_cas!(state.active, false, true) && throw(ArgumentError(
+        "an age-search state already has an active operation; concurrent or reentrant mutation is not supported"))
+    try
+        return f()
+    finally
+        state.active[] = false
+    end
 end
 
 """Migration input retaining explicit provenance when it is available."""
@@ -231,7 +254,7 @@ function _age_preflight_task(reg::Regressor, data::SupervisedDataset)
     return nothing
 end
 
-function _age_error_penalty(reg::Regressor)
+function _age_error_penalty(reg)
     value = get(reg.config, :error_penalty, 1.0e6)
     value isa Real || throw(ArgumentError("error_penalty must be real"))
     out = Float64(value)
@@ -262,7 +285,7 @@ function _age_same_program(a::Program, b::Program)
         isequal(a.local_consts_ty, b.local_consts_ty)
 end
 
-function _age_next_id!(state::AgeSearchState)
+function _age_next_id!(state::_AbstractAgeContext)
     id = state.next_id
     state.next_id += UInt64(1)
     return id
@@ -274,7 +297,7 @@ function _age_birth!(state::AgeSearchState)
 end
 
 function _age_make_record(
-    state::AgeSearchState,
+    state::_AbstractAgeContext,
     program::Program,
     parent_ids::Tuple{Vararg{UInt64}},
     origin::Symbol,
@@ -428,7 +451,7 @@ age_parent_candidates(::Union{Nothing,AbstractAgeSearchPolicy}, state,
     island, candidates, role::Symbol) = candidates
 
 function _age_validate_candidate(
-    state::AgeSearchState,
+    state::_AbstractAgeContext,
     program::Program,
     label::AbstractString;
     type_checked::Bool=false,
@@ -444,7 +467,7 @@ function _age_validate_candidate(
 end
 
 """Score one candidate and account for its original-task objective work."""
-function _age_count_samples!(state::AgeSearchState, source::Symbol, count::Int)
+function _age_count_samples!(state::_AbstractAgeContext, source::Symbol, count::Int)
     state.counters.sample_executions += count
     if source === :init
         state.counters.init_sample_executions += count
@@ -456,7 +479,7 @@ function _age_count_samples!(state::AgeSearchState, source::Symbol, count::Int)
     return nothing
 end
 
-function _age_score!(state::AgeSearchState, program::Program, source::Symbol)
+function _age_score!(state::_AbstractAgeContext, program::Program, source::Symbol)
     components = state.reg.components
     config = state.reg.config
     loss_fn = get(components, :loss, mse)
@@ -510,7 +533,7 @@ function _age_score!(state::AgeSearchState, program::Program, source::Symbol)
 end
 
 function _age_score_record!(
-    state::AgeSearchState,
+    state::_AbstractAgeContext,
     program::Program,
     parent_ids::Tuple{Vararg{UInt64}},
     origin::Symbol,
@@ -551,17 +574,18 @@ function _age_score_record!(
     return _age_make_record(state, program, parent_ids, origin, loss, complexity, valid)
 end
 
-function _age_mutation(state::AgeSearchState, parent::AgeSearchIndividual, rng::AbstractRNG;
+function _age_mutation(state::_AbstractAgeContext, parent::AgeSearchIndividual, rng::AbstractRNG;
         progress::ProposalProgress=_proposal_progress(state.reg.components,
-            max(0, state.counters.raw_attempts - 1)), check_admission::Bool=true)
-    c = state.reg.components
+            max(0, state.counters.raw_attempts - 1)), check_admission::Bool=true,
+        components=_age_private_components(state.reg.components))
+    c = components
     provider = get(c, :full_mutation_provider, OrdinaryMutationProvider())
     return _checked_propose_mutation(provider, parent.program, state.reg.target_ty;
         rng, progress, components=c, check_admission)
 end
 
 function _age_crossover(
-    state::AgeSearchState,
+    state::_AbstractAgeContext,
     left::AgeSearchIndividual,
     right::AgeSearchIndividual,
     rng::AbstractRNG,
@@ -738,6 +762,81 @@ function initialize_age_search(
     return state
 end
 
+# Only the built-in mutable index is replaced. Arbitrary extension resources
+# retain their documented caller ownership and synchronous fallback behavior.
+function _age_private_components(components)
+    get(components, :mutation_provider, nothing) isa Mutations.IndexedProvider ||
+        return components
+    return merge(components, (; mutation_provider=Mutations.IndexedProvider()))
+end
+
+_age_attempt_trace!(::Nothing, label, child) = nothing
+_age_attempt_trace!(trace, label, child) = (trace[] = (label, child); nothing)
+
+# Common candidate kernel. It never selects parents, publishes a population,
+# observes a policy, or assigns a birth. Parallel callers supply only a private
+# scoring context, so live search state cannot accidentally leak into workers.
+function _age_compute_attempt!(state::_AbstractAgeContext, left, right, rng,
+        mw, cw, progress; proposal=nothing, island=0,
+        mutation_components=state.reg.components, trace=nothing)
+    diagnostics = get(state.reg.components, :age_diagnostics, nothing)
+    label = :mutation
+    child = nothing
+    _age_attempt_trace!(trace, label, child)
+    type_checked = false
+    if proposal !== nothing
+        result = _age_call_proposal(proposal, state, island, left, right, rng)
+        if result isa Err
+            state.counters.expected_failures += 1
+            _age_add_operator!(state.counters, :proposal_failure)
+            return label, child, nothing
+        end
+        label, child = result
+    else
+        has_crossover = get(state.reg.components, :crossover_op, nothing) !== nothing
+        total_weight = mw + (has_crossover ? cw : 0.0)
+        total_weight > 0 || throw(ArgumentError("at least one proposal weight must be positive"))
+        choose_crossover = cw > 0 && has_crossover && rand(rng) * total_weight >= mw
+        if choose_crossover
+            label = :crossover
+            _age_attempt_trace!(trace, label, child)
+            state.counters.crossover_attempts += 1
+            token = _age_span_begin(diagnostics, :crossover)
+            child = try
+                _age_crossover(state, left, right, rng)
+            finally
+                _age_span_end(diagnostics, :crossover, token)
+            end
+        else
+            state.counters.mutation_attempts += 1
+            token = _age_span_begin(diagnostics, :mutation)
+            child = try
+                _age_mutation(state, left, rng; progress, check_admission=false,
+                    components=mutation_components)
+            finally
+                _age_span_end(diagnostics, :mutation, token)
+            end
+            type_checked = true
+        end
+    end
+    _age_attempt_trace!(trace, label, child)
+    _age_add_operator!(state.counters, label)
+    if child isa Err
+        state.counters.expected_failures += 1
+        return label, child, nothing
+    end
+    child isa Program || throw(ArgumentError("proposal operator returned an invalid child"))
+    if _age_same_program(child, left.program) ||
+            (label !== :mutation && _age_same_program(child, right.program))
+        state.counters.unchanged += 1
+        return label, child, nothing
+    end
+    record = _age_score_record!(state, child,
+        label === :mutation ? (left.id,) : (left.id, right.id), label, :advance;
+        type_checked)
+    return label, child, record
+end
+
 """
     advance_age_search!(state; max_attempts, max_evaluations,
                         mutation_weight=1.0, crossover_weight=1.0,
@@ -785,11 +884,16 @@ function _advance_age_search_serial!(
     mutation_start = state.counters.mutation_attempts
     crossover_start = state.counters.crossover_attempts
     diagnostics = get(state.reg.components, :age_diagnostics, nothing)
+    mutation_components = _age_private_components(state.reg.components)
+    # Preserve diagnostic metadata if an operator or scorer throws before the
+    # common kernel returns. Normal execution needs no trace allocation.
+    trace = diagnostics === nothing ? nothing : Ref{Tuple{Symbol,Any}}((:no_valid_parent, nothing))
 
     for _ in 1:max_attempts
         state.counters.objective_calls - objective_start < max_evaluations || break
         left = right = child_result = nothing
         label = :no_valid_parent
+        _age_attempt_trace!(trace, label, child_result)
         _age_proposal_begin(diagnostics, state)
         try
         island = state.cursor
@@ -812,62 +916,9 @@ function _advance_age_search_serial!(
         right = _age_selected_parent(
             policy, state, island, valid, rng, tournament_size, :donor,
         )
-        label = :mutation
-        child_result = nothing
-        type_checked = false
-        if proposal !== nothing
-            proposal_result = _age_call_proposal(proposal, state, island, left, right, rng)
-            proposal_result isa Err || ((label, child_result) = proposal_result)
-            proposal_result isa Err && (state.counters.expected_failures += 1; _age_add_operator!(state.counters, :proposal_failure); continue)
-        else
-            total_weight = mw + (isempty(valid) || get(state.reg.components, :crossover_op, nothing) === nothing ? 0.0 : cw)
-            total_weight > 0 || throw(ArgumentError("at least one proposal weight must be positive"))
-            choose_crossover = cw > 0 && get(state.reg.components, :crossover_op, nothing) !== nothing &&
-                rand(rng) * total_weight >= mw
-            if choose_crossover
-                label = :crossover
-                state.counters.crossover_attempts += 1
-                token = _age_span_begin(diagnostics, :crossover)
-                child_result = try
-                    _age_crossover(state, left, right, rng)
-                finally
-                    _age_span_end(diagnostics, :crossover, token)
-                end
-            else
-                state.counters.mutation_attempts += 1
-                token = _age_span_begin(diagnostics, :mutation)
-                child_result = try
-                    _age_mutation(state, left, rng; progress, check_admission=false)
-                finally
-                    _age_span_end(diagnostics, :mutation, token)
-                end
-                # The checked provider boundary inferred this final tree, or
-                # reused the exact ordinary driver's final-tree validation.
-                # No provider-controlled trait may bypass that boundary.
-                type_checked = true
-            end
-        end
-        _age_add_operator!(state.counters, label)
-        if child_result isa Err
-            state.counters.expected_failures += 1
-            continue
-        end
-        child_result isa Program || throw(ArgumentError("proposal operator returned an invalid child"))
-        if _age_same_program(child_result, left.program) ||
-           (label !== :mutation && _age_same_program(child_result, right.program))
-            state.counters.unchanged += 1
-            continue
-        end
-        # The guard at the top of the loop reserves one objective call for this
-        # candidate; scoring itself may execute every sample exactly once.
-        record = _age_score_record!(
-            state,
-            child_result,
-            label === :mutation ? (left.id,) : (left.id, right.id),
-            label,
-            :advance;
-            type_checked,
-        )
+        label, child_result, record = _age_compute_attempt!(state, left, right,
+            rng, mw, cw, progress; proposal, island, mutation_components, trace)
+        record === nothing && continue
         if !record.valid
             continue
         end
@@ -879,6 +930,7 @@ function _advance_age_search_serial!(
         _age_push_recent!(state, record)
         state.counters.accepted += 1
         finally
+            trace === nothing || ((label, child_result) = trace[])
             _age_proposal_end(diagnostics, state, label, left, right, child_result)
             _replay_periodic!(replay, state)
         end
@@ -929,7 +981,13 @@ deliberately ignored; rejected valid candidates are archived and observed but
 do not count as accepted migrants. Plain `Program`s have empty ancestry; use
 `AgeSearchMigration` or a named record with `parent_ids` to provide provenance.
 """
-function inject_age_migrants!(
+function inject_age_migrants!(state::AgeSearchState, individuals; kwargs...)
+    return _with_age_operation(state) do
+        _inject_age_migrants!(state, individuals; kwargs...)
+    end
+end
+
+function _inject_age_migrants!(
     state::AgeSearchState,
     individuals;
     population::Int=1,

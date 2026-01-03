@@ -12,6 +12,8 @@ function _age_initial_parallel_status(state::AgeSearchState, item_count::Int;
         :stateful_initial_transform
     elseif get(c, :age_diagnostics, nothing) !== nothing
         :diagnostics
+    elseif !_parallel_factories_safe(c)
+        :custom_factories
     elseif haskey(c, :evaluate) || haskey(c, :prepare_evaluate) ||
             get(c, :loss, mse) !== mse || get(c, :complexity, _node_count) !== _node_count ||
             get(c, :make_eval_context, nothing) !== get(c, :_parallel_default_eval_context, missing) ||
@@ -55,35 +57,20 @@ function _age_preflight_initial_population_parallel(
     return nothing
 end
 
-function _age_initial_scratch_state(state::AgeSearchState)
-    return AgeSearchState(
-        state.reg,
-        state.data,
-        state.seed,
-        Vector{Vector{AgeSearchIndividual}}(),
-        AbstractRNG[],
-        1,
-        state.birth_clock,
-        UInt64(1),
-        AgeSearchIndividual[],
-        0,
-        Dict{Int,AgeSearchIndividual}(),
-        nothing,
-        AgeSearchCounters(),
-    )
-end
-
 function _age_score_initial_population_parallel(
     state::AgeSearchState,
     population::AbstractVector,
     workers::Int,
 )
-    return _parallel_map(collect(eachindex(population)), (; enabled=true, workers)) do index
-        scratch = _age_initial_scratch_state(state)
+    contexts = [_AgeWorkerContext(state) for _ in 1:workers]
+    return _parallel_map(collect(eachindex(population)),
+            (; enabled=true, workers); workspaces=contexts) do context, index
+        context.counters = AgeSearchCounters()
+        context.next_id = UInt64(1)
         record = _age_score_record!(
-            scratch, population[index], (), :initial, :init; type_checked=true,
+            context, population[index], (), :initial, :init; type_checked=true,
         )
-        (; record, counters=scratch.counters)
+        (; record, counters=context.counters)
     end
 end
 

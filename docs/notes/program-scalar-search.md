@@ -40,3 +40,8 @@ Parallel initialization and age-search proposals use bounded worker tasks with
 private workspaces and ordered publication. Unsupported shared-state paths
 fall back to serial execution. Scalar mutation weights can optionally include
 local composition and pruning proposals; zero weights preserve ordinary selection.
+
+Proposal batches use isolated worker state while structural selection and
+publication remain coordinator-owned. Batch capacity is independent of worker
+count. Eligible array maps use batched evaluation with the same complete-sample
+scoring contract and fall back to ordinary execution when unsupported.

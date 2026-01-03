@@ -18,6 +18,13 @@ function _freshen_scoped_binders_node(
         body = _freshen_scoped_binders_node(term.body, remapped, next_id)
         delete!(remapped, term.binder_id)
         return _ScopedAbs(fresh_id, term.name, body)
+    elseif term isa _ScopedFunctionDef
+        fresh_id = next_id[]
+        next_id[] += 1
+        remapped[term.binder_id] = fresh_id
+        body = _freshen_scoped_binders_node(term.body, remapped, next_id)
+        delete!(remapped, term.binder_id)
+        return _ScopedFunctionDef(fresh_id, body)
     elseif term isa _ScopedApp
         return _ScopedApp(
             _freshen_scoped_binders_node(term.func, remapped, next_id),
@@ -30,9 +37,10 @@ end
 """
     _freshen_scoped_binders(term, next_binder_id)
 
-Copy `term`, assigning consecutive fresh identities to every abstraction and
-retargeting only references bound inside the copied term. External captures
-retain their original identities. Returns `(copy, next_unused_id)`.
+Copy `term`, assigning consecutive fresh identities to every lambda and
+FunctionDef self binder and retargeting only references bound inside the copied
+term. External captures retain their original identities. Returns
+`(copy, next_unused_id)`.
 """
 function _freshen_scoped_binders(term::_ScopedTerm, next_binder_id::Int)
     next_id = Ref(next_binder_id)
@@ -46,7 +54,7 @@ function _scoped_external_captures(term::_ScopedTerm)
     function collect_ids(node::_ScopedTerm)
         if node isa _ScopedBound
             push!(references, node.binder_id)
-        elseif node isa _ScopedAbs
+        elseif node isa Union{_ScopedAbs,_ScopedFunctionDef}
             push!(binders, node.binder_id)
             collect_ids(node.body)
         elseif node isa _ScopedApp
@@ -72,8 +80,8 @@ _unused_binding_host_preserves_role(
 Return the depths of finite legal ancestor hosts at which `source_path` can be
 retained as the body and copied into an unused let RHS. Prefix depths keep the
 candidate representation linear; only the selected path is materialized. The
-root-to-source path is traversed once to enforce external-capture scope and
-direct-`Abs` application roles.
+root-to-source path is traversed once to enforce external-capture scope across
+lambda and FunctionDef binders and direct-`Abs` application roles.
 """
 function _source_binding_host_depths(
     scoped::_ScopedTree,
@@ -84,7 +92,7 @@ function _source_binding_host_depths(
     binder_entry_depth = Dict{Int,Int}()
     node = scoped.root
     for (offset, child_index) in pairs(path)
-        if node isa _ScopedAbs && child_index == 1
+        if node isa Union{_ScopedAbs,_ScopedFunctionDef} && child_index == 1
             binder_entry_depth[node.binder_id] = offset
             node = node.body
         elseif node isa _ScopedApp && child_index == 1
@@ -1367,6 +1375,80 @@ end
         _ScopedApp(_ScopedBound(1), _ScopedBound(4)),
         _ScopedBound(5),
     )
+end
+
+@testitem "SourceBindingInsertionMutation freshens FunctionDef self binders and preserves captures" setup=[BindingInsertionTestSupport] begin
+    using Test
+    using LambdaRegression.Mutations:
+        _ScopedAbs,
+        _ScopedApp,
+        _ScopedBound,
+        _ScopedFunctionDef,
+        _freshen_scoped_binders
+
+    source = _ScopedFunctionDef(1,
+        _ScopedAbs(2, :x,
+            _ScopedApp(
+                _ScopedApp(_ScopedBound(2), _ScopedBound(1)),
+                _ScopedBound(7),
+            ),
+        ),
+    )
+    copied, next_id = _freshen_scoped_binders(source, 10)
+
+    @test copied == _ScopedFunctionDef(10,
+        _ScopedAbs(11, :x,
+            _ScopedApp(
+                _ScopedApp(_ScopedBound(11), _ScopedBound(10)),
+                _ScopedBound(7),
+            ),
+        ),
+    )
+    @test next_id == 12
+end
+
+@testitem "SourceBindingInsertionMutation applies to recursive FunctionDef sources with captured outer binders" setup=[BindingInsertionTestSupport] begin
+    using Test
+    using LambdaRegression.ASTs.NodeASTs: FunctionDefNode
+    using LambdaRegression.Mutations:
+        Site,
+        SourceBindingInsertionMutation,
+        _resolve_scoped,
+        _source_binding_host_depths,
+        apply
+    using LambdaRegression.TypeSystem: IntTy, TyFun, TyLike, infer, iscompatible
+
+    target_ty = TyFun(IntTy, TyFun(IntTy, IntTy))
+    type_ctx = Dict{Symbol,TyLike}(
+        :FADD => TyFun(IntTy, TyFun(IntTy, IntTy)),
+    )
+    original = AstTree(AbsNode(:outer, FunctionDefNode(AbsNode(:x,
+        AppNode(
+            AppNode(ConstNode(:FADD), AppNode(IndexNode(1), IndexNode(0))),
+            IndexNode(2),
+        ),
+    ))))
+    scoped = _resolve_scoped(original)
+    @test _source_binding_host_depths(scoped, [1]) == [1]
+    @test _source_binding_host_depths(scoped, [1, 1, 1, 1, 2, 1]) == [2, 3, 4, 5, 6]
+
+    seen_hosts = Vector{Vector{Int}}()
+    mutation = SourceBindingInsertionMutation(
+        host_weight=(_, host_path, _, _, _) -> begin
+            push!(seen_hosts, copy(host_path))
+            host_path == [1] ? 1.0 : 0.0
+        end,
+    )
+    function_def = original.root.body
+    site = Site([1], function_def, original.root, 1, 1, :any,
+        TyFun(IntTy, IntTy), TyLike[IntTy])
+    env = binding_env(original, target_ty, type_ctx)
+    result = apply(mutation, deepcopy(original), site, env, binding_ctx())
+
+    @test seen_hosts == [[1]]
+    @test result isa AstTree
+    result isa AstTree || return
+    @test iscompatible(infer(result, type_ctx), target_ty)
 end
 
 @testitem "SourceBindingInsertionMutation exact weights retain extreme positive support" setup=[BindingInsertionTestSupport] begin

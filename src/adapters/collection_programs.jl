@@ -253,6 +253,11 @@ function normalize_collection_array(
     schema::TensorSchema{N};
     label::AbstractString="array value",
 ) where {N}
+    if value isa AbstractArray && size(value) == schema.shape &&
+            eltype(value) <: Real
+        all(isfinite, value) || throw(ArgumentError("$label contains non-finite values"))
+        return Float64.(value)
+    end
     result = Array{Float64}(undef, schema.shape)
     function assign!(node, depth::Int, prefix::Tuple)
         if depth > N
@@ -274,11 +279,6 @@ function normalize_collection_array(
             assign!(child, depth + 1, (prefix..., index))
         end
         return nothing
-    end
-    if value isa AbstractArray && size(value) == schema.shape &&
-            eltype(value) <: Real
-        all(isfinite, value) || throw(ArgumentError("$label contains non-finite values"))
-        return Float64.(value)
     end
     assign!(value, 1, ())
     return result
@@ -416,6 +416,21 @@ function _array_loss(output_schema, prediction, target)
         ))
         target isa Real && isfinite(target) || throw(ArgumentError("target must be finite real"))
         return (Float64(prediction) - Float64(target))^2
+    end
+    shape = output_schema.shape
+    if prediction isa AbstractArray{<:Real} && target isa AbstractArray{<:Real} &&
+            size(prediction) == shape && size(target) == shape
+        all(isfinite, prediction) || throw(ArgumentError("prediction contains non-finite values"))
+        all(isfinite, target) || throw(ArgumentError("target contains non-finite values"))
+        squared_error = 0.0
+        count = 0
+        for (actual, expected) in zip(prediction, target)
+            delta = Float64(actual) - Float64(expected)
+            squared_error += delta * delta
+            count += 1
+        end
+        count > 0 || throw(ArgumentError("mse: empty inputs"))
+        return squared_error / count
     end
     actual = normalize_collection_array(prediction, output_schema; label="prediction")
     expected = normalize_collection_array(target, output_schema; label="target")
@@ -993,6 +1008,32 @@ end
     @test_throws ArgumentError fit_collection(X, y; made_up_option=1)
     @test_throws ArgumentError fit_collection(X, y; search_kwargs=(made_up_option=1,))
     @test_throws ArgumentError fit_collection(X, y; task_kind=:scalar)
+end
+
+@testitem "Dense collection array loss avoids copies and preserves normalization cases" begin
+    using Test
+    using LambdaRegression.FrontendAdapter: _array_loss, normalize_collection_array
+    using LambdaRegression.Regression: TensorSchema
+
+    schema = TensorSchema((2, 2))
+    prediction_parent = Float32[1, 2, 3, 4]
+    target_parent = Float64[1.5, 1.5, 3, 5]
+    prediction = reshape(@view(prediction_parent[:]), 2, 2)
+    target = reshape(@view(target_parent[:]), 2, 2)
+    @test _array_loss(schema, prediction, target) == 0.375
+    @test prediction_parent == Float32[1, 2, 3, 4]
+    @test target_parent == Float64[1.5, 1.5, 3, 5]
+
+    nested = [[1.0, 2.0], [3.0, 4.0]]
+    mixed = [Float32[1, 2], Float64[3, 4]]
+    @test _array_loss(schema, nested, nested) == 0.0
+    @test normalize_collection_array(mixed, schema) == [1.0 2.0; 3.0 4.0]
+    @test _array_loss(schema, mixed, nested) == 0.0
+
+    @test_throws DimensionMismatch _array_loss(schema, Float64[1, 2], nested)
+    @test_throws DimensionMismatch _array_loss(schema, Float64[], nested)
+    @test_throws ArgumentError _array_loss(schema, fill(Inf, 2, 2), ones(2, 2))
+    @test_throws ArgumentError _array_loss(schema, ones(2, 2), [1.0 NaN; 3.0 4.0])
 end
 
 @testitem "Collection series reduction keeps one scalar target per whole group" begin

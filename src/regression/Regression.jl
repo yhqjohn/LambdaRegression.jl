@@ -28,8 +28,8 @@ Capabilities
   a checked provider/mixture/codec interface; local scalar edits and finite
   generation do not invoke it. `schedule_budget`/`schedule_offset` define its
   cumulative proposal horizon, also used by scheduled mutation-family weights.
-- `prepare_regression_evaluator` extracts only the task's execution inputs and
-  explicit limits, then delegates preparation to `Execution`.
+- `prepare_regression_evaluator` prepares native execution and derives a batched
+  scalar plan for supported nested maps, preserving the native fallback.
 - `prepare_task_evaluator` resolves an explicit preparer, an injected sample
   evaluator, or the default Execution path once per candidate. `score_samples`
   owns the retained age-search per-sample loss loop while making
@@ -243,8 +243,9 @@ end
 
 """Assemble default Execution values from Regression components.
 
-This is the default branch used by `prepare_task_evaluator`. The resulting
-Execution object stores only the program and values needed to execute it.
+This is the default branch used by `prepare_task_evaluator`. With
+`batch_scalar_maps=true`, supported closed nested maps reuse scalar batch
+execution. Other programs and runtime shapes retain the native route.
 """
 function prepare_regression_evaluator(
     program::Program,
@@ -253,7 +254,7 @@ function prepare_regression_evaluator(
     copy_tree::Bool=true,
 )
     max_steps = get(config, :max_reduce_steps, 64)
-    return Execution.prepare_default_evaluator(
+    prepared = Execution.prepare_default_evaluator(
         program;
         input_slots=components.input_slots,
         global_consts=components.global_consts,
@@ -263,6 +264,7 @@ function prepare_regression_evaluator(
         max_call_depth=get(config, :closure_max_depth, 512),
         copy_tree,
     )
+    return get(config, :batch_scalar_maps, true) ? _prepare_batched_map(prepared, components) : prepared
 end
 
 """Prepare one candidate evaluator from Regression task components.
@@ -568,12 +570,15 @@ end
     default_config(; ...) -> NamedTuple
 
 Return defaults for bounded age search, initialization, and evaluation.
+`parallel.batch_size`, when supplied, caps each proposal batch; when omitted,
+proposal batches cover at least every island or available worker.
 """
 function default_config(;
     population_size::Int=64,
     max_reduce_steps::Int=64,
     procedural_max_steps::Int=max(256, 4 * max_reduce_steps),
     closure_max_depth::Int=512,
+    batch_scalar_maps::Bool=true,
     tournament_size::Int=3,
     error_penalty::Float64=1e12,
     strict_errors::Bool=false,
@@ -585,6 +590,7 @@ function default_config(;
         max_reduce_steps,
         procedural_max_steps,
         closure_max_depth,
+        batch_scalar_maps,
         tournament_size,
         error_penalty,
         strict_errors,
@@ -594,7 +600,7 @@ function default_config(;
 end
 
 function _normalize_parallel_config(parallel::NamedTuple)
-    unknown = filter(key -> key ∉ (:enabled, :workers), keys(parallel))
+    unknown = filter(key -> key ∉ (:enabled, :workers, :batch_size), keys(parallel))
     isempty(unknown) || throw(ArgumentError(
         "unknown parallel config option(s): $(join(string.(unknown), ", "))",
     ))
@@ -603,6 +609,14 @@ function _normalize_parallel_config(parallel::NamedTuple)
     workers = get(result, :workers, Threads.nthreads(:default))
     workers isa Integer && !(workers isa Bool) && workers > 0 ||
         throw(ArgumentError("parallel.workers must be a positive integer"))
+    if hasproperty(result, :batch_size)
+        batch_size = result.batch_size
+        batch_size isa Integer && !(batch_size isa Bool) &&
+            0 < batch_size <= typemax(Int) || throw(ArgumentError(
+                "parallel.batch_size must be a positive integer representable as Int",
+            ))
+        result = merge(result, (; batch_size=Int(batch_size)))
+    end
     return result
 end
 
@@ -622,6 +636,12 @@ end
 
 _procedural_candidate_admissibility(ind::Program) =
     obvious_functiondef_loop_reason(ind)
+
+_default_const_symfactory() = ConstSymbolFactory(prefix=:c)
+
+_parallel_factories_safe(c) =
+    get(c, :tyfactory_ctor, nothing) === make_tyvar_factory &&
+    get(c, :const_symfactory_ctor, nothing) === _default_const_symfactory
 
 function _generation_providers_with_functiondefs(providers)
     config = CanonicalGeneration.GenerationConfig(providers=Tuple(providers))
@@ -699,9 +719,9 @@ independent two-child `crossover` interface.
 An optional `initialization_candidate_snapshot` callback can capture successful
 pre-growth candidates when `initialization_observer` is also supplied. It runs
 synchronously with a read-only borrowed `(tree, local_consts, local_consts_ty)`
-view, may run concurrently by slot during parallel initialization, must not use
-search RNGs or mutate the borrowed materials, must be thread-safe, and must
-return a detached snapshot. The existing observer still receives the completed
+view. Supplying it keeps generation serial; it must not use search RNGs or
+mutate the borrowed materials, and must return a detached snapshot.
+The existing observer still receives the completed
 per-slot diagnostics serially after initialization joins.
 
 `fold_step_joint_use_probability` is forwarded to the default generation
@@ -722,7 +742,7 @@ function default_components(;
     input_slots::Vector{Symbol}=Symbol[],
     input_types::Dict{Symbol,TyLike}=Dict{Symbol,TyLike}(),
     tyfactory_ctor=make_tyvar_factory,
-    const_symfactory_ctor=() -> ConstSymbolFactory(prefix=:c),
+    const_symfactory_ctor=_default_const_symfactory,
     functiondef_generation_weight::Float64=1.0,
     fold_step_joint_use_probability::Real=0.0,
     list_state_helper::Real=0.0,
@@ -1262,20 +1282,17 @@ function default_components(;
         slots = collect(1:N)
         workers = Int(get(parallel, :workers, Threads.nthreads(:default)))
         worker_count = min(workers, N, Threads.nthreads(:default))
-        generated_slots = if parallel.enabled && worker_count > 1
-            worker_cache_key = gensym(:initial_generation_cache)
-            _parallel_map(slots, (; enabled=true, workers=worker_count)) do slot
-                worker_task_storage = task_local_storage()
-                cache = get!(worker_task_storage, worker_cache_key) do
-                    CanonicalGeneration._GenerationRelationCache()
-                end
+        generated_slots = if parallel.enabled && worker_count > 1 &&
+                _parallel_factories_safe(reg.components) && initialization_candidate_snapshot === nothing
+            caches = [CanonicalGeneration._GenerationRelationCache() for _ in 1:worker_count]
+            _parallel_map(slots, (; enabled=true, workers=worker_count); workspaces=caches) do cache, slot
                 CanonicalGeneration._with_generation_cache(cache) do
                     generate_individual(reg.target_ty, UInt64(seed), slot;
                         return_diagnostics=true)
                 end
             end
         else
-            _parallel_map(slots, parallel) do slot
+            _parallel_map(slots, (; enabled=false)) do slot
                 generate_individual(reg.target_ty, UInt64(seed), slot;
                     return_diagnostics=true)
             end
@@ -1359,6 +1376,7 @@ function default_regressor(target_ty::Ty;
 end
 
 include("ConstantSearch.jl")
+include("batched_maps.jl")
 include("TaskSchemas.jl")
 include("parallel.jl")
 include("age_search.jl")
@@ -1797,11 +1815,16 @@ end
         (; expression=sprint(show, MIME"text/plain"(), candidate.tree), symbols)
     end
 
-    function initialize(; snapshots::Bool, size_preference=nothing)
+    function initialize(; snapshots::Bool, size_preference=nothing, parallel_enabled=false)
         diagnostics = Any[]
+        snapshot_tasks = Task[]
         rng = MersenneTwister(42)
         preference_options = size_preference === nothing ? NamedTuple() :
             (; init_size_preference=size_preference)
+        snapshot = candidate -> begin
+            push!(snapshot_tasks, current_task())
+            capture(candidate)
+        end
         components = default_components(;
             global_consts=globals,
             global_consts_ty=global_types,
@@ -1811,22 +1834,25 @@ end
             init_max_try=4,
             init_growth_attempts=1,
             initialization_observer=items -> push!(diagnostics, items),
-            initialization_candidate_snapshot=snapshots ? capture : nothing,
+            initialization_candidate_snapshot=snapshots ? snapshot : nothing,
             preference_options...,
         )
-        config = default_config(population_size=4, parallel=(enabled=false,))
+        config = default_config(population_size=4,
+            parallel=(enabled=parallel_enabled, workers=8))
         reg = Regressor(target_ty, components, config, rng)
         population = components.init_population(
             reg, nothing; N=4, seed=UInt64(71),
             global_type_ctx=merge(global_types, components.input_types),
         )
-        return (; population, diagnostics, next_rng=rand(rng, UInt64))
+        return (; population, diagnostics, snapshot_tasks, caller_task=current_task(),
+            next_rng=rand(rng, UInt64))
     end
 
     off = initialize(snapshots=false)
     explicit_default = initialize(snapshots=false, size_preference=1.0)
     on = initialize(snapshots=true)
     repeated = initialize(snapshots=true)
+    parallel_snapshot = initialize(snapshots=true, parallel_enabled=true)
 
     @test !(off.population isa Err)
     @test !(on.population isa Err)
@@ -1840,6 +1866,9 @@ end
     @test off.next_rng == explicit_default.next_rng
     @test only(on.diagnostics) == only(repeated.diagnostics)
     @test getfield.(on.population, :tree) == getfield.(repeated.population, :tree)
+    @test !isempty(parallel_snapshot.snapshot_tasks)
+    @test all(task -> task === parallel_snapshot.caller_task,
+        parallel_snapshot.snapshot_tasks)
     @test length(only(on.diagnostics)) == length(on.population)
     @test all(!haskey(row, :init_candidate_snapshots) for row in only(off.diagnostics))
 

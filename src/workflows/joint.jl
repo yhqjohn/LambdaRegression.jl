@@ -43,7 +43,7 @@ end
 """Use the age-search mutation and typed crossover operators with finite retries."""
 function _joint_global_proposal(state::AgeSearchState; retry_limit::Int=4)
     retry_limit >= 0 || throw(ArgumentError("global_proposal_attempts must be nonnegative"))
-    components = state.reg.components
+    components = Regression._age_private_components(state.reg.components)
     has_crossover = get(components, :crossover_op, nothing) !== nothing
     # This closure owns a separate cumulative global-proposal clock. Local
     # scalar attempts never advance it; retry attempts share one progress value.
@@ -56,7 +56,7 @@ function _joint_global_proposal(state::AgeSearchState; retry_limit::Int=4)
             result = if has_crossover && rand(rng, Bool)
                 Regression._age_crossover(state, left, right, rng)
             else
-                Regression._age_mutation(state, left, rng; progress)
+                Regression._age_mutation(state, left, rng; progress, components)
             end
             result isa Err && continue
             result isa Program || throw(ArgumentError(

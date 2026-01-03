@@ -181,6 +181,188 @@ end
     @test declared.describe.boundary_policy.named_input_policy === :declared
 end
 
+@testitem "StructurePolicy batch selection freezes candidates and preserves draws" setup=[ContinuousWorkflowFixture] begin
+    state, reference_state = continuous_fixture(), continuous_fixture()
+    policy = StructurePolicy(continuous_key; capacity=4, representatives=3,
+        family_probability=1.0)
+    reference_policy = StructurePolicy(continuous_key; capacity=4, representatives=3,
+        family_probability=1.0)
+    valid = CR._age_valid_records(state, 1)
+    reference_valid = CR._age_valid_records(reference_state, 1)
+    selection = CR._age_batch_selection(policy, state, Dict(1 => valid))
+
+    family_counts(candidate) = sort!([(repr(key), family.parent_selections,
+        family.ledger_parent_selections) for (key, family) in candidate.families]; by=first)
+    for seed in 1:32
+        selected = CR._age_selected_parent(selection, state, 1, valid,
+            MersenneTwister(seed), 2, :parent)
+        reference = CR._age_selected_parent(reference_policy, reference_state, 1,
+            reference_valid, MersenneTwister(seed), 2, :parent)
+        @test selected.id == reference.id
+    end
+    @test family_counts(policy) == family_counts(reference_policy)
+
+    old_ids = Set(record.id for record in
+        CR.age_parent_candidates(selection, state, 1, valid, :parent))
+    raw = CR._age_score_record!(state, continuous_constant(3.0), (), :test, :advance)
+    published = CR.AgeSearchIndividual(raw.program, raw.id, raw.parent_ids,
+        raw.origin, raw.loss, raw.complexity, raw.valid, CR._age_birth!(state))
+    @test CR._age_insert!(state, published, 1; policy)
+    @test Set(record.id for record in
+        CR.age_parent_candidates(selection, state, 1, valid, :parent)) == old_ids
+
+    next_valid = CR._age_valid_records(state, 1)
+    next_selection = CR._age_batch_selection(policy, state, Dict(1 => next_valid))
+    next_ids = Set(record.id for record in
+        CR.age_parent_candidates(next_selection, state, 1, next_valid, :parent))
+    @test published.id ∈ next_ids
+    @test published.id ∉ old_ids
+end
+
+@testitem "Parallel StructurePolicy hooks stay coordinator-owned and repeat deterministically" setup=[ContinuousWorkflowFixture] begin
+    import Base.Threads
+    using LambdaRegression.StructureDiversity: StructureWorld
+    using LambdaRegression.Mutations: ScalarConstMutation
+
+    struct ContinuousPolicyProbe{P} <: CR.AbstractAgeSearchPolicy
+        inner::P
+        events::Channel{Tuple{Symbol,Task}}
+    end
+    probe_event!(probe, name) = put!(probe.events, (name, current_task()))
+    CR._age_parallel_policy(::ContinuousPolicyProbe) = true
+    function CR._age_batch_selection(probe::ContinuousPolicyProbe, state, valid_by_island)
+        probe_event!(probe, :batch_selection)
+        return ContinuousPolicyProbe(
+            CR._age_batch_selection(probe.inner, state, valid_by_island), probe.events)
+    end
+    function CR.age_parent_candidates(probe::ContinuousPolicyProbe, state, island,
+            candidates, role::Symbol)
+        probe_event!(probe, :parent_candidates)
+        return CR.age_parent_candidates(probe.inner, state, island, candidates, role)
+    end
+    function CR.age_select_parent(probe::ContinuousPolicyProbe, state, island,
+            candidates, rng, tournament_size, role::Symbol; eligible=nothing)
+        probe_event!(probe, :select_parent)
+        return CR.age_select_parent(probe.inner, state, island, candidates, rng,
+            tournament_size, role; eligible)
+    end
+    function CR.age_replacement_index(probe::ContinuousPolicyProbe, state, record, island)
+        probe_event!(probe, :replacement_index)
+        return CR.age_replacement_index(probe.inner, state, record, island)
+    end
+    function CR.age_observe_candidate!(probe::ContinuousPolicyProbe, state, record,
+            island, replaced, admitted)
+        probe_event!(probe, :observe_candidate)
+        return CR.age_observe_candidate!(probe.inner, state, record, island,
+            replaced, admitted)
+    end
+
+    population_size, workers = 6, 8
+    data = SupervisedDataset([-2.0, -1.0, 0.0, 1.0, 2.0], [1.0, 0.0, 0.0, 0.0, 1.0])
+    input_types = Dict{Symbol,TyLike}(:x => FloatTy)
+    world = StructureWorld(Dict{Symbol,TyLike}(); input_types=input_types,
+        target_ty=TyFun(FloatTy, FloatTy))
+    canonical_policy = StructurePolicy(world; capacity=12, representatives=3,
+        family_probability=0.75, development_evaluations=0)
+
+    function make_state()
+        components = default_components(input_slots=[:x], input_types=input_types,
+            mutations=AbstractMutation[ScalarConstMutation(σ=0.5)],
+            mutation_max_try=1, crossover_op=nothing,
+            init_population=(reg, data; N, seed, global_type_ctx) ->
+                [continuous_constant(Float64(i)) for i in 1:N])
+        reg = default_regressor(TyFun(FloatTy, FloatTy); rng=MersenneTwister(1234),
+            components, config=default_config(population_size=population_size,
+                tournament_size=2, parallel=(enabled=true, workers=workers)))
+        return initialize_age_search(reg, data; population_count=2,
+            population_size=population_size, seed=73)
+    end
+
+    function make_probe(events)
+        inner = StructurePolicy(program -> begin
+            put!(events, (:describe, current_task()))
+            canonical_policy.describe(program)
+        end; capacity=12, representatives=3, family_probability=0.75,
+            development_evaluations=0)
+        return ContinuousPolicyProbe(inner, events)
+    end
+
+    threads = Threads.nthreads(:default)
+    state_for_status = make_state()
+    real_status = CR.age_parallel_status(state_for_status; policy=StructurePolicy(world))
+    @test real_status.enabled == (threads > 1)
+    @test real_status.reason == (threads > 1 ? :coordinator_policy : :single_worker)
+    @test real_status.workers == (threads > 1 ? min(workers, threads) : 1)
+    @test real_status.trajectory_changes == real_status.enabled
+    if threads >= workers
+        @test real_status.workers == workers
+    end
+    @test :policy ∉ fieldnames(CR._AgeWorkerContext)
+    @test :policy ∉ fieldnames(CR._AgeAttemptJob)
+    @test :rng ∉ fieldnames(CR._AgeWorkerSettings)
+
+    record_signature(record) = (record.program.tree, record.program.local_consts,
+        record.program.local_consts_ty, record.id, record.parent_ids, record.origin,
+        record.loss, record.complexity, record.valid, record.birth)
+    function state_signature(state)
+        counters = Tuple(getfield(state.counters, field)
+            for field in fieldnames(typeof(state.counters)))
+        return (populations=[record_signature.(population) for population in state.populations],
+            archive=sort!([(id, record_signature(record)) for (id, record) in state.archive];
+                by=first),
+            recent=record_signature.(state.recent_valid_offspring),
+            best=record_signature(state.best), cursor=state.cursor,
+            birth_clock=state.birth_clock, next_id=state.next_id, counters,
+            rngs=[rand(copy(rng), UInt64, 8) for rng in state.rngs])
+    end
+    function policy_signature(policy)
+        family_state = [(key, record_signature.(family.representatives),
+            family.admissions, family.parent_selections, family.ledger_parent_selections,
+            family.development_actions, family.development_evaluations,
+            family.refused_actions, family.touched)
+            for (key, family) in policy.inner.families]
+        sort!(family_state; by=entry -> repr(first(entry)))
+        history_state = [(key, value.admissions, value.actions, value.evaluations,
+            value.refused, value.touched) for (key, value) in policy.inner.history]
+        sort!(history_state; by=entry -> repr(first(entry)))
+        key_state = sort!(collect(policy.inner.keys); by=first)
+        return (family_state, history_state, key_state, policy.inner.clock,
+            policy.inner.overflow)
+    end
+    function run_once()
+        state = make_state()
+        events = Channel{Tuple{Symbol,Task}}(8192)
+        policy = make_probe(events)
+        coordinator = current_task()
+        status = CR.age_parallel_status(state; policy)
+        report = CR.advance_age_search!(state; max_attempts=32,
+            max_evaluations=32, policy)
+        observed = Tuple{Symbol,Task}[]
+        while isready(events)
+            push!(observed, take!(events))
+        end
+        return (; state, policy, status, report, observed, coordinator)
+    end
+
+    first_run, second_run = run_once(), run_once()
+    @test first_run.status.enabled == (threads > 1)
+    @test first_run.status.workers == (threads > 1 ? min(workers, threads) : 1)
+    @test first_run.status.trajectory_changes == first_run.status.enabled
+    @test first_run.report == second_run.report
+    @test first_run.report.objective_calls > 0
+    @test state_signature(first_run.state) == state_signature(second_run.state)
+    @test policy_signature(first_run.policy) == policy_signature(second_run.policy)
+    @test !isempty(first_run.observed)
+    @test all(task === first_run.coordinator for (_, task) in first_run.observed)
+    @test all(task === second_run.coordinator for (_, task) in second_run.observed)
+    kinds = (:batch_selection, :describe, :parent_candidates, :select_parent,
+        :replacement_index, :observe_candidate)
+    @test all(kind in first.(first_run.observed) for kind in kinds)
+    @test [(kind, count(event -> first(event) === kind, first_run.observed))
+        for kind in kinds] == [(kind, count(event -> first(event) === kind,
+            second_run.observed)) for kind in kinds]
+end
+
 @testitem "Continuous workflow mixed material sources retain exploration" setup=[ContinuousWorkflowFixture] begin
     state = continuous_fixture()
     append!(state.recent_valid_offspring, state.populations[1])
@@ -466,6 +648,9 @@ and expires after actual local objective calls or bounded refusal actions.
 The history window remembers released non-live families only; outside that
 finite window rediscovery can receive fresh opportunity. Mutable policy/state
 ownership is exclusive, and all callbacks are synchronous.
+With parallel age search, hooks run on the coordinator task and each batch
+selects parents before publishing results, delaying cross-island policy feedback
+and changing the trajectory; unknown policies retain serial execution.
 """
 mutable struct StructurePolicy{F} <: Regression.AbstractAgeSearchPolicy
     describe::F
@@ -482,6 +667,11 @@ mutable struct StructurePolicy{F} <: Regression.AbstractAgeSearchPolicy
     overflow::Int
     owner::Union{Nothing,AgeSearchState}
 end
+
+# Hooks stay on the coordinator. Selection may use a batch-start view; family
+# feedback is applied in ordered publication, without sharing mutable policy
+# state with workers.
+Regression._age_parallel_policy(::StructurePolicy) = true
 
 function StructurePolicy(describe; capacity::Int=64, representatives::Int=3,
         history_capacity::Int=256, family_probability::Real=0.5,
@@ -683,10 +873,54 @@ function _structure_candidates(policy::StructurePolicy, candidates)
     return pool
 end
 
+struct _StructureIslandSelection
+    candidates::Vector{AgeSearchIndividual}
+    family_groups::Vector{Vector{AgeSearchIndividual}}
+    live_ids::Set{UInt64}
+end
+
+struct _StructureBatchSelection{P<:StructurePolicy} <: Regression.AbstractAgeSearchPolicy
+    policy::P
+    islands::Dict{Int,_StructureIslandSelection}
+end
+
+function _structure_family_groups(policy::StructurePolicy,
+        candidates::Vector{AgeSearchIndividual})
+    groups = Dict{Any,Vector{AgeSearchIndividual}}()
+    for record in candidates
+        key = _structure_key(policy, record)
+        group = key === nothing ? (:unknown_record, record.id) : (:known, key)
+        push!(get!(groups, group, AgeSearchIndividual[]), record)
+    end
+    group_keys = collect(keys(groups))
+    sort!(group_keys; by=key -> minimum(record.id for record in groups[key]))
+    return [groups[key] for key in group_keys]
+end
+
+function Regression._age_batch_selection(policy::StructurePolicy,
+        state::AgeSearchState, valid_by_island)
+    _seed_structure_policy!(policy, state)
+    islands = Dict{Int,_StructureIslandSelection}()
+    for (island, valid) in valid_by_island
+        candidates = isempty(valid) ? valid : _structure_candidates(policy, valid)
+        family_groups = !isempty(candidates) && policy.family_probability > 0 ?
+            _structure_family_groups(policy, candidates) : Vector{AgeSearchIndividual}[]
+        live_ids = Set(record.id for record in state.populations[island])
+        islands[island] = _StructureIslandSelection(candidates, family_groups, live_ids)
+    end
+    return _StructureBatchSelection(policy, islands)
+end
+
 function Regression.age_parent_candidates(policy::StructurePolicy, state::AgeSearchState,
         island::Int, candidates::Vector{AgeSearchIndividual}, role::Symbol)
     _seed_structure_policy!(policy, state)
     return _structure_candidates(policy, candidates)
+end
+
+function Regression.age_parent_candidates(selection::_StructureBatchSelection,
+        state::AgeSearchState, island::Int, candidates::Vector{AgeSearchIndividual},
+        role::Symbol)
+    return selection.islands[island].candidates
 end
 
 function Regression.age_select_parent(policy::StructurePolicy, state::AgeSearchState,
@@ -718,6 +952,31 @@ function Regression.age_select_parent(policy::StructurePolicy, state::AgeSearchS
     if family !== nothing && role !== :development
         family.parent_selections += 1
         selected.id in live_ids || (family.ledger_parent_selections += 1)
+    end
+    return selected
+end
+
+function Regression.age_select_parent(selection::_StructureBatchSelection,
+        state::AgeSearchState, island::Int, candidates::Vector{AgeSearchIndividual},
+        rng::AbstractRNG, tournament_size::Int, role::Symbol; eligible=nothing)
+    policy = selection.policy
+    island_view = selection.islands[island]
+    selected = if rand(rng) < policy.family_probability
+        pool = eligible === nothing ? candidates : filter(eligible, candidates)
+        isempty(pool) && return nothing
+        groups = eligible === nothing ? island_view.family_groups :
+            _structure_family_groups(policy, pool)
+        Regression._age_tournament(rng,
+            groups[rand(rng, eachindex(groups))], tournament_size)
+    else
+        pool = eligible === nothing ? candidates : filter(eligible, candidates)
+        isempty(pool) && return nothing
+        Regression._age_tournament(rng, pool, tournament_size)
+    end
+    family = get(policy.families, _structure_key(policy, selected), nothing)
+    if family !== nothing && role !== :development
+        family.parent_selections += 1
+        selected.id in island_view.live_ids || (family.ledger_parent_selections += 1)
     end
     return selected
 end
