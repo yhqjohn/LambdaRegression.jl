@@ -12,13 +12,25 @@ DynamicExpressions bridge, bounded generational search, and node-native
 regularized evolution with age replacement, rank tournaments, annealing,
 adaptive complexity frequencies, and a best-per-complexity archive. The
 `search_multi_scalar` coordinator advances persistent regularized islands with
-bounded inter-island migration. Its `initialize_multi_scalar`,
-`advance_multi_scalar!`, and `multi_scalar_result` APIs retain a fixed-context
-session across complete coordinator rounds. Its default `hof_donor_policy=:local_best`
+bounded inter-island migration. `initialize_multi_scalar` exposes separate
+settings for frequency-corrected admission and frequency-weighted tournament
+selection; admission accepts either one shared `Bool` or a per-island
+`AbstractVector{Bool}`, while tournament selection remains one shared `Bool`.
+Both default to enabled, and the shared frequency history keeps updating when
+either pressure is disabled. Its `advance_multi_scalar!` and
+`multi_scalar_result` APIs retain a fixed-context session across complete
+coordinator rounds. Its default `hof_donor_policy=:local_best`
 draws from bounded per-island archive leaders and excludes the destination;
 `:global_pareto` instead draws from the global loss-complexity frontier,
 including the destination's own history. Both retain the same migration clock,
 without-replacement donor sampling and random-slot replacement with fresh ages.
+For direct MSE in the multi-island API, an explicit `constant_jacobian` callback
+can supply constant derivatives for BFGS. Default `nothing` keeps central finite
+differences. Canonical forward scoring owns publication; invalid derivatives
+fall back to charged finite differences. Refinement and total budgets count
+both forward and derivative calls when enabled, with separate diagnostic
+counts in `constant_refinement_work`; these units do not imply equal cost.
+Custom complete-program objectives cannot use this direct-MSE callback.
 The public strategies share scalar configuration and independently bounded
 constant polishing while retaining their own search loops. Constant polishing
 stops at its evaluation cap and keeps the best valid trial already scored;
@@ -35,6 +47,21 @@ retain scored expression forms without implicit report-time simplification.
 Regularized cycle simplification proposes a new expression and scores it against
 the current structural and total budgets; its finite score may enter the archive,
 and it replaces a live member only when its loss is no worse, retaining its age.
+The opt-in `constant_refinement_resets_age` policy refreshes age only after a
+strictly improving cycle-end refinement; it requires regularized evolution and
+cycle timing. The default leaves existing age behavior unchanged.
+The opt-in `rotation_noop_reproduction` policy keeps the rotate weight for a
+native scalar tree with no rotatable position and routes that choice through
+ordinary scoring and admission as an unchanged-tree offspring. It is disabled
+by default and unsupported for generational or domain-backed search.
+Native regularized search optionally uses `deletion_policy=:child_edge` to
+choose an operator and then a child edge. Leaf children are redrawn using the
+configured feature/constant distribution; operator children are spliced out.
+The default `:operator` preserves uniform operator deletion, including roots.
+The child-edge policy is rejected for generational and domain-backed search.
+Native one-parent mutations consume the usual two tournament random draws but
+skip unused donor ranking. Crossover, composition and other search domains keep
+their donor selection; the optimization does not change selection probabilities.
 The module also provides direct shape-preserving `MapPlan` and
 ordered `FoldPlan` adapters. A minimal evaluation path is:
 

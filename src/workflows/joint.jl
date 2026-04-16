@@ -148,6 +148,10 @@ function run_joint_search!(state::AgeSearchState; rng::AbstractRNG,
         throw(ArgumentError("outer limits must be nonnegative integers"))
     config.evolution_strategy === :regularized || throw(ArgumentError(
         "joint search requires ScalarSearchConfig(evolution_strategy=:regularized)"))
+    config.rotation_noop_reproduction && throw(ArgumentError(
+        "rotation_noop_reproduction is unsupported for joint program search"))
+    config.deletion_policy !== :operator && throw(ArgumentError(
+        "deletion_policy=:child_edge is unsupported for joint program search"))
     if policy isa StructurePolicy && policy.describe isa _StructureClassifier
         policy.describe.boundary_policy.named_input_policy === named_input_policy ||
             throw(ArgumentError("descriptor and joint search named-input policies must match"))
@@ -338,6 +342,14 @@ end
         unary_operators=(:square,), binary_operators=(),
         constant_refinement_iterations=0, max_constant_refinement_evaluations=0,
         evolution_strategy=:regularized)
+    @test_throws ArgumentError run_joint_search!(continuous_fixture(size=2);
+        rng=MersenneTwister(1234),
+        config=ScalarSearchConfig(evolution_strategy=:regularized,
+            rotation_noop_reproduction=true), windows=0)
+    @test_throws ArgumentError run_joint_search!(continuous_fixture(size=2);
+        rng=MersenneTwister(1234),
+        config=ScalarSearchConfig(evolution_strategy=:regularized,
+            deletion_policy=:child_edge), windows=0)
     for interval in (0, 4)
         state = continuous_fixture(size=2)
         result = run_joint_search!(state; rng=MersenneTwister(8000), config,

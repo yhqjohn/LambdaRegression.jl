@@ -105,6 +105,17 @@ polishing of scored offspring. `max_total_evaluations`, when set, caps the sum
 of structural and constant-refinement objective calls; multi-island sessions
 split that cap across islands. Per-island baseline callbacks are reported
 separately and are excluded from the cap.
+`constant_refinement_resets_age=true` refreshes a live member's birth age only
+when cycle-end polishing strictly lowers its loss. It defaults to `false` and
+requires regularized evolution with `constant_refinement_timing=:cycle`.
+`rotation_noop_reproduction=true` retains the rotate mutation's weight when a
+native scalar tree has no rotatable position. Selecting it scores the unchanged
+tree through the regularized admission path; it defaults to `false` and is
+limited to native regularized scalar search.
+`deletion_policy=:child_edge` selects an operator uniformly, then one of its
+children: leaf children are redrawn from the configured leaf distribution and
+operator children are spliced out. It is native regularized scalar only. The
+default `:operator` deletes a uniformly selected operator, including the root.
 `proposal_biases` adds finite nonnegative relative mutation weights for
 `:pair`, `:transform_pair`, `:coefficient`, and `:prune`. These proposals
 consult only the current program, feature ports and configured operators.
@@ -135,6 +146,9 @@ struct ScalarSearchConfig
     constant_refinement_start_generation::Int
     constant_refinement_probability::Float64
     constant_refinement_timing::Symbol
+    constant_refinement_resets_age::Bool
+    rotation_noop_reproduction::Bool
+    deletion_policy::Symbol
     max_constant_refinement_evaluations::Int
     max_total_evaluations::Union{Nothing,Int}
     constant_refinement_optimizer::Symbol
@@ -183,6 +197,9 @@ function ScalarSearchConfig(;
         constant_refinement_start_generation::Int=25,
         constant_refinement_probability::Real=0.0,
         constant_refinement_timing::Symbol=:cycle,
+        constant_refinement_resets_age::Bool=false,
+        rotation_noop_reproduction::Bool=false,
+        deletion_policy::Symbol=:operator,
         max_constant_refinement_evaluations::Int=max(0, max_evaluations ÷ 5),
         max_total_evaluations::Union{Nothing,Int}=nothing,
         constant_refinement_optimizer::Symbol=:bfgs,
@@ -243,6 +260,20 @@ function ScalarSearchConfig(;
         throw(ArgumentError("initial_pool_multiplier must be positive"))
     evolution_strategy in (:generational, :regularized) || throw(ArgumentError(
         "evolution_strategy must be :generational or :regularized"))
+    if constant_refinement_resets_age
+        evolution_strategy === :regularized || throw(ArgumentError(
+            "constant_refinement_resets_age requires evolution_strategy=:regularized"))
+        constant_refinement_timing === :cycle || throw(ArgumentError(
+            "constant_refinement_resets_age requires constant_refinement_timing=:cycle"))
+    end
+    if rotation_noop_reproduction
+        evolution_strategy === :regularized || throw(ArgumentError(
+            "rotation_noop_reproduction requires evolution_strategy=:regularized"))
+    end
+    deletion_policy in (:operator, :child_edge) || throw(ArgumentError(
+        "deletion_policy must be :operator or :child_edge"))
+    deletion_policy === :operator || evolution_strategy === :regularized ||
+        throw(ArgumentError("deletion_policy=:child_edge requires evolution_strategy=:regularized"))
     biases = _validated_proposal_biases(proposal_biases)
     evolution_strategy === :regularized || all(iszero, values(biases)) ||
         throw(ArgumentError("nonzero proposal_biases requires evolution_strategy=:regularized"))
@@ -276,6 +307,9 @@ function ScalarSearchConfig(;
         constant_refinement_start_generation,
         Float64(constant_refinement_probability),
         constant_refinement_timing,
+        constant_refinement_resets_age,
+        rotation_noop_reproduction,
+        deletion_policy,
         max_constant_refinement_evaluations,
         max_total_evaluations,
         constant_refinement_optimizer,
@@ -388,22 +422,12 @@ function _replace_subexpression(expr::ScalarExpr, path, replacement::ScalarExpr,
 end
 
 function _fold_constant_unary(op::Symbol, value::Float64)
-    result = try
-        op === :sin ? sin(value) :
-        op === :cos ? cos(value) :
-        op === :sqrt ? sqrt(value) :
-        value * value
-    catch error
-        error isa DomainError || rethrow()
-        return nothing
-    end
+    result = _scalar_unary_value(op, value)
     return isfinite(result) ? result : nothing
 end
 
 function _fold_constant_binary(op::Symbol, left::Float64, right::Float64)
-    result = op === :+ ? left + right :
-        op === :- ? left - right :
-        op === :* ? left * right : left / right
+    result = _scalar_binary_value(op, left, right)
     return isfinite(result) ? result : nothing
 end
 
@@ -427,6 +451,52 @@ function _fold_constants(expr::_ScalarBinary)
         value === nothing || return scalar_constant(value)
     end
     return scalar_binary(expr.op, left, right)
+end
+
+@testitem "scalar constant folding covers the full operator language" begin
+    using Test
+    using LambdaRegression.ScalarSearch
+    const S = ScalarSearch
+    unary = [(:sin, sin), (:cos, cos), (:sqrt, sqrt), (:square, x -> x * x),
+        (:tan, tan), (:exp, exp), (:log, log), (:abs, abs)]
+    binary = [(:+, +), (:-, -), (:*, *), (:/, /), (:^, ^), (:max, max), (:min, min)]
+    @test Set(first.(unary)) == Set(keys(S._UNARY_AST))
+    @test Set(first.(binary)) == Set(keys(S._BINARY_AST))
+    X = zeros(0, 2)
+    function check(expr, expected)
+        folded = S._fold_constants(expr)
+        @test folded isa S._ScalarConstant
+        @test isequal(folded.value, expected)
+        @test isequal(evaluate_scalar_reference(expr, X), evaluate_scalar_reference(folded, X))
+        @test isequal(evaluate_dynamic_scalar(expr, X), evaluate_dynamic_scalar(folded, X))
+    end
+    for (op, f) in unary, value in (0.5, 2.0)
+        check(scalar_unary(op, scalar_constant(value)), f(value))
+    end
+    for (op, f) in binary, (left, right) in ((2.0, 3.0), (0.5, 2.0))
+        check(scalar_binary(op, scalar_constant(left), scalar_constant(right)), f(left, right))
+    end
+    check(scalar_unary(:abs, scalar_constant(-2.0)), 2.0)
+    check(scalar_unary(:sin, scalar_constant(-0.0)), -0.0)
+    check(scalar_binary(:*, scalar_constant(-0.0), scalar_constant(2.0)), -0.0)
+    for expr in (scalar_unary(:sqrt, scalar_constant(-1.0)),
+                 scalar_unary(:log, scalar_constant(-1.0)),
+                 scalar_unary(:log, scalar_constant(0.0)),
+                 scalar_unary(:exp, scalar_constant(1000.0)),
+                 scalar_binary(:/, scalar_constant(1.0), scalar_constant(0.0)),
+                 scalar_binary(:^, scalar_constant(-1.0), scalar_constant(0.5)),
+                 scalar_binary(:^, scalar_constant(1.0e308), scalar_constant(2.0)))
+        folded = S._fold_constants(expr)
+        @test !(folded isa S._ScalarConstant)
+        @test !(evaluate_scalar_reference(folded, X) isa AbstractVector)
+        @test !(evaluate_dynamic_scalar(folded, X) isa AbstractVector)
+    end
+    nested = scalar_binary(:+, scalar_input(1),
+        scalar_unary(:log, scalar_unary(:exp, scalar_constant(2.0))))
+    folded = S._fold_constants(nested)
+    @test S.scalar_complexity(folded) == 3
+    @test folded.right.value == 2.0
+    @test evaluate_dynamic_scalar(folded, ones(1, 2)) == [3.0, 3.0]
 end
 
 _simplify_scalar(expr::_ScalarInput) = expr
@@ -1156,6 +1226,37 @@ function search_scalar(X::AbstractMatrix{<:Real}, y::AbstractVector{<:Real};
         complexity_archive,
         variation,
     )
+end
+
+@testitem "scalar refinement age reset config is opt-in and cycle-only" begin
+    using Test
+    using LambdaRegression.ScalarSearch: ScalarSearchConfig
+
+    default = ScalarSearchConfig(evolution_strategy=:regularized)
+    @test default.constant_refinement_resets_age === false
+
+    enabled = ScalarSearchConfig(evolution_strategy=:regularized,
+        constant_refinement_resets_age=true)
+    @test enabled.constant_refinement_resets_age === true
+
+    @test_throws ArgumentError ScalarSearchConfig(
+        constant_refinement_resets_age=true)
+    @test_throws ArgumentError ScalarSearchConfig(
+        evolution_strategy=:regularized,
+        constant_refinement_timing=:offspring,
+        constant_refinement_resets_age=true)
+end
+
+@testitem "rotation no-op reproduction config is native regularized and opt-in" begin
+    using Test
+    using LambdaRegression.ScalarSearch: ScalarSearchConfig
+
+    disabled = ScalarSearchConfig(evolution_strategy=:regularized)
+    @test disabled.rotation_noop_reproduction === false
+    @test ScalarSearchConfig(evolution_strategy=:regularized,
+        rotation_noop_reproduction=true).rotation_noop_reproduction
+    @test_throws ArgumentError ScalarSearchConfig(
+        rotation_noop_reproduction=true)
 end
 
 @testitem "scalar backends support zero-input matrices and check supplied feature ids" begin

@@ -357,7 +357,8 @@ end
     @test all(task === second_run.coordinator for (_, task) in second_run.observed)
     kinds = (:batch_selection, :describe, :parent_candidates, :select_parent,
         :replacement_index, :observe_candidate)
-    @test all(kind in first.(first_run.observed) for kind in kinds)
+    @test (:batch_selection in first.(first_run.observed)) == first_run.status.enabled
+    @test all(kind in first.(first_run.observed) for kind in Base.tail(kinds))
     @test [(kind, count(event -> first(event) === kind, first_run.observed))
         for kind in kinds] == [(kind, count(event -> first(event) === kind,
             second_run.observed)) for kind in kinds]

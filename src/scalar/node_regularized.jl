@@ -322,7 +322,10 @@ end
 
 """Build one copy-on-propose node candidate.
 
-Mutation anchors are selected uniformly from the copied parent. The donor,
+Mutation anchors are selected uniformly from compatible copied occurrences.
+With `deletion_policy=:child_edge`, deletion instead selects an operator and
+one of its children; a leaf is redrawn, otherwise that child is spliced out.
+The donor,
 feature count, and `config` provide crossover and grammar context. Unsupported
 or inapplicable kinds, unchanged results, and complexity overflow return the
 original candidate with `false`; programmer errors still surface at source.
@@ -330,7 +333,8 @@ original candidate with `false`; programmer errors still surface at source.
 function _node_scalar_propose(rng::AbstractRNG, parent::_NodeScalarCandidate,
         donor::_NodeScalarCandidate, feature_count::Int,
         config::ScalarSearchConfig, kind::Symbol; temperature::Real=1.0)
-    kind in (:do_nothing, :simplify, :optimize) && return (parent, false)
+    kind in (:do_nothing, :simplify, :optimize, :rotation_copy) &&
+        return (parent, false)
     kind in (:pair, :transform_pair) &&
         return _node_bounded_composition(rng, parent, donor, feature_count, config, kind)
     kind === :coefficient && return _node_coefficient_proposal(
@@ -386,6 +390,13 @@ function _node_scalar_propose(rng::AbstractRNG, parent::_NodeScalarCandidate,
     end
     isempty(compatible) && return (parent, false)
     target = rand(rng, compatible)
+    if kind === :delete && config.deletion_policy === :child_edge
+        # Select an operator, then a child edge; never delete the complete root.
+        parent_node = target.node
+        side = parent_node.degree == 1 || rand(rng, Bool) ? 0x01 : 0x02
+        target = _NodeScalarAnchor(side == 0x01 ? parent_node.l : parent_node.r,
+            parent_node, side)
+    end
     node = target.node
     if kind === :insert
         root = _node_replace_anchor(root, target,
@@ -393,7 +404,8 @@ function _node_scalar_propose(rng::AbstractRNG, parent::_NodeScalarCandidate,
     elseif kind === :rotate
         root = _node_replace_anchor(root, target, _node_rotate(rng, node))
     elseif kind === :delete
-        replacement = node.degree == 1 ? node.l :
+        replacement = node.degree == 0 ? _node_random_leaf(rng, feature_count, config) :
+            node.degree == 1 ? node.l :
             (rand(rng, Bool) ? node.l : node.r)
         root = _node_replace_anchor(root, target, replacement)
     elseif kind === :operator
@@ -441,8 +453,10 @@ end
 Sample one regularized-evolution mutation directly from a node candidate.
 Eligibility is computed from one anchor traversal and conditions the existing
 `_REGULARIZED_MUTATION_WEIGHTS`; in particular `:optimize` remains disabled
-because constant refinement has a separate budget.  The chooser only returns
-operation names and never rebuilds the candidate through `ScalarExpr`.
+because constant refinement has a separate budget. When opted in, a tree with
+no rotatable position labels the retained rotate weight `:rotation_copy`. The
+chooser only returns operation names and never rebuilds the candidate through
+`ScalarExpr`.
 """
 function _node_scalar_sample_mutation(rng::AbstractRNG,
         candidate::_NodeScalarCandidate, config::ScalarSearchConfig)
@@ -455,7 +469,9 @@ function _node_scalar_sample_mutation(rng::AbstractRNG,
     has_rotation = any(a -> _node_is_rotatable(a.node), anchors)
     under_cap = candidate.complexity < config.max_complexity
 
-    names = _REGULARIZED_MUTATION_NAMES
+    names = !has_rotation && config.rotation_noop_reproduction ?
+        ntuple(i -> i == 4 ? :rotation_copy : _REGULARIZED_MUTATION_NAMES[i],
+            length(_REGULARIZED_MUTATION_NAMES)) : _REGULARIZED_MUTATION_NAMES
     weights = (
         _REGULARIZED_MUTATION_WEIGHTS.mutate_constant,
         _REGULARIZED_MUTATION_WEIGHTS.mutate_operator,
@@ -473,7 +489,7 @@ function _node_scalar_sample_mutation(rng::AbstractRNG,
         has_constant,
         has_alternate_operator,
         has_binary,
-        has_rotation,
+        has_rotation || config.rotation_noop_reproduction,
         under_cap,
         under_cap,
         has_children,
@@ -547,6 +563,66 @@ end
         @test ScalarSearch._node_allowed_operator_indices(node, config) ==
             filter(!=(index), UInt8[ScalarSearch._dynamic_binary_index(item) for item in binary])
         @test ScalarSearch.scalar_from_dynamic(node) isa ScalarExpr
+    end
+end
+
+@testitem "native deletion policies preserve parents and configured leaf support" setup=[NodeRegularizedImports] begin
+    S = ScalarSearch
+    @test ScalarSearchConfig().deletion_policy === :operator
+    @test_throws ArgumentError ScalarSearchConfig(deletion_policy=:unknown)
+    @test_throws ArgumentError ScalarSearchConfig(deletion_policy=:child_edge)
+    config = ScalarSearchConfig(evolution_strategy=:regularized,
+        deletion_policy=:child_edge, constant_probability=0.0,
+        unary_operators=(:sin,), binary_operators=(:+,), max_complexity=4)
+    @test S._copy_config(config, 64, 0, nothing).deletion_policy === :child_edge
+    flow = S._NodeRegularizedFlow(nothing, false, 1.0, 3.17, 1,
+        false, 0.0, 0.982, false, 0.0)
+    @test_throws ArgumentError S._initialize_regularized_values([], identity;
+        config, rng=MersenneTwister(1), flow, domain=:unsupported)
+    parent = S._node_scalar_candidate(scalar_binary(:+, scalar_input(1), scalar_input(1)))
+    original = copy(parent.node)
+    changed_count = Ref(0)
+    for seed in 1:32
+        child, changed = S._node_scalar_propose(MersenneTwister(seed), parent,
+            parent, 2, config, :delete)
+        @test child.complexity == 3
+        @test child.node.op == parent.node.op
+        @test !child.node.l.constant && !child.node.r.constant
+        @test child.node.l.feature in (1,2) && child.node.r.feature in (1,2)
+        @test parent.node == original
+        changed_count[] += changed
+    end
+    @test changed_count[] > 0
+    # With one possible feature, the same leaf draw remains a no-op.
+    child, changed = S._node_scalar_propose(MersenneTwister(555), parent,
+        parent, 1, config, :delete)
+    @test !changed && child === parent
+    constants = ScalarSearchConfig(evolution_strategy=:regularized,
+        deletion_policy=:child_edge, constant_probability=1.0)
+    unary = S._node_scalar_candidate(scalar_unary(:sin, scalar_input(1)))
+    child, changed = S._node_scalar_propose(MersenneTwister(1234), unary,
+        unary, 0, constants, :delete)
+    @test changed && child.complexity == 2 && child.node.l.constant
+    @test isfinite(child.node.l.val) && !unary.node.l.constant
+    mixed = S._node_scalar_candidate(scalar_unary(:sin,
+        scalar_binary(:+, scalar_input(1), scalar_input(1))))
+    sizes = Set{Int}()
+    for seed in 1:32
+        child, _ = S._node_scalar_propose(MersenneTwister(seed), mixed,
+            mixed, 2, config, :delete)
+        push!(sizes,child.complexity)
+        @test child.node.op == mixed.node.op && child.node.degree == 1
+        @test S._node_scalar_materialize(child) isa ScalarExpr
+    end
+    @test sizes == Set((2,4))
+    default = ScalarSearchConfig(evolution_strategy=:regularized)
+    explicit = ScalarSearchConfig(evolution_strategy=:regularized, deletion_policy=:operator)
+    for seed in 1:16
+        a,b = MersenneTwister(seed),MersenneTwister(seed)
+        x,xc = S._node_scalar_propose(a,parent,parent,2,default,:delete)
+        y,yc = S._node_scalar_propose(b,parent,parent,2,explicit,:delete)
+        @test xc && yc && x.complexity == y.complexity == 1
+        @test x.node == y.node && rand(a) == rand(b)
     end
 end
 
@@ -638,6 +714,46 @@ end
     @test counts[:delete] > 0
     @test counts[:do_nothing] > 0
     @test counts[:optimize] == 0
+end
+
+@testitem "rotation no-op keeps its weight only when native trees cannot rotate" setup=[NodeRegularizedImports] begin
+    S = ScalarSearch
+    disabled = ScalarSearchConfig(evolution_strategy=:regularized,
+        max_complexity=1)
+    explicit_off = ScalarSearchConfig(evolution_strategy=:regularized,
+        max_complexity=1, rotation_noop_reproduction=false)
+    enabled = ScalarSearchConfig(evolution_strategy=:regularized,
+        max_complexity=1, rotation_noop_reproduction=true)
+    leaf = S._node_scalar_candidate(scalar_input(1))
+
+    default_rng = MersenneTwister(42)
+    explicit_off_rng = MersenneTwister(42)
+    @test [S._node_scalar_sample_mutation(default_rng, leaf, disabled)
+        for _ in 1:64] == [S._node_scalar_sample_mutation(explicit_off_rng,
+        leaf, explicit_off) for _ in 1:64]
+    @test rand(default_rng) == rand(explicit_off_rng)
+
+    sampled = [S._node_scalar_sample_mutation(MersenneTwister(seed), leaf,
+        enabled) for seed in 1:256]
+    @test :rotation_copy in sampled
+    @test :rotate ∉ sampled
+
+    rotatable = S._node_scalar_candidate(scalar_binary(:+,
+        scalar_unary(:sin, scalar_input(1)), scalar_input(1)))
+    @test any(anchor -> S._node_is_rotatable(anchor.node),
+        S._node_anchors(rotatable.node))
+    rotatable_off_rng = MersenneTwister(555)
+    rotatable_on_rng = MersenneTwister(555)
+    rotatable_off = [S._node_scalar_sample_mutation(rotatable_off_rng,
+        rotatable, disabled) for _ in 1:256]
+    rotatable_on = [S._node_scalar_sample_mutation(rotatable_on_rng,
+        rotatable, enabled) for _ in 1:256]
+    @test rotatable_on == rotatable_off
+    @test rand(rotatable_on_rng) == rand(rotatable_off_rng)
+    @test :rotation_copy ∉ rotatable_on
+    @test :rotate in rotatable_on
+    copied = S._copy_config(enabled, 64, 0, nothing)
+    @test copied.rotation_noop_reproduction
 end
 
 @testitem "bounded composition scalar proposals and zero bias preserve contracts" setup=[NodeRegularizedImports] begin

@@ -17,6 +17,28 @@ mutable struct _NodeRegularizedMember{V}
     born::Int
 end
 
+mutable struct _NodeTournamentWorkspace
+    available::Vector{Int}
+    selected::Vector{Int}
+    costs::Vector{Float64}
+    order::Vector{Int}
+end
+
+"""Allocate reusable sampling and ranking buffers for one regularized state.
+
+Buffers are sized to the state's population and tournament. The workspace owns
+only indices and costs, never candidate references, and must not be shared
+between states. Invalid sizes are left to the vector constructors to reject.
+"""
+_NodeTournamentWorkspace(population_size::Int, tournament_size::Int) =
+    _NodeTournamentWorkspace(collect(1:population_size),
+        Vector{Int}(undef, tournament_size),
+        Vector{Float64}(undef, tournament_size),
+        Vector{Int}(undef, tournament_size))
+
+_node_tournament_candidate(candidate::_NodeSearchCandidate) = candidate
+_node_tournament_candidate(member::_NodeRegularizedMember) = member.candidate
+
 _node_candidate_key(candidate::_NodeSearchCandidate) =
     (candidate.loss, candidate.value.complexity, candidate.serial)
 
@@ -87,6 +109,18 @@ function _regularized_refine_value(::Nothing, value::_NodeScalarCandidate,
         rng, restarts)
 end
 
+function _regularized_refine_value(::Nothing, value::_NodeScalarCandidate,
+        loss::Real, score::_NodeMSEScore, config::ScalarSearchConfig, remaining::Int;
+        rng::AbstractRNG, restarts::Int=2)
+    if score.jacobian === nothing
+        score_node = node -> score(_NodeScalarCandidate(node, value.complexity))
+        return _node_refine_constants(value, loss, score_node, config, remaining;
+            rng, restarts)
+    end
+    return _node_refine_mse_jacobian(value, loss, score, config, remaining;
+        rng, restarts)
+end
+
 function _regularized_simplify_value(::Nothing, value::_NodeScalarCandidate, rng)
     expr = _node_scalar_materialize(value)
     expr isa Err && return nothing
@@ -139,26 +173,49 @@ function _node_observe_population!(frequency::_RegularizedFrequency, population)
     return _regularized_normalize!(frequency)
 end
 
-"""Choose one candidate by rank tournament without replacement.
+"""Sample tournament slots and its rank draw without ranking candidates.
 
-Candidate loss/complexity, the configured tournament size, and the shared
-frequency snapshot anchor ranking. Empty candidate sets fail at sampling;
-malformed selection probabilities are rejected by the state initializer.
+Population size and `config.tournament_size` anchor sampling without replacement.
+The state-owned workspace keeps the sampled indices until the next draw. The
+returned random draw can be ranked later against the unchanged population and
+frequency snapshot, or discarded while preserving RNG consumption. The caller
+supplies a nonempty candidate set; no candidate references are retained.
 """
-function _node_tournament(rng, candidates, config, frequency;
-        loss_normalization, selection_p, use_frequency_in_tournament,
-        adaptive_parsimony_scaling)
+function _node_draw_tournament!(rng, candidates,
+        workspace::_NodeTournamentWorkspace, config)
     n = min(config.tournament_size, length(candidates))
-    available = collect(eachindex(candidates))
-    selected = Vector{Int}(undef, n)
+    available = workspace.available
+    resize!(available, length(candidates))
+    for (position, index) in enumerate(eachindex(candidates))
+        available[position] = index
+    end
+    selected = workspace.selected
+    resize!(selected, n)
     for index in 1:n
         slot = rand(rng, eachindex(available))
         selected[index] = available[slot]
         deleteat!(available, slot)
     end
-    costs = Vector{Float64}(undef, n)
+    return rand(rng)
+end
+
+"""Resolve previously sampled tournament slots against the current ranking.
+
+The caller must preserve the population, frequency snapshot and workspace's
+selected indices since `_node_draw_tournament!`. Candidate loss/complexity and
+the supplied pressure parameters anchor costs. This step consumes no random
+numbers; selection probability is validated by the state initializer.
+"""
+function _node_rank_tournament!(draw, candidates,
+        workspace::_NodeTournamentWorkspace, config, frequency;
+        loss_normalization, selection_p, use_frequency_in_tournament,
+        adaptive_parsimony_scaling)
+    selected = workspace.selected
+    n = length(selected)
+    costs = workspace.costs
+    resize!(costs, n)
     for index in 1:n
-        candidate = candidates[selected[index]]
+        candidate = _node_tournament_candidate(candidates[selected[index]])
         complexity = candidate.value.complexity
         cost = _regularized_cost(candidate.loss, complexity,
             loss_normalization, config.parsimony_coefficient)
@@ -169,8 +226,6 @@ function _node_tournament(rng, candidates, config, frequency;
         end
         costs[index] = cost
     end
-    order = sortperm(costs)
-    draw = rand(rng)
     cumulative = 0.0
     chosen = n
     normalization = sum(selection_p * (1 - selection_p)^(rank - 1) for rank in 1:n)
@@ -181,8 +236,40 @@ function _node_tournament(rng, candidates, config, frequency;
             break
         end
     end
-    return candidates[selected[order[chosen]]]
+    if chosen == 1
+        # Match stable sortperm ordering, including ties, signed zero and NaN.
+        # Ordinary `<` or an unordered reduction can change these boundaries.
+        best = 1
+        for index in 2:n
+            isless(costs[index], costs[best]) && (best = index)
+        end
+        return _node_tournament_candidate(candidates[selected[best]])
+    end
+    order = workspace.order
+    resize!(order, n)
+    sortperm!(order, costs)
+    return _node_tournament_candidate(candidates[selected[order[chosen]]])
 end
+
+"""Choose one candidate by rank tournament without replacement.
+
+Candidate loss/complexity, the configured tournament size, and the shared
+frequency snapshot anchor ranking. Empty candidate sets fail at sampling;
+malformed selection probabilities are rejected by the state initializer.
+"""
+function _node_tournament(rng, candidates, workspace::_NodeTournamentWorkspace,
+        config, frequency; kwargs...)
+    draw = _node_draw_tournament!(rng, candidates, workspace, config)
+    return _node_rank_tournament!(draw, candidates, workspace, config,
+        frequency; kwargs...)
+end
+
+# Ordinary scalar mutations below never read their donor. Keep all composition,
+# extension and unknown kinds conservative; joint-domain mutation has separate
+# donor/provenance semantics and does not use this shortcut.
+_node_mutation_uses_donor(kind::Symbol) = !(kind in
+    (:constant, :operator, :swap, :rotate, :add, :insert, :delete,
+     :simplify, :restart, :do_nothing, :optimize, :rotation_copy))
 
 function _node_to_scalar(candidate::_NodeSearchCandidate)
     expr = _node_scalar_materialize(candidate.value)
@@ -235,7 +322,7 @@ function _node_regularized_report(population, archive, best, evaluations,
     variation_attempts = mutation_attempts + crossover_attempts + composition_attempts
     mutation_kinds = (; (kind => get(mutation_kind_counts, kind, 0)
         for kind in (:constant, :operator, :swap, :rotate, :add, :insert, :delete,
-            :simplify, :restart, :do_nothing, :optimize,
+            :rotation_copy, :simplify, :restart, :do_nothing, :optimize,
             :graft, :scale, :shift, :subtree))...)
     variation = (
         attempts=variation_attempts,
@@ -280,7 +367,8 @@ function _node_regularized_named_child(rng::AbstractRNG,
         first_parent::_NodeScalarCandidate, second_parent::_NodeScalarCandidate,
         feature_count::Int, config::ScalarSearchConfig, kind::Symbol;
         temperature::Real=1.0)
-    tries = kind in (:do_nothing, :simplify, :optimize, :compose) ? 1 : 10
+    tries = kind in (:do_nothing, :simplify, :optimize, :compose,
+        :rotation_copy) ? 1 : 10
     for _ in 1:tries
         child, changed = _node_scalar_propose(
             rng, first_parent, second_parent, feature_count, config, kind;
@@ -307,8 +395,10 @@ end
         scalar_unary(:sin, scalar_constant(0.0)))
     frequency = ScalarSearch._RegularizedFrequency(10, 2)
     frequency.normalized_frequencies .= [0.9, 0.1]
+    workspace = ScalarSearch._NodeTournamentWorkspace(2, config.tournament_size)
     choose = candidates -> ScalarSearch._node_tournament(
-        MersenneTwister(1111), candidates, config, frequency;
+        MersenneTwister(1111), candidates, workspace, config, frequency;
+
         loss_normalization=1.0, selection_p=1.0,
         use_frequency_in_tournament=true, adaptive_parsimony_scaling=1.0)
 
@@ -323,6 +413,150 @@ end
         ScalarSearch._NodeSearchCandidate(larger, 1.0, 2, true),
     ]
     @test choose(positive).value.complexity == 2
+end
+
+@testitem "node tournament workspace preserves selection and RNG stream" setup=[NodeRegularizedSearchImports] begin
+    candidate_of(value) = value isa ScalarSearch._NodeRegularizedMember ?
+        value.candidate : value
+    function reference_tournament(rng, candidates, config, frequency;
+            loss_normalization, selection_p, use_frequency_in_tournament,
+            adaptive_parsimony_scaling)
+        n = min(config.tournament_size, length(candidates))
+        available = collect(eachindex(candidates))
+        selected = Vector{Int}(undef, n)
+        for index in 1:n
+            slot = rand(rng, eachindex(available))
+            selected[index] = available[slot]
+            deleteat!(available, slot)
+        end
+        costs = Vector{Float64}(undef, n)
+        for index in 1:n
+            candidate = candidate_of(candidates[selected[index]])
+            complexity = candidate.value.complexity
+            cost = ScalarSearch._regularized_cost(candidate.loss, complexity,
+                loss_normalization, config.parsimony_coefficient)
+            if use_frequency_in_tournament
+                pressure = adaptive_parsimony_scaling *
+                    ScalarSearch._regularized_frequency(frequency, complexity)
+                cost *= exp(cost < 0 ? -pressure : pressure)
+            end
+            costs[index] = cost
+        end
+        order = sortperm(costs)
+        draw = rand(rng)
+        cumulative = 0.0
+        chosen = n
+        normalization = sum(selection_p * (1 - selection_p)^(rank - 1)
+            for rank in 1:n)
+        for rank in 1:n
+            cumulative += selection_p * (1 - selection_p)^(rank - 1) /
+                normalization
+            if draw < cumulative
+                chosen = rank
+                break
+            end
+        end
+        return candidate_of(candidates[selected[order[chosen]]])
+    end
+
+    values = [
+        ScalarSearch._node_scalar_candidate(scalar_constant(0.0)),
+        ScalarSearch._node_scalar_candidate(
+            scalar_unary(:sin, scalar_constant(0.0))),
+        ScalarSearch._node_scalar_candidate(scalar_unary(:sin,
+            scalar_unary(:sin, scalar_constant(0.0)))),
+    ]
+    frequency = ScalarSearch._RegularizedFrequency(20, 3)
+    frequency.normalized_frequencies .= [0.8, 0.15, 0.05]
+
+    for population_size in (2, 3, 7)
+        candidates = [
+            ScalarSearch._NodeSearchCandidate(values[mod1(index, 3)],
+                index == 4 ? Inf : (isodd(index) ? -1.0 : 0.5), index, true)
+            for index in 1:population_size
+        ]
+        tied = [ScalarSearch._NodeSearchCandidate(values[1], 0.0,
+            100 + index, true) for index in 1:population_size]
+        members = [ScalarSearch._NodeRegularizedMember(candidate, index)
+            for (index, candidate) in enumerate(candidates)]
+        for population in (candidates, tied, members)
+            n = length(population)
+            for tournament_size in unique((1, min(2, n), n)),
+                    use_frequency in (false, true), selection_p in (1.0, 0.37)
+                config = ScalarSearchConfig(population_size=n,
+                    max_evaluations=max(n, 1), max_complexity=4,
+                    initial_depth=0, tournament_size=tournament_size,
+                    elite_count=1, unary_operators=(:sin,), binary_operators=(),
+                    parsimony_coefficient=0.2,
+                    constant_refinement_iterations=0,
+                    evolution_strategy=:regularized)
+                actual_rng = MersenneTwister(1234)
+                reference_rng = MersenneTwister(1234)
+                workspace = ScalarSearch._NodeTournamentWorkspace(n,
+                    tournament_size)
+                for _ in 1:4
+                    kwargs = (; loss_normalization=1.0,
+                        selection_p, use_frequency_in_tournament=use_frequency,
+                        adaptive_parsimony_scaling=0.7)
+                    actual = ScalarSearch._node_tournament(actual_rng,
+                        population, workspace, config, frequency; kwargs...)
+                    expected = reference_tournament(reference_rng, population,
+                        config, frequency; kwargs...)
+                    @test actual.serial == expected.serial
+                    @test rand(actual_rng, UInt, 4) == rand(reference_rng, UInt, 4)
+                end
+                # A discarded donor must still consume the historical draws;
+                # resolving a retained donor later must not consume any more.
+                kwargs = (; loss_normalization=1.0, selection_p,
+                    use_frequency_in_tournament=use_frequency,
+                    adaptive_parsimony_scaling=0.7)
+                ScalarSearch._node_draw_tournament!(actual_rng, population,
+                    workspace, config)
+                reference_tournament(reference_rng, population, config,
+                    frequency; kwargs...)
+                @test rand(actual_rng, UInt, 4) == rand(reference_rng, UInt, 4)
+                draw = ScalarSearch._node_draw_tournament!(actual_rng,
+                    population, workspace, config)
+                expected = reference_tournament(reference_rng, population,
+                    config, frequency; kwargs...)
+                @test rand(actual_rng, UInt, 4) == rand(reference_rng, UInt, 4)
+                actual = ScalarSearch._node_rank_tournament!(draw, population,
+                    workspace, config, frequency; kwargs...)
+                @test actual.serial == expected.serial
+                @test rand(actual_rng, UInt, 4) == rand(reference_rng, UInt, 4)
+            end
+        end
+    end
+end
+
+@testitem "node tournament minimum preserves stable float ordering" setup=[NodeRegularizedSearchImports] begin
+    value = ScalarSearch._node_scalar_candidate(scalar_constant(0.0))
+    losses = [NaN, Inf, -Inf, -0.0, 0.0, 1.0, 1.0, NaN]
+    candidates = [ScalarSearch._NodeSearchCandidate(value, loss, i, true)
+        for (i, loss) in enumerate(losses)]
+    config = ScalarSearchConfig(population_size=8, max_evaluations=8,
+        tournament_size=8, elite_count=1, parsimony_coefficient=-0.0,
+        constant_refinement_iterations=0, evolution_strategy=:regularized)
+    frequency = ScalarSearch._RegularizedFrequency(20, config.max_complexity)
+    workspace = ScalarSearch._NodeTournamentWorkspace(8, 8)
+    # Explicit rank draws exercise the shortcut and every fallback rank, even
+    # when production selection pressure makes non-first ranks very rare.
+    for selected in (collect(1:8), collect(8:-1:1), [1,8,2], [6,7], [5,4])
+        workspace.selected = copy(selected)
+        n = length(selected)
+        for rank in 1:n
+            expected_costs = [ScalarSearch._regularized_cost(losses[i], 1,
+                1.0, -0.0) for i in selected]
+            p = 0.2
+            weights = [p * (1-p)^(k-1) for k in 1:n]
+            draw = (sum(weights[1:rank-1]) + weights[rank]/2) / sum(weights)
+            actual = ScalarSearch._node_rank_tournament!(draw, candidates,
+                workspace, config, frequency; loss_normalization=1.0,
+                selection_p=p, use_frequency_in_tournament=false,
+                adaptive_parsimony_scaling=0.0)
+            @test actual.serial == selected[sortperm(expected_costs)[rank]]
+        end
+    end
 end
 
 @testitem "scalar reports retain scored trees under floating-point cancellation" setup=[NodeRegularizedSearchImports] begin

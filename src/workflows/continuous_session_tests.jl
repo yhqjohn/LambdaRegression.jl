@@ -27,6 +27,40 @@
     )
 end
 
+@testitem "Continuous workflow publishes and releases an initially terminal scalar session" setup=[ContinuousWorkflowFixture, ContinuousSessionTestFixture] begin
+    scalar_config = ScalarSearchConfig(
+        population_size=2, max_evaluations=4, max_complexity=6,
+        initial_depth=0, tournament_size=1, elite_count=1,
+        unary_operators=(:square,), binary_operators=(),
+        constant_refinement_iterations=0,
+        max_constant_refinement_evaluations=0,
+        evolution_strategy=:regularized)
+    observed_rounds = Int[]
+    result = run_continuous_search!(continuous_fixture(); rng=MersenneTwister(1),
+        config=ContinuousSearchConfig(max_actions=1, outer_weight=1.0,
+            scalar_weight=2.0, constant_weight=0.0),
+        outer=(attempts=0, evaluations=0, max_nodes=32, max_depth=8),
+        typed=(enabled=false,),
+        scalar=(enabled=true, config=scalar_config, max_return=1,
+            material_return=1, allow_zero_input=true,
+            session=(rounds_per_action=1,
+                backend_options=continuous_session_backend_options(
+                    round_observer=(round, _) -> push!(observed_rounds, round)))))
+
+    entry = only(result.ledger)
+    @test entry.kind === :scalar
+    @test !entry.refused
+    @test entry.returned >= 1
+    @test entry.report.session.event === :started
+    @test entry.report.session.completed
+    @test entry.report.session.rounds_completed == 0
+    @test entry.report.session.cumulative.structural_evaluations == 4
+    @test entry.report.session.cumulative.constant_refinement_evaluations == 0
+    @test isempty(observed_rounds)
+    @test result.scalar_sessions.started == result.scalar_sessions.completed == 1
+    @test result.scalar_sessions.unfinished === nothing
+end
+
 @testitem "Continuous workflow retains one fixed scalar session across outer and typed actions" setup=[ContinuousWorkflowFixture, ContinuousSessionTestFixture] begin
     state = continuous_fixture()
     scalar_config = continuous_session_config()

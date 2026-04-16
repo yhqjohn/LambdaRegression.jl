@@ -6,6 +6,150 @@ and only a strictly improving finite score is returned.  The authoritative
 candidate and its structure are never mutated.
 """
 
+"""One island's direct MSE scorer and optional constant-Jacobian callback.
+
+Inputs are borrowed read-only; evaluation buffers and diagnostic counters are
+island-owned. The callback is synchronous and must not mutate its node or X.
+It returns `(prediction, jacobian, complete)` in depth-first constant-leaf
+order, with a constants-by-samples Jacobian. It never supplies the authoritative
+loss. Invalid derivatives fall back to charged central differences.
+"""
+mutable struct _NodeMSEScore{X,Y,J,W}
+    X::X
+    y::Y
+    workspace::W
+    jacobian::J
+    derivative_evaluations::Int
+    invalid_derivatives::Int
+    fallback_gradients::Int
+end
+
+_NodeMSEScore(X, y, jacobian) =
+    _NodeMSEScore(X, y, DynamicScalarWorkspace(), jacobian, 0, 0, 0)
+
+function _node_mse_score(score::_NodeMSEScore, node)
+    prediction = evaluate_dynamic_scalar!(score.workspace, node, score.X)
+    prediction isa Err && return (Inf, true, nothing)
+    total = 0.0
+    @inbounds @simd for index in eachindex(score.y)
+        residual = prediction[index] - score.y[index]
+        total += residual * residual
+    end
+    loss = total / length(score.y)
+    return isfinite(loss) ? (loss, false, prediction) : (Inf, true, nothing)
+end
+
+(score::_NodeMSEScore)(value::_NodeScalarCandidate) =
+    _node_mse_score(score, value.node)[1:2]
+
+_node_constant_work(score, count) = (forward_evaluations=count,
+    derivative_evaluations=0, invalid_derivatives=0, fallback_gradients=0)
+_node_constant_work(score::_NodeMSEScore, count) = (
+    forward_evaluations=count - score.derivative_evaluations,
+    derivative_evaluations=score.derivative_evaluations,
+    invalid_derivatives=score.invalid_derivatives,
+    fallback_gradients=score.fallback_gradients)
+
+"""Bounded BFGS using an explicit direct-MSE constant Jacobian.
+
+Every canonical forward evaluation and every Jacobian callback consumes one
+unit of the same finite allowance. Counters separate these unequal-cost units.
+Only canonical forward evaluations can publish a best trial. Each trial owns
+its tree; derivative singularities use charged central differences, including
+retention of a better perturbation if the allowance expires mid-gradient.
+"""
+function _node_refine_mse_jacobian(candidate::_NodeScalarCandidate, loss::Real,
+        score::_NodeMSEScore, config::ScalarSearchConfig, cap::Integer;
+        rng::AbstractRNG=default_rng(), restarts::Int=2)
+    config.constant_refinement_optimizer === :bfgs ||
+        throw(ArgumentError("constant Jacobians require BFGS"))
+    restarts >= 0 || throw(ArgumentError("constant-refinement restarts cannot be negative"))
+    paths = _node_constant_paths(candidate.node)
+    initial = Float64[_node_at_path(candidate.node, p).val for p in paths]
+    (cap <= 0 || isempty(initial) || config.constant_refinement_iterations == 0) &&
+        return (candidate, Float64(loss), 0, 0)
+    work = Ref(0); invalid = Ref(0)
+    best_loss = Ref(Float64(loss)); best_values = copy(initial)
+    function charge!()
+        work[] >= cap && throw(_ConstantRefinementBudgetExhausted())
+        work[] += 1
+    end
+    function owned(values)
+        node = DynamicExpressions.copy_node(candidate.node; break_sharing=Val(true))
+        _node_set_constants!(node, paths, values) || error("invalid refinement parameters")
+        return node
+    end
+    function forward(node, values)
+        charge!()
+        value, failed, prediction = _node_mse_score(score, node)
+        invalid[] += failed
+        if !failed && value < best_loss[]
+            best_loss[] = value
+            copyto!(best_values, values)
+        end
+        return value, prediction
+    end
+    function trial(values)
+        all(isfinite, values) || return Inf
+        return first(forward(owned(values), values))
+    end
+    function fg!(F, G, values)
+        G === nothing && return trial(values)
+        if !all(isfinite, values)
+            fill!(G, NaN)
+            return F === nothing ? nothing : Inf
+        end
+        node = owned(values)
+        value, prediction = forward(node, values)
+        if isfinite(value)
+            charge!()
+            score.derivative_evaluations += 1
+            _, jacobian, complete = score.jacobian(node, score.X)
+            if complete
+                size(jacobian) == (length(values), length(score.y)) ||
+                    throw(DimensionMismatch("constant Jacobian must be constants by samples"))
+                for j in eachindex(G)
+                    total = 0.0
+                    @inbounds @simd for i in eachindex(score.y)
+                        total += (prediction[i] - score.y[i]) * jacobian[j, i]
+                    end
+                    G[j] = 2total / length(score.y)
+                end
+                complete = all(isfinite, G)
+            end
+            if complete
+                return F === nothing ? nothing : value
+            end
+            score.invalid_derivatives += 1
+        end
+        score.fallback_gradients += 1
+        for j in eachindex(values)
+            h = cbrt(eps(Float64)) * max(1.0, abs(values[j]))
+            plus, minus = copy(values), copy(values)
+            plus[j] += h
+            minus[j] -= h
+            G[j] = (trial(plus) - trial(minus)) / (2h)
+        end
+        return F === nothing ? nothing : value
+    end
+    options = Optim.Options(iterations=config.constant_refinement_iterations,
+        show_trace=false, store_trace=false)
+    method = Optim.BFGS(linesearch=Optim.LineSearches.BackTracking())
+    try
+        Optim.optimize(Optim.NLSolversBase.only_fg!(fg!), initial, method, options)
+        for _ in 1:restarts
+            work[] >= cap && break
+            restart = initial .* (1 .+ 0.5 .* randn(rng, length(initial)))
+            Optim.optimize(Optim.NLSolversBase.only_fg!(fg!), restart, method, options)
+        end
+    catch exception
+        exception isa _ConstantRefinementBudgetExhausted || rethrow()
+    end
+    best_loss[] < loss || return (candidate, Float64(loss), work[], invalid[])
+    return (_NodeScalarCandidate(owned(best_values), candidate.complexity),
+        best_loss[], work[], invalid[])
+end
+
 function _node_constant_paths!(paths::Vector{Tuple{Vararg{Int}}}, node,
         path::Tuple=())
     node.degree == 0 && node.constant && push!(paths, path)
@@ -146,6 +290,58 @@ end
 @testsnippet NodeConstantRefinementImports begin
     using Test
     using LambdaRegression.ScalarSearch
+end
+
+@testitem "direct MSE Jacobian refinement charges work and preserves publication" setup=[NodeConstantRefinementImports] begin
+    using Random: MersenneTwister
+    S = ScalarSearch
+    X = reshape([0.2, 0.5, 0.9, 1.3], 1, :)
+    y = 2vec(X) .+ 0.7
+    expr = scalar_binary(:+, scalar_binary(:*, scalar_constant(0.0),
+        scalar_input(1)), scalar_constant(0.0))
+    parent = S._node_scalar_candidate(expr)
+    before = copy(parent.node; break_sharing=Val(true))
+    config = ScalarSearchConfig(constant_refinement_iterations=24)
+    callbacks = Ref(0)
+    jacobian = (node, data) -> begin
+        callbacks[] += 1
+        (nothing, vcat(data, ones(1, size(data, 2))), true)
+    end
+    for cap in (0, 1, 2, 3, 5, 100)
+        callbacks[] = 0
+        score = S._NodeMSEScore(X, y, jacobian)
+        initial = first(score(parent))
+        fitted, value, work, invalid = S._regularized_refine_value(nothing,
+            parent, initial, score, config, cap; rng=MersenneTwister(1111), restarts=0)
+        counts = S._node_constant_work(score, work)
+        @test work <= cap
+        @test counts.forward_evaluations + counts.derivative_evaluations == work
+        @test counts.derivative_evaluations == callbacks[]
+        @test invalid == 0
+        @test first(score(fitted)) == value <= initial
+        @test parent.node == before
+        cap == 100 && @test value < 1e-10
+    end
+    # A finite forward with a singular derivative keeps its finite-difference
+    # improvement even when the cap expires midway through the fallback.
+    singular = (node, data) -> (nothing, fill(NaN, 2, size(data, 2)), true)
+    score = S._NodeMSEScore(X, y, singular)
+    initial = first(score(parent))
+    fitted, value, work, invalid = S._regularized_refine_value(nothing,
+        parent, initial, score, config, 3; rng=MersenneTwister(1111), restarts=0)
+    @test work == 3
+    @test score.invalid_derivatives == score.fallback_gradients == 1
+    @test value == first(score(fitted)) < initial
+    @test invalid == 0
+    bad_shape = S._NodeMSEScore(X, y, (n, x) -> (nothing, zeros(1, 1), true))
+    @test_throws DimensionMismatch S._regularized_refine_value(nothing,
+        parent, initial, bad_shape, config, 8; rng=MersenneTwister(1111))
+    crashing = S._NodeMSEScore(X, y, (n, x) -> error("derivative bug"))
+    @test_throws ErrorException S._regularized_refine_value(nothing,
+        parent, initial, crashing, config, 8; rng=MersenneTwister(1111))
+    no_constants = S._node_scalar_candidate(scalar_input(1))
+    @test S._regularized_refine_value(nothing, no_constants, 1.0, crashing,
+        config, 8; rng=MersenneTwister(1111)) == (no_constants, 1.0, 0, 0)
 end
 
 @testitem "node constant refinement preserves parent and obeys cap" setup=[NodeConstantRefinementImports] begin

@@ -555,12 +555,13 @@ variation, simplification and numerical publication all recheck this boundary;
 the observational structure key grants no reuse rights. A mismatched additional
 seed fails initialization; a mismatched offspring is an expected failed edit.
 
-`use_frequency_in_tournament=true` and `adaptive_parsimony_scaling=1040.0`
-control the scalar engine's tournament cost adjustment by full-program
-complexity frequency. This is a whole-program complexity frequency, not
-higher-order structure-family diversity. Turning it off disables only this
-tournament adjustment; mutation acceptance continues to use its existing
-frequency policy. The scale must convert to a finite nonnegative `Float64`.
+`use_frequency_in_tournament=true` controls the scalar engine's tournament
+cost adjustment by full-program complexity frequency. This is a whole-program
+complexity frequency, not higher-order structure-family diversity.
+`use_frequency=true` independently controls mutation-acceptance frequency; when
+false it disables only that acceptance pressure. `adaptive_parsimony_scaling=1040.0`
+is the tournament adjustment scale and must convert to a finite nonnegative
+`Float64`.
 """
 function initialize_joint_search(programs, target_ty, type_context, score;
         config::ScalarSearchConfig=ScalarSearchConfig(evolution_strategy=:regularized),
@@ -574,11 +575,16 @@ function initialize_joint_search(programs, target_ty, type_context, score;
         ncycles_per_iteration::Int=64, frequency_window::Int=100000,
         loss_normalization::Real=1.0, event_capacity::Int=256,
         fixed_template::Bool=false, seed_per_island::Bool=false,
+        use_frequency::Bool=true,
         use_frequency_in_tournament::Bool=true,
         adaptive_parsimony_scaling::Real=1040.0)
     isempty(programs) && throw(ArgumentError("joint search requires initial programs"))
     config.evolution_strategy === :regularized ||
         throw(ArgumentError("joint search requires regularized maintenance"))
+    config.rotation_noop_reproduction && throw(ArgumentError(
+        "rotation_noop_reproduction is unsupported for joint program search"))
+    config.deletion_policy !== :operator && throw(ArgumentError(
+        "deletion_policy=:child_edge is unsupported for joint program search"))
     island_count >= 1 || throw(ArgumentError("island_count must be positive"))
     replacement in (:age, :rtr) || throw(ArgumentError("replacement must be :age or :rtr"))
     rtr_window > 0 || throw(ArgumentError("rtr_window must be positive"))
@@ -619,7 +625,7 @@ function initialize_joint_search(programs, target_ty, type_context, score;
     totals = config.max_total_evaluations === nothing ? fill(nothing, island_count) :
         ScalarSearch._split_budget(config.max_total_evaluations, island_count)
     flow = ScalarSearch._NodeRegularizedFlow(nothing, true, 1.0, 3.17,
-        ncycles_per_iteration, true, 0.0614, 0.982,
+        ncycles_per_iteration, use_frequency, 0.0614, 0.982,
         use_frequency_in_tournament, frequency_scale)
     frequency = ScalarSearch._RegularizedFrequency(frequency_window, max_nodes)
     states = Any[]
@@ -806,6 +812,12 @@ end
     same_program(a, b) = a.tree == b.tree &&
         a.local_consts == b.local_consts && a.local_consts_ty == b.local_consts_ty
     config = joint_config()
+    @test_throws ArgumentError initialize_joint_search([programs[1]], pair_ty,
+        joint_types, _ -> 1.0;
+        config=joint_config(rotation_noop_reproduction=true), island_count=1)
+    @test_throws ArgumentError initialize_joint_search([programs[1]], pair_ty,
+        joint_types, _ -> 1.0;
+        config=joint_config(deletion_policy=:child_edge), island_count=1)
     default = initialize_joint_search(programs, pair_ty, joint_types, _ -> 1.0;
         config, island_count=2, rng=MersenneTwister(42))
     default_report = joint_search_result(default)
@@ -847,7 +859,7 @@ end
     @test one_seed_report.evaluations == 8
 end
 
-@testitem "joint tournament frequency controls preserve defaults and mutation frequency" setup=[JointSearchFixture] begin
+@testitem "joint frequency controls preserve defaults and remain independent" setup=[JointSearchFixture] begin
     config = joint_config()
     program = pair_program(1, 2)
     make_session(; kwargs...) = initialize_joint_search([program], pair_ty,
@@ -858,10 +870,12 @@ end
         adaptive_parsimony_scaling=1040.0)
     no_tournament_frequency = make_session(use_frequency_in_tournament=false,
         adaptive_parsimony_scaling=17.0)
+    no_acceptance_frequency = make_session(use_frequency=false)
 
     default_state = only(default.states)
     explicit_state = only(explicit_default.states)
     disabled_state = only(no_tournament_frequency.states)
+    no_acceptance_state = only(no_acceptance_frequency.states)
     @test default_state.flow.use_frequency_in_tournament
     @test default_state.flow.adaptive_parsimony_scaling == 1040.0
     @test explicit_state.flow.use_frequency_in_tournament
@@ -871,6 +885,8 @@ end
     @test default_state.flow.use_frequency
     @test explicit_state.flow.use_frequency
     @test disabled_state.flow.use_frequency
+    @test no_acceptance_state.flow.use_frequency_in_tournament
+    @test !no_acceptance_state.flow.use_frequency
 
     default_population = only(joint_search_result(default).population)
     explicit_population = only(joint_search_result(explicit_default).population)

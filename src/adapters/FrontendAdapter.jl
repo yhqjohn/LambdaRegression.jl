@@ -136,7 +136,7 @@ function _fit_config(kwargs)
         get!(options, :binary_operators, binary)
     end
 
-    for name in (:evolution_strategy, :constant_refinement_timing,
+    for name in (:evolution_strategy, :constant_refinement_timing, :deletion_policy,
             :constant_refinement_optimizer)
         if haskey(options, name) && options[name] isa AbstractString
             options[name] = Symbol(options[name])
@@ -534,6 +534,18 @@ end
     @test isempty(empty_unary.unary_operators)
     @test empty_unary.binary_operators == (:*,)
     @test_throws ArgumentError _fit_config((operator_set=String[],))
+
+    age_reset, _, _ = _fit_config((evolution_strategy="regularized",
+        constant_refinement_resets_age=true,))
+    @test age_reset.constant_refinement_resets_age
+    @test typeof(age_reset.constant_refinement_resets_age) === Bool
+    rotation_copy, _, _ = _fit_config((evolution_strategy="regularized",
+        rotation_noop_reproduction=true,))
+    @test rotation_copy.rotation_noop_reproduction
+    @test typeof(rotation_copy.rotation_noop_reproduction) === Bool
+    child_edge, _, _ = _fit_config((evolution_strategy="regularized",
+        deletion_policy="child_edge",))
+    @test child_edge.deletion_policy === :child_edge
 end
 
 @testitem "Frontend adapter fits and round-trips multiple output channels" begin

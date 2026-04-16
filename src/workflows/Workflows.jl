@@ -298,6 +298,11 @@ function _scalar_config(scalar)
         constant_refinement_start_generation=Int(scalar.constant_refinement_start_generation),
         constant_refinement_probability=scalar.constant_refinement_probability,
         constant_refinement_timing=get(scalar, :constant_refinement_timing, :cycle),
+        constant_refinement_resets_age=get(scalar,
+            :constant_refinement_resets_age, false),
+        rotation_noop_reproduction=get(scalar,
+            :rotation_noop_reproduction, false),
+        deletion_policy=get(scalar, :deletion_policy, :operator),
         max_constant_refinement_evaluations=Int(scalar.max_constant_refinement_evaluations),
         max_total_evaluations=get(scalar, :max_total_evaluations, nothing),
         evolution_strategy=:regularized,
@@ -804,6 +809,38 @@ include("continuous.jl")
 include("continuous_session_tests.jl")
 include("joint.jl")
 include("composition_seeds.jl")
+
+@testitem "workflow scalar configuration forwards regularized age and rotation policies" begin
+    using Test
+    using LambdaRegression.Workflows: _scalar_config
+
+    config = _scalar_config((;
+        population_size=2,
+        max_evaluations=4,
+        max_complexity=4,
+        initial_depth=1,
+        tournament_size=1,
+        elite_count=1,
+        unary_operators=(:square,),
+        binary_operators=(:+,),
+        constant_probability=0.2,
+        mutation_probability=0.9,
+        crossover_probability=0.05,
+        constant_refinement_iterations=2,
+        constant_refinement_interval=2,
+        constant_refinement_start_generation=1,
+        constant_refinement_probability=1.0,
+        max_constant_refinement_evaluations=4,
+        constant_refinement_resets_age=true,
+        rotation_noop_reproduction=true,
+        deletion_policy=:child_edge,
+    ))
+    @test config.constant_refinement_resets_age
+    @test config.rotation_noop_reproduction
+    @test config.deletion_policy === :child_edge
+    @test config.constant_refinement_timing === :cycle
+    @test config.evolution_strategy === :regularized
+end
 
 @testitem "Mixed workflow outer-only run borrows initialized state" begin
     using Random: MersenneTwister

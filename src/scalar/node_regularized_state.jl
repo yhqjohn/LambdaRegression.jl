@@ -20,6 +20,7 @@ mutable struct _NodeRegularizedState{R<:AbstractRNG,F,V,D}
     score::F
     flow::_NodeRegularizedFlow
     population::Vector{_NodeRegularizedMember{V}}
+    tournament_workspace::_NodeTournamentWorkspace
     archive::Dict{Int,_NodeSearchCandidate{V}}
     frequency::_RegularizedFrequency
     domain::D
@@ -41,6 +42,8 @@ mutable struct _NodeRegularizedState{R<:AbstractRNG,F,V,D}
     oldest_replacements::Int
     hof_migrations::Int
     mutation_kind_counts::Dict{Symbol,Int}
+    rotation_copy_evaluations::Int
+    rotation_copy_accepted::Int
     offspring_attempts::Int
     loss_normalization::Float64
     cycle_refinement_calls::Int
@@ -121,6 +124,10 @@ function _node_state_refine!(state::_NodeRegularizedState,
         state, previous, generation, :cycle)
     refined === previous && return member
     member.candidate = refined
+    if state.config.constant_refinement_resets_age
+        state.birth_clock += 1
+        member.born = state.birth_clock
+    end
     _node_state_record!(state, member.candidate; source=:constant_refinement)
     _regularized_observe(state.domain, state, :constant_refinement,
         previous, refined, true)
@@ -258,13 +265,25 @@ end
 
 function _node_state_offspring_variation!(state::_NodeRegularizedState,
         evaluation_limit::Int)
-    candidates = [member.candidate for member in state.population]
-    tournament() = _node_tournament(state.rng, candidates, state.config,
-        state.frequency; loss_normalization=state.loss_normalization,
+    tournament() = _node_tournament(state.rng, state.population,
+        state.tournament_workspace, state.config, state.frequency;
+        loss_normalization=state.loss_normalization,
         selection_p=state.flow.tournament_selection_p,
         use_frequency_in_tournament=state.flow.use_frequency_in_tournament,
         adaptive_parsimony_scaling=state.flow.adaptive_parsimony_scaling)
-    first_parent, second_parent = tournament(), tournament()
+    first_parent = tournament()
+    second_draw = _node_draw_tournament!(state.rng, state.population,
+        state.tournament_workspace, state.config)
+    rank_second() = _node_rank_tournament!(second_draw, state.population,
+        state.tournament_workspace, state.config, state.frequency;
+        loss_normalization=state.loss_normalization,
+        selection_p=state.flow.tournament_selection_p,
+        use_frequency_in_tournament=state.flow.use_frequency_in_tournament,
+        adaptive_parsimony_scaling=state.flow.adaptive_parsimony_scaling)
+    # Always consume both tournaments' random draws. Native one-parent mutation
+    # can omit the second ranking; other domains retain their donor semantics.
+    deferred_second = state.domain === nothing
+    second_parent = deferred_second ? first_parent : rank_second()
     draw = rand(state.rng)
     if draw >= state.config.mutation_probability &&
             draw < state.config.mutation_probability +
@@ -273,6 +292,7 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
         min(evaluation_limit - state.evaluations,
             _node_state_total_remaining(state)) >= 2 ||
             (state.skipped_variations += 1; return state)
+        deferred_second && (second_parent = rank_second())
         first_value, second_value, changed =
             first_parent.value, second_parent.value, false
         for _ in 1:10
@@ -309,6 +329,9 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
         _regularized_sample_mutation(state.domain, state.rng,
             first_parent.value, state.config) :
         :compose
+    if deferred_second && _node_mutation_uses_donor(kind)
+        second_parent = rank_second()
+    end
     cycle_temperature, _ = _regularized_cycle_temperature(
         state.offspring_attempts, state.config.population_size,
         state.config.tournament_size, state.flow.ncycles_per_iteration)
@@ -331,11 +354,12 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
         admitted = _node_state_replace_offspring!(state, first_parent, child)
         _regularized_observe(state.domain, state, kind,
             first_parent, child, admitted)
-    elseif !changed
+    elseif !changed && kind !== :rotation_copy
         state.skipped_variations += 1
     else
         child = _node_state_score_candidate!(state, child_value, true, evaluation_limit)
         child === nothing && return state
+        kind === :rotation_copy && (state.rotation_copy_evaluations += 1)
         child = _node_state_refine_offspring!(state, child)
         # Archive every finite scored mutation before applying the live-island
         # admission policy. A rejected child can still be the best candidate
@@ -343,6 +367,8 @@ function _node_state_offspring_variation!(state::_NodeRegularizedState,
         _node_state_record!(state, child)
         if _node_state_accept!(state, first_parent, child)
             admitted = _node_state_replace_offspring!(state, first_parent, child)
+            kind === :rotation_copy && admitted &&
+                (state.rotation_copy_accepted += 1)
         else
             state.rejected_offspring += 1
             admitted = false
@@ -365,6 +391,11 @@ function _initialize_regularized_values(values, score;
         flow::_NodeRegularizedFlow, feature_count::Int=0,
         frequency=nothing, frequency_window::Int=100000,
         loss_normalization::Real=0.01, domain=nothing)
+    config.rotation_noop_reproduction && domain !== nothing &&
+        throw(ArgumentError(
+            "rotation_noop_reproduction is supported only for native scalar search (domain=nothing)"))
+    config.deletion_policy !== :operator && domain !== nothing &&
+        throw(ArgumentError("deletion_policy=:child_edge is supported only for native scalar search"))
     initial_values = collect(values)
     length(initial_values) > config.population_size &&
         resize!(initial_values, config.population_size)
@@ -389,11 +420,13 @@ function _initialize_regularized_values(values, score;
     member_type = typeof(_NodeRegularizedMember(
         _NodeSearchCandidate(first_value, Inf, 0, false), 0))
     state = _NodeRegularizedState(config, rng, feature_count, score, flow,
-        member_type[], Dict{Int,candidate_type}(), shared_frequency, domain,
+        member_type[],
+        _NodeTournamentWorkspace(config.population_size, config.tournament_size),
+        Dict{Int,candidate_type}(), shared_frequency, domain,
         0, 0, 0, 0, 0, 0,
         _NodeSearchCandidate(first_value, Inf, 0, false), NamedTuple[],
         0, 0, 0, 0, 0, 0, 0, 0, 0, Dict{Symbol,Int}(), 0,
-        Float64(loss_normalization), 0, 0)
+        0, 0, Float64(loss_normalization), 0, 0)
     for value in initial_values
         candidate = _node_state_score_candidate!(
             state, value, false, config.max_evaluations)
@@ -437,7 +470,7 @@ objectives, or an unfillable initial population fail before the state escapes.
 function _initialize_node_regularized_state(X::AbstractMatrix{<:Real},
         y::AbstractVector{<:Real}; config::ScalarSearchConfig=ScalarSearchConfig(),
         rng::AbstractRNG=default_rng(), initial_population=nothing,
-        objective=nothing, stop_loss::Union{Nothing,Real}=
+        objective=nothing, constant_jacobian=nothing, stop_loss::Union{Nothing,Real}=
             objective === nothing ? 1.0e-12 : nothing,
         annealing::Bool=true, temperature::Real=1.0, alpha::Real=3.17,
         ncycles_per_iteration::Int=380, use_frequency::Bool=true,
@@ -453,25 +486,16 @@ function _initialize_node_regularized_state(X::AbstractMatrix{<:Real},
     all(isfinite, y) || throw(ArgumentError("scalar search targets must be finite"))
     objective === nothing || applicable(objective, scalar_input(1)) ||
         throw(ArgumentError("objective must accept one ScalarExpr"))
+    constant_jacobian === nothing || (objective === nothing &&
+        config.constant_refinement_optimizer === :bfgs) || throw(ArgumentError(
+        "constant_jacobian requires direct MSE and BFGS refinement"))
     flow = _NodeRegularizedFlow(
         stop_loss === nothing ? nothing : Float64(stop_loss), annealing,
         Float64(temperature), Float64(alpha), ncycles_per_iteration,
         use_frequency, Float64(hof_migration_fraction),
         Float64(tournament_selection_p), use_frequency_in_tournament,
         Float64(adaptive_parsimony_scaling))
-    workspace = DynamicScalarWorkspace()
-    function score(value::_NodeScalarCandidate)
-        if objective === nothing
-            prediction = evaluate_dynamic_scalar!(workspace, value.node, X)
-            prediction isa Err && return (Inf, true)
-            total = 0.0
-            @inbounds @simd for index in eachindex(y)
-                residual = prediction[index] - y[index]
-                total += residual * residual
-            end
-            loss = total / length(y)
-            return isfinite(loss) ? (loss, false) : (Inf, true)
-        end
+    function custom_score(value::_NodeScalarCandidate)
         expr = _node_scalar_materialize(value)
         expr isa Err && return (Inf, true)
         result = applicable(objective, expr, value.node) ?
@@ -481,6 +505,7 @@ function _initialize_node_regularized_state(X::AbstractMatrix{<:Real},
         loss = Float64(result)
         return isfinite(loss) ? (loss, false) : (Inf, true)
     end
+    score = objective === nothing ? _NodeMSEScore(X, y, constant_jacobian) : custom_score
     values = _NodeScalarCandidate[]
     if initial_population !== nothing
         all(expr -> expr isa ScalarExpr, initial_population) ||
@@ -545,6 +570,15 @@ function _step_node_regularized!(state::_NodeRegularizedState;
     return state
 end
 
+"""Read the completed-or-partial maintenance cycle count without publishing candidates."""
+function _node_state_generations(state::_NodeRegularizedState)
+    _, period = _regularized_cycle_temperature(
+        max(1, state.offspring_attempts), state.config.population_size,
+        state.config.tournament_size, state.flow.ncycles_per_iteration)
+    return state.offspring_attempts == 0 ? 0 :
+        cld(state.offspring_attempts, period)
+end
+
 function _node_regularized_result(state::_NodeRegularizedState)
     solved = state.flow.stop_loss !== nothing &&
         state.best.loss <= state.flow.stop_loss
@@ -552,11 +586,7 @@ function _node_regularized_result(state::_NodeRegularizedState)
         (_node_state_total_remaining(state) <= 0 ? :total_evaluation_cap :
             (state.evaluations >= state.config.max_evaluations ?
                 :evaluation_cap : :paused))
-    _, period = _regularized_cycle_temperature(
-        max(1, state.offspring_attempts), state.config.population_size,
-        state.config.tournament_size, state.flow.ncycles_per_iteration)
-    generations = state.offspring_attempts == 0 ? 0 :
-        cld(state.offspring_attempts, period)
+    generations = _node_state_generations(state)
     return _node_regularized_report(state.population, state.archive, state.best,
         state.evaluations, state.invalid_evaluations,
         state.constant_refinement_evaluations,
@@ -603,6 +633,171 @@ end
     using LambdaRegression.ScalarSearch
 end
 
+@testsnippet RefinementAgePolicySetup begin
+    using Test
+    using Random: MersenneTwister, rand
+    using LambdaRegression.ScalarSearch
+
+    struct RefinementAgeMockValue
+        complexity::Int
+        loss::Float64
+        improvable::Bool
+    end
+    struct RefinementAgeMockDomain
+        improve::Bool
+    end
+
+    ScalarSearch._regularized_has_constants(::RefinementAgeMockDomain,
+        ::RefinementAgeMockValue) = true
+    ScalarSearch._regularized_simplify_value(::RefinementAgeMockDomain,
+        value::RefinementAgeMockValue, rng) = nothing
+    function ScalarSearch._regularized_refine_value(
+            domain::RefinementAgeMockDomain, value::RefinementAgeMockValue,
+            loss::Real, score, config::ScalarSearchConfig, remaining::Int;
+            rng, restarts::Int=2)
+        remaining <= 0 && return (value, Float64(loss), 0, 0)
+        refined = domain.improve && value.improvable ?
+            RefinementAgeMockValue(value.complexity, Float64(loss) - 1.0, false) :
+            value
+        refined_loss, invalid = score(refined)
+        return refined, refined_loss, 1, invalid
+    end
+
+    function refinement_age_state(; reset_age=nothing, improve=true,
+            improvable=true, probability=1.0, budget=8, seed=71)
+        options = (
+            population_size=2,
+            max_evaluations=8,
+            max_complexity=2,
+            initial_depth=0,
+            tournament_size=1,
+            elite_count=1,
+            unary_operators=(:square,),
+            binary_operators=(:+,),
+            constant_refinement_iterations=1,
+            constant_refinement_start_generation=1,
+            constant_refinement_probability=probability,
+            max_constant_refinement_evaluations=budget,
+            evolution_strategy=:regularized,
+        )
+        reset_options = reset_age === nothing ? (;) :
+            (; constant_refinement_resets_age=reset_age)
+        config = ScalarSearchConfig(; merge(options, reset_options)...)
+        values = [RefinementAgeMockValue(1, 3.0, improvable),
+            RefinementAgeMockValue(1, 2.0, false)]
+        score = value -> (value.loss, 0)
+        flow = ScalarSearch._NodeRegularizedFlow(nothing, false, 1.0, 3.17,
+            1, false, 0.0, 0.982, false, 0.0)
+        state = ScalarSearch._initialize_regularized_values(values, score;
+            config, rng=MersenneTwister(seed), flow, domain=RefinementAgeMockDomain(improve))
+        state.offspring_attempts = 1
+        return state
+    end
+end
+
+@testitem "cycle refinement age reset requires strict improvement and opt-in" setup=[RefinementAgePolicySetup] begin
+    enabled = refinement_age_state(reset_age=true)
+    original = [member.candidate for member in enabled.population]
+    ScalarSearch._node_state_maintain_cycle!(enabled, enabled.config.max_evaluations)
+    @test enabled.population[1].candidate.loss == original[1].loss - 1.0
+    @test enabled.population[1].candidate.serial == original[1].serial
+    @test enabled.population[1].born == enabled.birth_clock
+    @test enabled.population[1].born > enabled.population[2].born
+    @test enabled.birth_clock == 3
+
+    unchanged = refinement_age_state(reset_age=true, improve=false)
+    unchanged_ages = [member.born for member in unchanged.population]
+    unchanged_clock = unchanged.birth_clock
+    ScalarSearch._node_state_maintain_cycle!(unchanged,
+        unchanged.config.max_evaluations)
+    @test [member.born for member in unchanged.population] == unchanged_ages
+    @test unchanged.birth_clock == unchanged_clock
+
+    skipped = refinement_age_state(reset_age=true, probability=0.0)
+    skipped_ages = [member.born for member in skipped.population]
+    ScalarSearch._node_state_maintain_cycle!(skipped,
+        skipped.config.max_evaluations)
+    @test skipped.constant_refinement_evaluations == 0
+    @test [member.born for member in skipped.population] == skipped_ages
+
+    exhausted = refinement_age_state(reset_age=true, budget=0)
+    exhausted_ages = [member.born for member in exhausted.population]
+    exhausted_clock = exhausted.birth_clock
+    ScalarSearch._node_state_maintain_cycle!(exhausted,
+        exhausted.config.max_evaluations)
+    @test exhausted.constant_refinement_evaluations == 0
+    @test [member.born for member in exhausted.population] == exhausted_ages
+    @test exhausted.birth_clock == exhausted_clock
+
+    default = refinement_age_state()
+    explicit_off = refinement_age_state(reset_age=false)
+    @test default.config.constant_refinement_resets_age === false
+    ScalarSearch._node_state_maintain_cycle!(default, default.config.max_evaluations)
+    ScalarSearch._node_state_maintain_cycle!(explicit_off,
+        explicit_off.config.max_evaluations)
+    @test [member.born for member in default.population] == [1, 2]
+    @test default.birth_clock == explicit_off.birth_clock == 2
+    @test default.constant_refinement_evaluations ==
+        explicit_off.constant_refinement_evaluations == 2
+    @test [member.candidate.loss for member in default.population] ==
+        [member.candidate.loss for member in explicit_off.population]
+    @test rand(default.rng) == rand(explicit_off.rng)
+
+    copied = ScalarSearch._copy_config(enabled.config,
+        enabled.config.max_evaluations,
+        enabled.config.max_constant_refinement_evaluations,
+        enabled.config.max_total_evaluations)
+    @test copied.constant_refinement_resets_age
+end
+
+@testitem "cycle refinement age state is identical across segmented advancement" setup=[NodeRegularizedStateImports] begin
+    config = ScalarSearchConfig(
+        population_size=2, max_evaluations=8, max_complexity=4,
+        initial_depth=0, tournament_size=1, elite_count=1,
+        unary_operators=(:square,), binary_operators=(:+,),
+        mutation_probability=1.0, crossover_probability=0.0,
+        constant_refinement_iterations=3,
+        constant_refinement_start_generation=1,
+        constant_refinement_probability=1.0,
+        constant_refinement_timing=:cycle,
+        constant_refinement_resets_age=true,
+        max_constant_refinement_evaluations=12,
+        constant_refinement_optimizer=:nelder_mead,
+        evolution_strategy=:regularized)
+    X = zeros(Float64, 0, 2)
+    objective = expr -> (first(evaluate_scalar_reference(expr, X)) - 2.0)^2
+    initial = [scalar_constant(0.0), scalar_constant(1.0)]
+    function make_state()
+        return ScalarSearch._initialize_node_regularized_state(
+            X, [2.0, 2.0]; config, rng=MersenneTwister(42), objective,
+            initial_population=initial, stop_loss=nothing, annealing=false,
+            use_frequency=false, ncycles_per_iteration=1,
+            hof_migration_fraction=0.0)
+    end
+
+    segmented = make_state()
+    continuous = make_state()
+    ScalarSearch._step_node_regularized!(segmented; evaluation_limit=5)
+    ScalarSearch._step_node_regularized!(segmented; evaluation_limit=8)
+    ScalarSearch._step_node_regularized!(continuous; evaluation_limit=8)
+
+    @test segmented.evaluations == continuous.evaluations == 8
+    @test segmented.constant_refinement_evaluations ==
+        continuous.constant_refinement_evaluations
+    @test segmented.serial == continuous.serial
+    @test segmented.birth_clock == continuous.birth_clock
+    @test segmented.offspring_attempts == continuous.offspring_attempts
+    @test [(member.candidate.loss, member.candidate.serial, member.born) for
+        member in segmented.population] ==
+        [(member.candidate.loss, member.candidate.serial, member.born) for
+            member in continuous.population]
+    @test all(ScalarSearch._same_scalar_expression(
+        ScalarSearch._node_scalar_materialize(left.candidate.value),
+        ScalarSearch._node_scalar_materialize(right.candidate.value))
+        for (left, right) in zip(segmented.population, continuous.population))
+    @test rand(segmented.rng) == rand(continuous.rng)
+end
+
 @testitem "regularized search accepts finite negative objective losses" setup=[NodeRegularizedStateImports] begin
     config = ScalarSearchConfig(population_size=2, max_evaluations=4,
         max_complexity=1, initial_depth=0, tournament_size=1, elite_count=1,
@@ -629,6 +824,15 @@ end
         X, y; config, rng=MersenneTwister(1111),
         initial_population=initial, objective, stop_loss=-1.0)
     @test threshold_state.flow.stop_loss == -1.0
+    @test state.tournament_workspace !== threshold_state.tournament_workspace
+    @test state.tournament_workspace.available !==
+        threshold_state.tournament_workspace.available
+    @test state.tournament_workspace.selected !==
+        threshold_state.tournament_workspace.selected
+    @test state.tournament_workspace.costs !==
+        threshold_state.tournament_workspace.costs
+    @test state.tournament_workspace.order !==
+        threshold_state.tournament_workspace.order
 end
 
 @testsnippet SimplificationScoreContractSetup begin
@@ -639,7 +843,8 @@ end
 
     function simplification_state(expression, objective;
             X=reshape([2.0], 1, 1), max_evaluations=8,
-            max_total_evaluations=nothing, refinement_budget=0)
+            max_total_evaluations=nothing, refinement_budget=0,
+            reset_age=false)
         config = ScalarSearchConfig(; population_size=2, max_evaluations,
             max_total_evaluations, max_complexity=5, initial_depth=0,
             tournament_size=1, elite_count=1, unary_operators=(),
@@ -647,6 +852,7 @@ end
             constant_refinement_start_generation=1,
             constant_refinement_probability=refinement_budget > 0 ? 1.0 : 0.0,
             max_constant_refinement_evaluations=refinement_budget,
+            constant_refinement_resets_age=reset_age,
             evolution_strategy=:regularized)
         return ScalarSearch._initialize_node_regularized_state(X, [0.0];
             config, objective, rng=MersenneTwister(1234),
@@ -683,7 +889,7 @@ end
 @testitem "cycle simplification accepts scored improvements without refreshing age" setup=[SimplificationScoreContractSetup] begin
     original = scalar_binary(:+, scalar_input(1), scalar_constant(0.0))
     objective = expression -> Float64(scalar_complexity(expression))
-    state = simplification_state(original, objective)
+    state = simplification_state(original, objective; reset_age=true)
     ages = [member.born for member in state.population]
     birth_clock = state.birth_clock
     ScalarSearch._node_state_maintain_cycle!(state, 8)
@@ -790,6 +996,94 @@ end
         @test 0 < state.constant_refinement_evaluations <= 64
         @test state.best.loss < 1e-8
     end
+end
+
+@testitem "rotation no-op is scored and accepted as an unchanged regularized offspring" setup=[NodeRegularizedStateImports] begin
+    S = ScalarSearch
+    config = ScalarSearchConfig(population_size=2, max_evaluations=4,
+        max_complexity=1, initial_depth=0, tournament_size=1, elite_count=1,
+        unary_operators=(:sin,), binary_operators=(:+,),
+        mutation_probability=1.0, crossover_probability=0.0,
+        constant_refinement_iterations=0,
+        rotation_noop_reproduction=true,
+        evolution_strategy=:regularized)
+    X = reshape(Float64[0, 1], 1, :)
+    initial = [scalar_input(1), scalar_input(1)]
+    calls = Ref(0)
+    objective = expression -> (calls[] += 1; 1.0)
+    state = S._initialize_node_regularized_state(X, [0.0, 1.0]; config,
+        rng=MersenneTwister(1), initial_population=initial, objective,
+        stop_loss=nothing, annealing=false, use_frequency=false,
+        ncycles_per_iteration=1, hof_migration_fraction=0.0)
+    S._node_state_one_offspring!(state, config.max_evaluations)
+    @test get(state.mutation_kind_counts, :rotation_copy, 0) == 1
+    @test calls[] == 4 # baseline, two members, and the scored copy
+    @test state.evaluations == 3
+    @test state.mutation_attempts == 1
+    @test state.changed_variations == 0
+    @test state.skipped_variations == 0
+    @test state.accepted_offspring == 1
+    @test state.rejected_offspring == 0
+    @test state.rotation_copy_evaluations == 1
+    @test state.rotation_copy_accepted == 1
+    @test state.serial == 3
+    @test state.birth_clock == 3
+    @test maximum(member.born for member in state.population) == 3
+    @test any(member -> member.candidate.serial == 3, state.population)
+    @test all(S._node_scalar_materialize(member.candidate.value) ==
+        scalar_input(1) for member in state.population)
+
+    rejected_calls = Ref(0)
+    reject_objective = expression -> begin
+        rejected_calls[] += 1
+        rejected_calls[] <= 3 ? 1.0 : Inf
+    end
+    rejected = S._initialize_node_regularized_state(X, [0.0, 1.0]; config,
+        rng=MersenneTwister(1), initial_population=initial,
+        objective=reject_objective, stop_loss=nothing, annealing=false,
+        use_frequency=false, ncycles_per_iteration=1,
+        hof_migration_fraction=0.0)
+    S._node_state_one_offspring!(rejected, config.max_evaluations)
+    @test get(rejected.mutation_kind_counts, :rotation_copy, 0) == 1
+    @test rejected.rotation_copy_evaluations == 1
+    @test rejected.rotation_copy_accepted == 0
+    @test rejected.invalid_evaluations == 1
+    @test rejected.rejected_offspring == 1
+    @test rejected.changed_variations == 0
+    @test rejected.birth_clock == 2
+    @test [member.born for member in rejected.population] == [1, 2]
+end
+
+@testitem "rotation no-op rejects domain-backed states and honors exhausted budgets" setup=[NodeRegularizedStateImports] begin
+    S = ScalarSearch
+    config = ScalarSearchConfig(population_size=2, max_evaluations=4,
+        max_total_evaluations=2, max_complexity=1, initial_depth=0,
+        tournament_size=1, elite_count=1,
+        rotation_noop_reproduction=true,
+        evolution_strategy=:regularized)
+    flow = S._NodeRegularizedFlow(nothing, false, 1.0, 3.17, 1,
+        false, 0.0, 0.982, false, 0.0)
+    values = [(complexity=1,), (complexity=1,)]
+    @test_throws ArgumentError S._initialize_regularized_values(values,
+        _ -> (1.0, 0); config, rng=MersenneTwister(1111), flow,
+        domain=NamedTuple())
+
+    calls = Ref(0)
+    objective = expression -> (calls[] += 1; 1.0)
+    exhausted = S._initialize_node_regularized_state(
+        reshape(Float64[0, 1], 1, :), [0.0, 1.0]; config,
+        rng=MersenneTwister(2000),
+        initial_population=[scalar_input(1), scalar_input(1)], objective,
+        stop_loss=nothing, annealing=false, use_frequency=false,
+        ncycles_per_iteration=1, hof_migration_fraction=0.0)
+    S._step_node_regularized!(exhausted;
+        evaluation_limit=config.max_evaluations, offspring_limit=1)
+    @test calls[] == 3 # baseline and two initial members; no offspring score
+    @test exhausted.evaluations == 2
+    @test exhausted.offspring_attempts == 0
+    @test isempty(exhausted.mutation_kind_counts)
+    @test exhausted.rotation_copy_evaluations == 0
+    @test exhausted.rotation_copy_accepted == 0
 end
 
 @testitem "node regularized state resumes without resetting island history" setup=[NodeRegularizedStateImports] begin

@@ -45,3 +45,8 @@ Proposal batches use isolated worker state while structural selection and
 publication remain coordinator-owned. Batch capacity is independent of worker
 count. Eligible array maps use batched evaluation with the same complete-sample
 scoring contract and fall back to ordinary execution when unsupported.
+
+Scalar islands expose admission-frequency controls independently of tournament
+weighting. Optional constant Jacobians share the refinement budget with forward
+scoring and fall back to finite differences when invalid. Sessions stop when all
+islands are terminal; optional age and mutation policies retain explicit defaults.

@@ -6,6 +6,13 @@ each through synchronous round budgets and applying bounded HOF/top migration
 between rounds. The coordinator does not select a validation or test
 expression: its only objective is the callback supplied by the caller.
 
+`rounds` is an upper bound. The session completes at that bound, at
+initialization, or after a coordinator round when every island is terminal by
+stop loss, structural budget, or shared total budget. A round observer still
+sees the actual round that reaches this boundary, but no migration follows it.
+Independent constant-refinement-budget exhaustion alone does not make an island
+terminal.
+
 `search_multi_scalar` returns the `ScalarSearch` result fields expected by the
 program/scalar bridge.  Its matrix arguments are the normal scalar backend
 contract; a contextual objective may deliberately ignore them when the
@@ -36,6 +43,9 @@ function _copy_config(config::ScalarSearchConfig, structural::Int,
         constant_refinement_start_generation=config.constant_refinement_start_generation,
         constant_refinement_probability=config.constant_refinement_probability,
         constant_refinement_timing=config.constant_refinement_timing,
+        constant_refinement_resets_age=config.constant_refinement_resets_age,
+        rotation_noop_reproduction=config.rotation_noop_reproduction,
+        deletion_policy=config.deletion_policy,
         max_constant_refinement_evaluations=refinement,
         max_total_evaluations=total,
         constant_refinement_optimizer=config.constant_refinement_optimizer,
@@ -189,8 +199,7 @@ end
 function _multi_scalar_completed(session)
     progress = session.progress
     progress.rounds_completed >= session.rounds ||
-        (session.config.max_total_evaluations !== nothing &&
-            all(_node_state_terminal, progress.states))
+        all(_node_state_terminal, progress.states)
 end
 
 function _merge_archives(reports)
@@ -259,6 +268,7 @@ end
     initialize_multi_scalar(X, y; config, rng, initial_population, objective,
         stop_loss, island_count=2, rounds=2, migrant_count=2,
         top_migrant_count=nothing, ncycles_per_iteration=380,
+        use_frequency=true, use_frequency_in_tournament=true,
         frequency_window=100_000, top_migration_rate=0.00036,
         donor_limit=12, hof_donor_policy=:local_best,
         round_observer=nothing) -> MultiScalarSession
@@ -276,10 +286,33 @@ context. Session fields are internal and must not be mutated; use only
 native initializer calls the supplied objective once for its baseline loss per
 island; that call is not part of `evaluations`, so the result
 reports it separately from structural and constant-refinement counts.
+The optional `constant_jacobian(node, X)` callback enables direct-MSE BFGS
+derivatives; it is rejected with a custom objective or a different optimizer.
+It returns `(prediction, jacobian, complete)` with a constants-by-samples
+Jacobian in depth-first constant-leaf order, using the native operators and
+domains. The canonical evaluator still owns the forward loss. The callback
+must not mutate its inputs and must be safe for serial use by all islands;
+unexpected errors propagate. A non-finite derivative or `complete=false` uses
+charged central differences. Default `nothing` preserves finite differences
+and requires no automatic-differentiation dependency.
+With this callback, `constant_refinement_evaluations` and its budget count
+forward evaluations plus Jacobian calls, including their internal forward
+work, as one unit each. These units do not imply equal cost. The separate
+`diagnostics.constant_refinement_work` and per-island fields report forward,
+derivative, invalid-derivative and fallback counts; invalid evaluation counts
+still mean forward failures. Total budgets use the same combined units.
 `ncycles_per_iteration` is passed unchanged to each native island; its default
 preserves the native 380-cycle behavior. `frequency_window`,
 `top_migration_rate`, and `donor_limit` expose the existing cross-island
-coordinator settings without changing their defaults.
+coordinator settings without changing their defaults. `use_frequency` controls
+the acceptance-probability correction by old/new complexity frequency;
+it may be one `Bool` shared by all islands or an `AbstractVector{Bool}` with
+one entry per island, copied during initialization. A vector with the wrong
+length is rejected before any objective calls. `use_frequency_in_tournament`
+independently controls frequency pressure in tournament ranking and remains a
+shared `Bool`; both settings default to `true`. The shared frequency histogram
+continues to update at island maintenance boundaries and remains available to
+observers regardless of these switches.
 
 `hof_donor_policy=:local_best` uses each island's lowest-loss archive entries,
 limited by `donor_limit`, and excludes that destination's own entries. Set
@@ -302,6 +335,12 @@ observation. Call the snapshot synchronously; retaining it would observe later
 mutable state. Observer exceptions propagate. No snapshot work occurs by
 default. Scorer and observer exceptions propagate; an advance that throws may
 have changed part of a round, so discard that session instead of retrying it.
+
+`rounds` bounds coordinator rounds rather than requiring all of them to run.
+If every island is already terminal after initialization, the session completes
+with zero rounds and no observer or migration. If a round makes every island
+terminal, its observer runs after island advancement and migration is skipped.
+Partially terminal islands retain the existing coordinator behavior.
 """
 function initialize_multi_scalar(
     X::AbstractMatrix{<:Real},
@@ -310,12 +349,15 @@ function initialize_multi_scalar(
     rng::AbstractRNG=default_rng(),
     initial_population=nothing,
     objective=nothing,
+    constant_jacobian=nothing,
     stop_loss=nothing,
     island_count=2,
     rounds=2,
     migrant_count=2,
     top_migrant_count=nothing,
     ncycles_per_iteration::Int=380,
+    use_frequency=true,
+    use_frequency_in_tournament::Bool=true,
     frequency_window=100_000,
     top_migration_rate=0.00036,
     donor_limit=12,
@@ -334,6 +376,16 @@ function initialize_multi_scalar(
         "ncycles_per_iteration must be positive"))
     island_count >= 1 || throw(ArgumentError("island_count must be positive"))
     rounds >= 1 || throw(ArgumentError("rounds must be positive"))
+    acceptance_frequency = if use_frequency isa Bool
+        fill(use_frequency, island_count)
+    elseif use_frequency isa AbstractVector{Bool}
+        length(use_frequency) == island_count || throw(ArgumentError(
+            "use_frequency vector length must equal island_count"))
+        Bool[flag for flag in use_frequency]
+    else
+        throw(ArgumentError(
+            "use_frequency must be a Bool or AbstractVector{Bool}"))
+    end
     migrant_count >= 0 || throw(ArgumentError("migrant_count cannot be negative"))
     top_migrant_count === nothing || top_migrant_count isa Integer ||
         throw(ArgumentError("top_migrant_count must be an integer or nothing"))
@@ -364,6 +416,9 @@ function initialize_multi_scalar(
         throw(ArgumentError("stop_loss must be nothing or finite"))
     objective === nothing || applicable(objective, scalar_input(1)) ||
         throw(ArgumentError("objective must accept one ScalarExpr"))
+    constant_jacobian === nothing || (objective === nothing &&
+        config.constant_refinement_optimizer === :bfgs) || throw(ArgumentError(
+        "constant_jacobian requires direct MSE and BFGS refinement"))
 
     initial = _validated_initial_population(
         initial_population, config, size(X, 1))
@@ -405,8 +460,10 @@ function initialize_multi_scalar(
             rng=island_rngs[island],
             initial_population=[deepcopy(expression) for expression in initial],
             objective=state_objective,
+            constant_jacobian,
             stop_loss=stop_loss,
             ncycles_per_iteration=ncycles_per_iteration,
+            use_frequency=acceptance_frequency[island], use_frequency_in_tournament,
             # Coordinator migration is the only cross-island tier.
             hof_migration_fraction=0.0,
             frequency=shared_frequency,
@@ -452,12 +509,12 @@ function _advance_multi_scalar_round!(session::MultiScalarSession)
         progress.targets[island] += progress.round_increments[island][round]
         _step_node_regularized!(state;
             evaluation_limit=progress.targets[island])
-        report = _node_regularized_result(state)
+        generations = _node_state_generations(state)
         structural_delta = state.evaluations - progress.previous_evaluations[island]
         invalid_delta = state.invalid_evaluations - progress.previous_invalid[island]
         refinement_delta = state.constant_refinement_evaluations -
             progress.previous_refinement[island]
-        generation_delta = report.generations - progress.previous_generations[island]
+        generation_delta = generations - progress.previous_generations[island]
         total_cap_hit = session.config.max_total_evaluations !== nothing &&
             _node_state_total_remaining(state) <= 0
         underfilled = state.evaluations < progress.targets[island]
@@ -481,7 +538,7 @@ function _advance_multi_scalar_round!(session::MultiScalarSession)
         progress.previous_invalid[island] = state.invalid_evaluations
         progress.previous_refinement[island] =
             state.constant_refinement_evaluations
-        progress.previous_generations[island] = report.generations
+        progress.previous_generations[island] = generations
     end
     if session.round_observer !== nothing
         snapshot = () -> (;
@@ -508,8 +565,7 @@ function _advance_multi_scalar_round!(session::MultiScalarSession)
         session.round_observer(round, snapshot)
     end
     if round < session.rounds &&
-            (session.config.max_total_evaluations === nothing ||
-                !all(_node_state_terminal, progress.states))
+            !all(_node_state_terminal, progress.states)
         incoming_hof, incoming_top = _inject_migrants!(
             progress.states, progress.island_rngs, session.migrant_count,
             session.top_migrant_count, session.top_migration_rate,
@@ -527,10 +583,12 @@ end
 """
     advance_multi_scalar!(session; max_rounds=1) -> session
 
-Advance at most `max_rounds` complete configured rounds, including migration.
-This slices the session's fixed structural and refinement budgets; it cannot
-add budget. Zero is a no-op, completed sessions are unchanged, and negative
-values throw `ArgumentError`.
+Advance at most `max_rounds` coordinator rounds. This slices the session's
+fixed structural and refinement budgets; it cannot add budget. A round that
+leaves every island terminal completes its observer boundary without a final
+migration. A session terminal after initialization runs no rounds. Zero is a
+no-op, completed sessions are unchanged, and negative values throw
+`ArgumentError`.
 """
 function advance_multi_scalar!(session::MultiScalarSession; max_rounds::Int=1)
     max_rounds >= 0 || throw(ArgumentError("max_rounds cannot be negative"))
@@ -548,9 +606,10 @@ end
 
 Return a detached report for the current session boundary. Projection performs
 no scoring or random draws. `diagnostics.rounds_completed` reports actual
-progress. A total-capped session also completes early when every island has
-reached a structural, total-evaluation, or stop-loss boundary; no empty rounds
-are counted. Termination identifies the boundary that ended the session.
+progress. Any session completes early when every island has reached a
+structural, applicable total-evaluation, or stop-loss boundary; no empty rounds
+are counted. Shared total-cap exhaustion retains priority in termination
+classification. Termination identifies the boundary that ended the session.
 """
 function multi_scalar_result(session::MultiScalarSession)
     progress = session.progress
@@ -568,26 +627,33 @@ function multi_scalar_result(session::MultiScalarSession)
         report.constant_refinement_evaluations for report in reports)
     refinement_invalid = sum(
         report.constant_refinement_invalid_evaluations for report in reports)
+    work = [_node_constant_work(state.score, state.constant_refinement_evaluations)
+        for state in states]
+    constant_refinement_work = (;
+        (key => sum(getproperty(row, key) for row in work)
+            for key in keys(first(work)))...)
     generations = sum(report.generations for report in reports)
     total_migrations = sum(progress.incoming_hof_total) +
         sum(progress.incoming_top_total)
     solved = session.stop_loss !== nothing && any(
         report.best_loss <= Float64(session.stop_loss) for report in reports)
     total_remaining = _multi_scalar_total_remaining(session)
-    all_terminal = config.max_total_evaluations !== nothing &&
-        all(_node_state_terminal, states)
-    termination = if config.max_total_evaluations === nothing
-        # Keep the legacy round boundary and solved precedence unchanged when
-        # the new shared budget is not enabled.
-        progress.rounds_completed < session.rounds ? :paused :
-            (solved ? :solved :
-                (evaluations >= config.max_evaluations ? :evaluation_cap : :paused))
-    elseif total_remaining === 0
+    all_terminal = all(_node_state_terminal, states)
+    termination = if config.max_total_evaluations !== nothing &&
+            total_remaining === 0
         :total_evaluation_cap
     elseif all_terminal
-        all(state -> session.stop_loss !== nothing &&
-            state.best.loss <= Float64(session.stop_loss), states) ? :solved :
-            :evaluation_cap
+        if config.max_total_evaluations === nothing
+            # Preserve legacy no-total-cap solved precedence at the new early
+            # terminal boundary: any solved island takes precedence over the
+            # structural cap of another island.
+            solved ? :solved :
+                (evaluations >= config.max_evaluations ? :evaluation_cap : :paused)
+        else
+            all(state -> session.stop_loss !== nothing &&
+                state.best.loss <= Float64(session.stop_loss), states) ? :solved :
+                :evaluation_cap
+        end
     elseif progress.rounds_completed < session.rounds
         :paused
     else
@@ -611,6 +677,7 @@ function multi_scalar_result(session::MultiScalarSession)
                 reports[index].constant_refinement_evaluations,
             constant_refinement_invalid_evaluations=
                 reports[index].constant_refinement_invalid_evaluations,
+            constant_refinement_work=work[index],
             cycle_refinement_calls=
                 reports[index].variation.cycle_refinement_calls,
             offspring_refinement_calls=
@@ -626,6 +693,11 @@ function multi_scalar_result(session::MultiScalarSession)
             accepted_offspring=states[index].accepted_offspring,
             rejected_offspring=states[index].rejected_offspring,
             skipped_variations=states[index].skipped_variations,
+            rotation_copy_attempts=get(
+                states[index].mutation_kind_counts, :rotation_copy, 0),
+            rotation_copy_evaluations=states[index].rotation_copy_evaluations,
+            rotation_copy_accepted=states[index].rotation_copy_accepted,
+            changed_variations=states[index].changed_variations,
         )
         for index in 1:session.island_count
     ]
@@ -639,7 +711,8 @@ function multi_scalar_result(session::MultiScalarSession)
         baseline_objective_calls=session.objective === nothing ? 0 :
             session.island_count,
         structural_objective_calls=evaluations,
-        constant_refinement_objective_calls=refinement_evaluations,
+        constant_refinement_objective_calls=constant_refinement_work.forward_evaluations,
+        constant_refinement_work,
         structural_evaluations=evaluations,
         invalid_evaluations,
         constant_refinement_evaluations=refinement_evaluations,
@@ -709,17 +782,23 @@ function multi_scalar_result(session::MultiScalarSession)
     )
 end
 
-"""Read detached counters without publishing expressions, scoring or RNG draws.
-With a total cap enabled, `completed` also becomes true when all islands reach
-a structural, total-evaluation, or stop-loss boundary, even before all planned
-rounds run. `rounds_completed` always reports actual rounds.
+"""Read detached counters without publishing expressions, scoring or random draws.
+`completed` becomes true at the configured round count or earlier when all
+islands reach a structural, applicable total-evaluation, or stop-loss boundary.
+Independent constant-refinement-budget exhaustion alone is not terminal.
+`rounds_completed` always reports actual rounds.
 """
 function multi_scalar_progress(session::MultiScalarSession)
     progress = session.progress
     structural = sum(state.evaluations for state in progress.states)
     constants = sum(state.constant_refinement_evaluations for state in progress.states)
+    derivatives = sum(_node_constant_work(state.score,
+        state.constant_refinement_evaluations).derivative_evaluations
+        for state in progress.states)
     return (; rounds=session.rounds, rounds_completed=progress.rounds_completed,
         completed=_multi_scalar_completed(session),
+        constant_refinement_work=(forward_evaluations=constants - derivatives,
+            derivative_evaluations=derivatives),
         initialization_count=session.island_count,
         budget=(; structural_evaluations=session.config.max_evaluations,
             constant_refinement_evaluations=session.config.max_constant_refinement_evaluations,
@@ -735,8 +814,9 @@ function multi_scalar_progress(session::MultiScalarSession)
             baseline_objective_calls=session.objective === nothing ? 0 : session.island_count))
 end
 
-"""Run every configured round and return the existing multi-island report.
-See `initialize_multi_scalar` for options, borrowed-input ownership, and the
+"""Run up to the configured round count, stopping early when every island is
+terminal, and return the existing multi-island report. See
+`initialize_multi_scalar` for options, borrowed-input ownership, and the
 fixed-context session contract.
 """
 function search_multi_scalar(
@@ -746,12 +826,15 @@ function search_multi_scalar(
     rng::AbstractRNG=default_rng(),
     initial_population=nothing,
     objective=nothing,
+    constant_jacobian=nothing,
     stop_loss=nothing,
     island_count=2,
     rounds=2,
     migrant_count=2,
     top_migrant_count=nothing,
     ncycles_per_iteration::Int=380,
+    use_frequency=true,
+    use_frequency_in_tournament::Bool=true,
     frequency_window=100_000,
     top_migration_rate=0.00036,
     donor_limit=12,
@@ -759,8 +842,9 @@ function search_multi_scalar(
     round_observer=nothing,
 )
     session = initialize_multi_scalar(X, y;
-        config, rng, initial_population, objective, stop_loss, island_count,
+        config, rng, initial_population, objective, constant_jacobian, stop_loss, island_count,
         rounds, migrant_count, top_migrant_count, ncycles_per_iteration,
+        use_frequency, use_frequency_in_tournament,
         frequency_window, top_migration_rate, donor_limit, hof_donor_policy,
         round_observer)
     advance_multi_scalar!(session; max_rounds=session.rounds)
@@ -774,7 +858,49 @@ end
         ScalarSearchConfig, scalar_complexity, scalar_input, scalar_constant,
         scalar_binary, evaluate_scalar_reference, MultiScalarSession,
         initialize_multi_scalar, advance_multi_scalar!, multi_scalar_result,
-        search_multi_scalar
+        multi_scalar_progress, search_multi_scalar
+end
+
+@testitem "multi scalar explicit Jacobian capability and island accounting" setup=[MultiIslandSearchImports] begin
+    import LambdaRegression.ScalarSearch
+    S = ScalarSearch
+    X = reshape([0.2, 0.5, 0.9, 1.3], 1, :)
+    y = 2vec(X)
+    config = ScalarSearchConfig(population_size=4, tournament_size=2, elite_count=1,
+        constant_refinement_elites=1,
+        max_evaluations=40, max_constant_refinement_evaluations=12,
+        max_total_evaluations=24, constant_refinement_iterations=8,
+        constant_refinement_start_generation=1,
+        evolution_strategy=:regularized)
+    jacobian = (node, data) -> (nothing, copy(data), true)
+    @test_throws ArgumentError initialize_multi_scalar(X, y; config,
+        objective=scalar_complexity, constant_jacobian=jacobian)
+    other = ScalarSearchConfig(evolution_strategy=:regularized,
+        constant_refinement_optimizer=:nelder_mead)
+    @test_throws ArgumentError initialize_multi_scalar(X, y; config=other,
+        constant_jacobian=jacobian)
+    expr = scalar_binary(:*, scalar_constant(0.2), scalar_input(1))
+    session = initialize_multi_scalar(X, y; config, constant_jacobian=jacobian,
+        initial_population=fill(expr, 4), island_count=2, rounds=2,
+        rng=MersenneTwister(1234))
+    for state in session.progress.states
+        S._node_state_refine_candidate!(state, first(state.population).candidate,
+            1, :cycle)
+        @test state.constant_refinement_evaluations <= 6
+    end
+    @test session.progress.states[1].score !== session.progress.states[2].score
+    report = multi_scalar_result(session)
+    counts = report.diagnostics.constant_refinement_work
+    @test counts.derivative_evaluations > 0
+    @test counts.forward_evaluations + counts.derivative_evaluations ==
+        report.constant_refinement_evaluations
+    @test report.diagnostics.constant_refinement_objective_calls == counts.forward_evaluations
+    @test sum(row.constant_refinement_work.derivative_evaluations
+        for row in report.diagnostics.per_island) == counts.derivative_evaluations
+    progress = multi_scalar_progress(session)
+    @test progress.constant_refinement_work.derivative_evaluations == counts.derivative_evaluations
+    @test progress.remaining.total_evaluations == 24 - report.evaluations -
+        report.constant_refinement_evaluations
 end
 
 @testitem "Multi-island scalar coordinator reports layered work" setup=[MultiIslandSearchImports] begin
@@ -869,6 +995,240 @@ end
         hof_donor_policy="global_pareto")
 end
 
+@testitem "Multi-island frequency switches preserve defaults and tunnel to islands" setup=[MultiIslandSearchImports] begin
+    X = reshape(Float64[-1, 0, 1], 1, :)
+    y = vec(X)
+    config = ScalarSearchConfig(population_size=2, max_evaluations=12,
+        max_complexity=6, initial_depth=0, tournament_size=1, elite_count=1,
+        unary_operators=(:square,), binary_operators=(:+,),
+        constant_probability=0.0, mutation_probability=1.0,
+        crossover_probability=0.0, constant_refinement_iterations=0,
+        constant_refinement_probability=0.0,
+        max_constant_refinement_evaluations=0, evolution_strategy=:regularized)
+    function run_with_frequency(log; kwargs...)
+        objective = expression -> begin
+            push!(log, repr(expression))
+            Float64(scalar_complexity(expression))
+        end
+        return search_multi_scalar(X, y; config, rng=MersenneTwister(8000),
+            initial_population=[scalar_input(1)], objective, island_count=2,
+            rounds=1, migrant_count=1, top_migrant_count=0,
+            ncycles_per_iteration=1, kwargs...)
+    end
+
+    default_log = String[]
+    default_result = run_with_frequency(default_log)
+    enabled_log = String[]
+    enabled_result = run_with_frequency(enabled_log;
+        use_frequency=true, use_frequency_in_tournament=true)
+    @test enabled_log == default_log
+    @test repr(enabled_result) == repr(default_result)
+
+    enabled_vector_log = String[]
+    enabled_vector_result = run_with_frequency(enabled_vector_log;
+        use_frequency=fill(true, 2), use_frequency_in_tournament=true)
+    @test enabled_vector_log == default_log
+    @test repr(enabled_vector_result) == repr(default_result)
+
+    disabled_log = String[]
+    disabled_result = run_with_frequency(disabled_log;
+        use_frequency=false, use_frequency_in_tournament=false)
+    disabled_vector_log = String[]
+    disabled_vector_result = run_with_frequency(disabled_vector_log;
+        use_frequency=fill(false, 2), use_frequency_in_tournament=false)
+    @test disabled_vector_log == disabled_log
+    @test repr(disabled_vector_result) == repr(disabled_result)
+    disabled = initialize_multi_scalar(X, y; config,
+        rng=MersenneTwister(8000), initial_population=[scalar_input(1)],
+        objective=scalar_complexity, island_count=2, rounds=1,
+        migrant_count=1, top_migrant_count=0, ncycles_per_iteration=1,
+        frequency_window=100, use_frequency=false,
+        use_frequency_in_tournament=false)
+    @test !multi_scalar_progress(disabled).completed
+    @test default_result.evaluations == config.max_evaluations
+    shared_frequency = disabled.progress.shared_frequency
+    before = copy(shared_frequency.frequencies)
+    @test all(state -> state.frequency === shared_frequency,
+        disabled.progress.states)
+    @test all(state -> !state.flow.use_frequency &&
+        !state.flow.use_frequency_in_tournament, disabled.progress.states)
+    advance_multi_scalar!(disabled; max_rounds=1)
+    after = multi_scalar_result(disabled)
+    @test after.diagnostics.rounds_completed == 1
+    @test repr(after) == repr(disabled_result)
+    @test sum(shared_frequency.frequencies) > sum(before)
+    @test all(state -> state.frequency === shared_frequency,
+        disabled.progress.states)
+
+    acceptance_flags = Bool[true, false]
+    scored = Ref(0)
+    counting_objective = expression -> begin
+        scored[] += 1
+        Float64(scalar_complexity(expression))
+    end
+    heterogeneous = initialize_multi_scalar(X, y; config,
+        rng=MersenneTwister(42), initial_population=[scalar_input(1)],
+        objective=counting_objective, island_count=2, rounds=1,
+        migrant_count=1, top_migrant_count=0, ncycles_per_iteration=1,
+        use_frequency=acceptance_flags)
+    @test scored[] > 0
+    states = heterogeneous.progress.states
+    acceptance_flags .= Bool[false, true]
+    @test [state.flow.use_frequency for state in states] == [true, false]
+    @test all(state -> state.flow.use_frequency isa Bool, states)
+    @test all(state -> state.frequency === heterogeneous.progress.shared_frequency,
+        states)
+
+    rejected_scores = Ref(0)
+    rejected_objective = expression -> begin
+        rejected_scores[] += 1
+        Float64(scalar_complexity(expression))
+    end
+    @test_throws ArgumentError initialize_multi_scalar(X, y; config,
+        rng=MersenneTwister(555), objective=rejected_objective,
+        island_count=2, use_frequency=Bool[true])
+    @test rejected_scores[] == 0
+end
+
+@testitem "Multi-island sessions stop when all islands are terminal at initialization" setup=[MultiIslandSearchImports] begin
+    X = reshape(Float64[-1, 0, 1], 1, :)
+    y = vec(X)
+    common = (; population_size=2, max_complexity=6, initial_depth=0,
+        tournament_size=1, elite_count=1, unary_operators=(:square,),
+        binary_operators=(:+,), constant_probability=0.0,
+        mutation_probability=1.0, crossover_probability=0.0,
+        constant_refinement_iterations=0,
+        max_constant_refinement_evaluations=0,
+        evolution_strategy=:regularized)
+    initial = [scalar_input(1)]
+    rng_preview(session) = [rand(deepcopy(rng), UInt64, 16)
+        for rng in session.progress.island_rngs]
+
+    structural_config = ScalarSearchConfig(; common..., max_evaluations=4)
+    structural_observed = Int[]
+    structural = initialize_multi_scalar(X, y; config=structural_config,
+        rng=MersenneTwister(8000), initial_population=initial,
+        objective=scalar_complexity, island_count=2, rounds=3,
+        migrant_count=1,
+        round_observer=(round, snapshot) -> push!(structural_observed, round))
+    structural_before = multi_scalar_result(structural)
+    structural_rng = rng_preview(structural)
+    structural_calls = structural.progress.objective_calls[]
+    @test multi_scalar_progress(structural).completed
+    @test structural_before.diagnostics.rounds_completed == 0
+    @test structural_before.termination == :evaluation_cap
+    advance_multi_scalar!(structural; max_rounds=3)
+    @test repr(multi_scalar_result(structural)) == repr(structural_before)
+    @test rng_preview(structural) == structural_rng
+    @test structural.progress.objective_calls[] == structural_calls
+    @test isempty(structural_observed)
+    @test multi_scalar_result(structural).diagnostics.migration_events == 0
+
+    solved_config = ScalarSearchConfig(; common..., max_evaluations=8)
+    zero_objective = expression -> 0.0
+    solved_observed = Int[]
+    solved = initialize_multi_scalar(X, y; config=solved_config,
+        rng=MersenneTwister(42), initial_population=initial,
+        objective=zero_objective, stop_loss=0.0, island_count=2, rounds=3,
+        migrant_count=1,
+        round_observer=(round, snapshot) -> push!(solved_observed, round))
+    solved_before = multi_scalar_result(solved)
+    @test multi_scalar_progress(solved).completed
+    @test solved_before.diagnostics.rounds_completed == 0
+    @test solved_before.termination == :solved
+    advance_multi_scalar!(solved; max_rounds=3)
+    @test repr(multi_scalar_result(solved)) == repr(solved_before)
+    @test isempty(solved_observed)
+    @test multi_scalar_result(solved).diagnostics.migration_events == 0
+
+    total_config = ScalarSearchConfig(; common..., max_evaluations=8,
+        max_total_evaluations=4)
+    total = initialize_multi_scalar(X, y; config=total_config,
+        rng=MersenneTwister(555), initial_population=initial,
+        objective=zero_objective, stop_loss=0.0, island_count=2, rounds=3,
+        migrant_count=1)
+    total_result = multi_scalar_result(total)
+    @test multi_scalar_progress(total).completed
+    @test total_result.diagnostics.rounds_completed == 0
+    @test total_result.diagnostics.remaining_total_evaluations == 0
+    @test total_result.termination == :total_evaluation_cap
+end
+
+@testitem "Multi-island sessions stop after the all-terminal round boundary" setup=[MultiIslandSearchImports] begin
+    X = reshape(Float64[-2, -1, 0, 1, 2], 1, :)
+    y = vec(X)
+    # Seven structural scores split as 4/3: one island naturally finishes
+    # after the first round while the other still has a real score to spend.
+    config = ScalarSearchConfig(population_size=2, max_evaluations=7,
+        max_complexity=6, initial_depth=0, tournament_size=1, elite_count=1,
+        unary_operators=(:square,), binary_operators=(:+,),
+        constant_probability=0.0, mutation_probability=1.0,
+        crossover_probability=0.0, constant_refinement_iterations=0,
+        max_constant_refinement_evaluations=0, evolution_strategy=:regularized)
+    function make_session(seed, objective_log, observed_rounds)
+        objective = expression -> begin
+            push!(objective_log, repr(expression))
+            return Float64(scalar_complexity(expression))
+        end
+        observer = (round, snapshot) ->
+            push!(observed_rounds, (round=round, state=snapshot()))
+        return initialize_multi_scalar(X, y; config,
+            rng=MersenneTwister(seed), initial_population=[scalar_input(1)],
+            objective, stop_loss=0.0, island_count=2, rounds=4,
+            migrant_count=1, top_migrant_count=0,
+            ncycles_per_iteration=1, round_observer=observer)
+    end
+    rng_preview(session) = [rand(deepcopy(rng), UInt64, 16)
+        for rng in session.progress.island_rngs]
+
+    whole_log = String[]
+    whole_rounds = NamedTuple[]
+    whole = make_session(73, whole_log, whole_rounds)
+    @test !multi_scalar_progress(whole).completed
+    advance_multi_scalar!(whole; max_rounds=4)
+    whole_result = multi_scalar_result(whole)
+    @test multi_scalar_progress(whole).completed
+    @test whole_result.diagnostics.rounds_completed == 2
+    @test whole_result.termination == :evaluation_cap
+    @test [row.round for row in whole_rounds] == [1, 2]
+    @test whole_result.diagnostics.per_island[1].structural_evaluations == 4
+    @test whole_result.diagnostics.per_island[2].structural_evaluations == 3
+    @test whole_result.diagnostics.hof_migrations > 0
+
+    split_log = String[]
+    split_rounds = NamedTuple[]
+    split = make_session(73, split_log, split_rounds)
+    advance_multi_scalar!(split; max_rounds=1)
+    partial = multi_scalar_result(split)
+    @test !multi_scalar_progress(split).completed
+    @test partial.diagnostics.rounds_completed == 1
+    @test partial.diagnostics.hof_migrations > 0
+    @test any(state -> state.evaluations == state.config.max_evaluations,
+        split.progress.states)
+    @test any(state -> state.evaluations < state.config.max_evaluations &&
+        state.best.loss > 0.0, split.progress.states)
+    first_migrations = partial.diagnostics.hof_migrations
+    advance_multi_scalar!(split; max_rounds=1)
+    split_result = multi_scalar_result(split)
+    @test split_result.diagnostics.rounds_completed == 2
+    @test multi_scalar_progress(split).completed
+    @test [row.round for row in split_rounds] == [1, 2]
+    @test split_result.diagnostics.hof_migrations == first_migrations
+    @test repr(split_result) == repr(whole_result)
+    @test split_log == whole_log
+    @test repr(split_rounds) == repr(whole_rounds)
+    @test rng_preview(split) == rng_preview(whole)
+
+    completed_rng = rng_preview(split)
+    completed_calls = length(split_log)
+    completed_rounds = length(split_rounds)
+    advance_multi_scalar!(split; max_rounds=4)
+    @test repr(multi_scalar_result(split)) == repr(split_result)
+    @test rng_preview(split) == completed_rng
+    @test length(split_log) == completed_calls
+    @test length(split_rounds) == completed_rounds
+end
+
 @testitem "Global Pareto donors merge archives before dominance filtering" setup=[MultiIslandSearchImports] begin
     using LambdaRegression: ScalarSearch
     candidate(complexity, loss, serial) =
@@ -900,31 +1260,36 @@ end
 @testitem "Global Pareto archive migration includes self and ignores donor limit" setup=[MultiIslandSearchImports] begin
     X = reshape(Float64[-1, 0, 1], 1, :)
     y = vec(X)
-    config = ScalarSearchConfig(population_size=2, max_evaluations=2,
+    config = ScalarSearchConfig(population_size=2, max_evaluations=4,
         max_complexity=1, initial_depth=0, tournament_size=1, elite_count=1,
         constant_refinement_iterations=0, evolution_strategy=:regularized)
-    make_session(policy; migrant_count=2) = initialize_multi_scalar(X, y;
+    make_session(policy; migrant_count=2, round_observer=nothing) = initialize_multi_scalar(X, y;
         config, rng=MersenneTwister(1234), initial_population=[scalar_input(1)],
         objective=scalar_complexity, island_count=1, rounds=2,
         migrant_count, top_migrant_count=0, donor_limit=0,
-        hof_donor_policy=policy)
+        hof_donor_policy=policy, round_observer)
 
     local_session = make_session(:local_best)
     advance_multi_scalar!(local_session; max_rounds=2)
     @test multi_scalar_result(local_session).diagnostics.hof_migrations == 0
 
-    global_session = make_session(:global_pareto)
+    pre_migration_clock = Ref(0)
+    global_session = make_session(:global_pareto;
+        round_observer=(_, snapshot) ->
+            (pre_migration_clock[] = only(snapshot().islands).birth_clock))
     before = multi_scalar_result(global_session)
-    birth_clock = global_session.progress.states[1].birth_clock
     advance_multi_scalar!(global_session; max_rounds=1)
     after = multi_scalar_result(global_session)
     @test after.diagnostics.hof_donor_policy === :global_pareto
     @test after.diagnostics.hof_migrations == 1 # Only one frontier member.
     @test after.diagnostics.top_migrations == 0
+    # This one-node language skips unchanged proposals; migration itself scores nothing.
     @test after.diagnostics.objective_calls == before.diagnostics.objective_calls
-    @test after.evaluations == before.evaluations == 2
-    @test global_session.progress.states[1].birth_clock == birth_clock + 1
-    @test any(member.born == birth_clock + 1
+    @test before.evaluations == 2
+    @test after.evaluations == 2
+    @test !multi_scalar_progress(global_session).completed
+    @test global_session.progress.states[1].birth_clock == pre_migration_clock[] + 1
+    @test any(member.born == pre_migration_clock[] + 1
         for member in global_session.progress.states[1].population)
 
     disabled = make_session(:global_pareto; migrant_count=0)
@@ -1047,10 +1412,12 @@ end
     @test [(row.structural_evaluations, row.invalid_evaluations,
         row.constant_refinement_evaluations, row.generations,
         row.hof_migrations, row.top_migrations, row.offspring_attempts,
-        row.accepted_offspring, row.rejected_offspring)
+        row.accepted_offspring, row.rejected_offspring,
+        row.rotation_copy_attempts, row.rotation_copy_evaluations,
+        row.rotation_copy_accepted, row.changed_variations)
         for row in diagnostics.per_island] == [
-            (4, 0, 0, 1, 1, 1, 2, 1, 1),
-            (4, 0, 0, 1, 1, 1, 2, 2, 0)]
+            (4, 0, 0, 1, 1, 1, 2, 1, 1, 0, 0, 0, 2),
+            (4, 0, 0, 1, 1, 1, 2, 2, 0, 0, 0, 0, 2)]
     @test [(row.round, row.island, row.configured_structural_budget,
         row.structural_evaluations, row.invalid_evaluations,
         row.constant_refinement_evaluations, row.generations,
